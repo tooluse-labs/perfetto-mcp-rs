@@ -2,6 +2,11 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.14.1](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.1) (May 22, 2026)
+
+- **Download retry with exponential backoff.** Transient failures (HTTP 5xx, 429, connect/timeout errors, mid-stream I/O errors) now retry up to 2 times with 1s/2s delays. URLs are redacted in error messages to prevent credential leaks in logs.
+- **Module split.** Extracted `params`, `sql_templates`, `stdlib_catalog` out of `server.rs` (2672 → 1971 lines). Pure mechanical extraction — zero semantic changes.
+
 ### [0.14.0](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.0) (May 14, 2026)
 
 - **Renamed MCP server registration from `perfetto-mcp-rs` to `perfetto-rs`.** The `-mcp` suffix is redundant inside `/mcp` UI listings (Claude Code already shows entries under a "Manage MCP servers" header — repeating "mcp" in every server name just clutters the column). The new value is what gets passed to `claude mcp add` / `codex mcp add` and what surfaces in `claude mcp list`. **Crate name, binary file name, GitHub repo, release asset names, the local cache directory (`dirs::data_local_dir()/perfetto-mcp-rs`), and the Glama catalog identifier all remain `perfetto-mcp-rs`** — changing those would invalidate user caches (~35MB trace_processor_shell re-download), break `cargo install` / `brew install` lookups, and unlist us from public MCP catalogs. Only the runtime MCP-registration identifier moved.
