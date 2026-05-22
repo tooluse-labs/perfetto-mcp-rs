@@ -175,7 +175,7 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 
 | 工具 | 用途 |
 |---|---|
-| `load_trace` | 打开一个 Perfetto trace 文件（`.pftrace` / `.perfetto-trace` / `.bin` 等任何 trace_processor 能读的格式）；其余工具都要先调它 |
+| `load_trace` | 打开一个 Perfetto trace 文件，并返回轻量路由摘要（类型/profile、时长、平台、进程/线程数、能力标签、推荐下一步工具） |
 | `list_tables` | 列出 trace 里的表和视图，支持 GLOB 过滤 |
 | `list_table_structure` | 查看某张表的列名和类型 |
 | `execute_sql` | 执行 PerfettoSQL 查询，返回列式 JSON `{columns, rows}`（最多 5000 行） |

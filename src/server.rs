@@ -9,6 +9,7 @@ use rmcp::{
     model::{ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::error::{PerfettoError, QueryErrorKind, MAX_ROWS};
@@ -57,8 +58,10 @@ impl ServerHandler for PerfettoMcpServer {
 impl PerfettoMcpServer {
     #[tool(
         name = "load_trace",
-        description = "Load a Perfetto trace file for analysis. Every other tool operates on \
-                       the trace set here.\n\
+        description = "Load a Perfetto trace file for analysis and return a lightweight \
+                       routing summary (trace type/profile, duration, platform, process/thread \
+                       counts, capabilities, and recommended next tools). Every other tool \
+                       operates on the trace set here.\n\
                        \n\
                        Use when: starting any analysis session — call this first.\n\
                        \n\
@@ -95,14 +98,13 @@ impl PerfettoMcpServer {
 
         // Only update current_trace after the client is healthy and status
         // succeeded — a failed load must not redirect subsequent tools to a
-        // half-loaded trace.
-        *self.current_trace.lock().await = Some(params.path);
+        // half-loaded trace. Summary collection below is best-effort and must
+        // not turn a successfully loaded trace into a failed load.
+        *self.current_trace.lock().await = Some(params.path.clone());
 
-        Ok(format!(
-            "Trace loaded successfully: {display}\n\
-             Use list_tables to see available tables, then \
-             list_table_structure to see column details."
-        ))
+        let summary = collect_load_trace_summary(&client, &params.path).await;
+
+        format_load_trace_response(&display, summary)
     }
 
     #[tool(
@@ -783,9 +785,276 @@ fn pragma_row_to_column_info(table: &DecodedTable, i: usize) -> Result<ColumnInf
     })
 }
 
-/// Validate a string for use in SQL GLOB patterns or table names.
-///
-/// Only allows alphanumeric characters and `._-:*?` to prevent injection.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct LoadTraceSummary {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_type: Option<String>,
+    trace_profile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    android_build_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    android_sdk_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chrome_product_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_ts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_ts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_count: Option<i64>,
+    capabilities: Vec<String>,
+    recommended_next_tools: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+async fn collect_load_trace_summary(
+    client: &crate::tp_client::TraceProcessorClient,
+    trace_path: &str,
+) -> Result<LoadTraceSummary, String> {
+    let metadata = client
+        .query(LOAD_TRACE_METADATA_SQL)
+        .await
+        .map_err(|e| format!("metadata query failed: {e}"))?;
+    let overview = client
+        .query(LOAD_TRACE_OVERVIEW_SQL)
+        .await
+        .map_err(|e| format!("overview query failed: {e}"))?;
+    let file_size_bytes = std::fs::metadata(trace_path).map(|m| m.len()).ok();
+
+    Ok(build_load_trace_summary(
+        &metadata,
+        &overview,
+        file_size_bytes,
+    ))
+}
+
+fn build_load_trace_summary(
+    metadata: &DecodedTable,
+    overview: &DecodedTable,
+    file_size_bytes: Option<u64>,
+) -> LoadTraceSummary {
+    let trace_type = metadata_string(metadata, "trace_type");
+    let android_build_fingerprint = metadata_string(metadata, "android_build_fingerprint");
+    let android_sdk_version = metadata_i64(metadata, "android_sdk_version");
+    let chrome_product_version = metadata_string(metadata, "cr-product-version")
+        .or_else(|| metadata_string(metadata, "cr-2-product-version"));
+
+    let system_name = metadata_string(metadata, "system_name");
+    let system_machine = metadata_string(metadata, "system_machine");
+    let chrome_os_name = metadata_string(metadata, "cr-os-name")
+        .or_else(|| metadata_string(metadata, "cr-2-os-name"));
+    let platform = infer_platform(
+        android_build_fingerprint.as_deref(),
+        android_sdk_version,
+        chrome_os_name.as_deref(),
+        system_name.as_deref(),
+        system_machine.as_deref(),
+    );
+
+    let start_ts = overview_i64(overview, "start_ts");
+    let end_ts = overview_i64(overview, "end_ts");
+    let duration_ns = overview_i64(overview, "duration_ns")
+        .filter(|duration_ns| *duration_ns >= 0)
+        .or_else(|| match (start_ts, end_ts) {
+            (Some(start), Some(end)) if end >= start => Some(end - start),
+            _ => None,
+        });
+
+    let has_chrome = overview_bool(overview, "has_chrome");
+    let is_android = android_build_fingerprint.is_some()
+        || android_sdk_version.is_some()
+        || chrome_os_name.as_deref() == Some("Android");
+    let trace_profile = if has_chrome {
+        "chrome"
+    } else if is_android {
+        "android"
+    } else if trace_type.is_some() || start_ts.is_some() || end_ts.is_some() {
+        "generic"
+    } else {
+        "unknown"
+    }
+    .to_owned();
+
+    let mut capabilities = Vec::new();
+    push_capability(&mut capabilities, has_chrome, "chrome");
+    push_capability(&mut capabilities, is_android, "android");
+    push_capability(
+        &mut capabilities,
+        overview_bool(overview, "has_sched"),
+        "sched",
+    );
+    push_capability(
+        &mut capabilities,
+        overview_bool(overview, "has_ftrace"),
+        "ftrace",
+    );
+    push_capability(
+        &mut capabilities,
+        overview_bool(overview, "has_slices"),
+        "slices",
+    );
+    push_capability(
+        &mut capabilities,
+        overview_bool(overview, "has_counters"),
+        "counters",
+    );
+
+    let recommended_next_tools = recommended_tools(&trace_profile);
+    let mut warnings = Vec::new();
+    if duration_ns.is_none() {
+        warnings.push("trace duration unavailable from trace_dur()".to_owned());
+    }
+    if overview_i64(overview, "process_count").is_none() {
+        warnings.push("process count unavailable".to_owned());
+    }
+    if overview_i64(overview, "thread_count").is_none() {
+        warnings.push("thread count unavailable".to_owned());
+    }
+
+    LoadTraceSummary {
+        available: true,
+        trace_type,
+        trace_profile,
+        platform,
+        android_build_fingerprint,
+        android_sdk_version,
+        chrome_product_version,
+        start_ts,
+        end_ts,
+        duration_ms: duration_ns.map(ns_to_ms),
+        file_size_bytes,
+        process_count: overview_i64(overview, "process_count"),
+        thread_count: overview_i64(overview, "thread_count"),
+        capabilities,
+        recommended_next_tools,
+        warnings,
+    }
+}
+
+fn format_load_trace_response(
+    display: &str,
+    summary: Result<LoadTraceSummary, String>,
+) -> Result<String, String> {
+    let summary_json = match summary {
+        Ok(summary) => serde_json::to_string(&summary)
+            .map_err(|e| format!("Failed to serialize load summary: {e}"))?,
+        Err(error) => serde_json::to_string(&serde_json::json!({
+            "available": false,
+            "error": error,
+        }))
+        .map_err(|e| format!("Failed to serialize load summary: {e}"))?,
+    };
+
+    Ok(format!(
+        "Trace loaded successfully: {display}\n\
+         Trace summary: {summary_json}\n\
+         Routing hint: use `recommended_next_tools` from the summary first; \
+         use `list_tables` / `list_table_structure` for schema discovery and \
+         `execute_sql` for custom PerfettoSQL."
+    ))
+}
+
+fn metadata_string(table: &DecodedTable, key: &str) -> Option<String> {
+    for row_idx in 0..table.len() {
+        if table.cell(row_idx, "name").and_then(|v| v.as_str()) == Some(key) {
+            return table
+                .cell(row_idx, "str_value")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+        }
+    }
+    None
+}
+
+fn metadata_i64(table: &DecodedTable, key: &str) -> Option<i64> {
+    for row_idx in 0..table.len() {
+        if table.cell(row_idx, "name").and_then(|v| v.as_str()) == Some(key) {
+            return table.cell(row_idx, "int_value").and_then(|v| v.as_i64());
+        }
+    }
+    None
+}
+
+fn overview_i64(table: &DecodedTable, column: &str) -> Option<i64> {
+    table.cell(0, column).and_then(|v| v.as_i64())
+}
+
+fn overview_bool(table: &DecodedTable, column: &str) -> bool {
+    overview_i64(table, column).unwrap_or(0) != 0
+}
+
+fn infer_platform(
+    android_build_fingerprint: Option<&str>,
+    android_sdk_version: Option<i64>,
+    chrome_os_name: Option<&str>,
+    system_name: Option<&str>,
+    system_machine: Option<&str>,
+) -> Option<String> {
+    if android_build_fingerprint.is_some()
+        || android_sdk_version.is_some()
+        || chrome_os_name == Some("Android")
+    {
+        return Some("Android".to_owned());
+    }
+
+    let system_name = system_name.filter(|s| !s.is_empty())?;
+    match system_machine.filter(|s| !s.is_empty()) {
+        Some(machine) => Some(format!("{system_name} ({machine})")),
+        None => Some(system_name.to_owned()),
+    }
+}
+
+fn push_capability(capabilities: &mut Vec<String>, enabled: bool, name: &str) {
+    if enabled {
+        capabilities.push(name.to_owned());
+    }
+}
+
+fn recommended_tools(trace_profile: &str) -> Vec<String> {
+    let tools = match trace_profile {
+        "chrome" => [
+            "chrome_page_load_summary",
+            "chrome_scroll_jank_summary",
+            "chrome_main_thread_hotspots",
+            "chrome_web_content_interactions",
+            "list_processes",
+            "execute_sql",
+        ]
+        .as_slice(),
+        "android" => [
+            "list_stdlib_modules",
+            "list_processes",
+            "list_threads_in_process",
+            "execute_sql",
+        ]
+        .as_slice(),
+        _ => [
+            "list_tables",
+            "list_table_structure",
+            "list_processes",
+            "execute_sql",
+        ]
+        .as_slice(),
+    };
+
+    tools.iter().map(|tool| (*tool).to_owned()).collect()
+}
+
+fn ns_to_ms(ns: i64) -> f64 {
+    ((ns as f64 / 1_000_000.0) * 1000.0).round() / 1000.0
+}
+
 /// Render the load confirmation. If `trace_processor_shell`'s `/status` reports
 /// a name that differs from the filesystem path we loaded — typically because
 /// the trace's recording embedded a different name — surface both so users do
@@ -878,6 +1147,192 @@ mod tests {
             "C:/Users/admin/Downloads/低端机traces/round13_2_trace.bin",
             "basename match must rescue the CJK-locale mojibake'd path"
         );
+    }
+
+    fn decoded_table(columns: &[&str], rows: Vec<Vec<serde_json::Value>>) -> DecodedTable {
+        DecodedTable {
+            columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+            rows,
+        }
+    }
+
+    #[test]
+    fn load_trace_summary_classifies_android_chrome_trace() {
+        let metadata = decoded_table(
+            &["name", "str_value", "int_value"],
+            vec![
+                vec![json!("trace_type"), json!("proto"), serde_json::Value::Null],
+                vec![
+                    json!("android_build_fingerprint"),
+                    json!("google/oriole/oriole:13/TP1A.220624.014/8819323:userdebug/dev-keys"),
+                    serde_json::Value::Null,
+                ],
+                vec![
+                    json!("android_sdk_version"),
+                    serde_json::Value::Null,
+                    json!(33),
+                ],
+                vec![
+                    json!("cr-product-version"),
+                    json!("Chrome/121.0.6167.178"),
+                    serde_json::Value::Null,
+                ],
+            ],
+        );
+        let overview = decoded_table(
+            &[
+                "start_ts",
+                "end_ts",
+                "duration_ns",
+                "process_count",
+                "thread_count",
+                "has_slices",
+                "has_counters",
+                "has_sched",
+                "has_ftrace",
+                "has_chrome",
+            ],
+            vec![vec![
+                json!(1_000),
+                json!(2_001_000),
+                json!(2_000_000),
+                json!(5),
+                json!(14),
+                json!(1),
+                json!(1),
+                json!(1),
+                json!(1),
+                json!(1),
+            ]],
+        );
+
+        let summary = build_load_trace_summary(&metadata, &overview, Some(6_392_331));
+
+        assert!(summary.available);
+        assert_eq!(summary.trace_type.as_deref(), Some("proto"));
+        assert_eq!(summary.trace_profile, "chrome");
+        assert_eq!(summary.platform.as_deref(), Some("Android"));
+        assert_eq!(summary.android_sdk_version, Some(33));
+        assert_eq!(
+            summary.chrome_product_version.as_deref(),
+            Some("Chrome/121.0.6167.178")
+        );
+        assert_eq!(summary.duration_ms, Some(2.0));
+        assert_eq!(summary.process_count, Some(5));
+        assert_eq!(summary.thread_count, Some(14));
+        assert_eq!(
+            summary.capabilities,
+            vec!["chrome", "android", "sched", "ftrace", "slices", "counters"]
+        );
+        assert!(
+            summary
+                .recommended_next_tools
+                .contains(&"chrome_main_thread_hotspots".to_owned()),
+            "Chrome summary must route callers to dedicated chrome tools: {summary:?}",
+        );
+        assert!(summary.warnings.is_empty());
+    }
+
+    #[test]
+    fn load_trace_response_embeds_parseable_summary_json() {
+        let summary = LoadTraceSummary {
+            available: true,
+            trace_type: Some("proto".to_owned()),
+            trace_profile: "generic".to_owned(),
+            platform: Some("Linux (x86_64)".to_owned()),
+            android_build_fingerprint: None,
+            android_sdk_version: None,
+            chrome_product_version: None,
+            start_ts: Some(10),
+            end_ts: Some(20),
+            duration_ms: Some(0.00001),
+            file_size_bytes: Some(207),
+            process_count: Some(4),
+            thread_count: Some(4),
+            capabilities: vec!["slices".to_owned()],
+            recommended_next_tools: recommended_tools("generic"),
+            warnings: vec![],
+        };
+
+        let response = format_load_trace_response("/tmp/basic.perfetto-trace", Ok(summary))
+            .expect("response must serialize");
+        let summary_line = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Trace summary: "))
+            .expect("response must contain a Trace summary line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(summary_line).expect("summary line must be JSON");
+
+        assert_eq!(parsed["available"], json!(true));
+        assert_eq!(parsed["trace_profile"], json!("generic"));
+        assert_eq!(parsed["process_count"], json!(4));
+        assert!(
+            response.contains("recommended_next_tools"),
+            "response should expose routing data, got: {response}",
+        );
+    }
+
+    #[test]
+    fn load_trace_response_preserves_success_when_summary_unavailable() {
+        let response = format_load_trace_response("/tmp/basic.perfetto-trace", Err("boom".into()))
+            .expect("response must serialize");
+        let summary_line = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Trace summary: "))
+            .expect("response must contain a Trace summary line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(summary_line).expect("summary line must be JSON");
+
+        assert_eq!(parsed["available"], json!(false));
+        assert_eq!(parsed["error"], json!("boom"));
+        assert!(
+            response.starts_with("Trace loaded successfully"),
+            "summary failure must not make load_trace look failed: {response}",
+        );
+    }
+
+    #[test]
+    fn load_trace_returns_summary_from_real_trace() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        runtime.block_on(async {
+            let manager = Arc::new(TraceProcessorManager::new_with_starting_port(1, 19_061));
+            let server = PerfettoMcpServer::new(manager);
+            let response = server
+                .load_trace(Parameters(LoadTraceParams {
+                    path: "tests/fixtures/basic.perfetto-trace".to_owned(),
+                }))
+                .await
+                .expect("load_trace on basic fixture must succeed");
+
+            let summary_line = response
+                .lines()
+                .find_map(|line| line.strip_prefix("Trace summary: "))
+                .expect("load_trace must include a summary line");
+            let parsed: serde_json::Value =
+                serde_json::from_str(summary_line).expect("summary line must be JSON");
+
+            assert_eq!(parsed["available"], json!(true));
+            assert_eq!(parsed["trace_type"], json!("proto"));
+            assert_eq!(parsed["trace_profile"], json!("generic"));
+            assert_eq!(parsed["process_count"], json!(4));
+            assert_eq!(parsed["thread_count"], json!(4));
+            assert!(
+                parsed["duration_ms"].as_f64().is_some(),
+                "trace_dur() duration should be present: {parsed}",
+            );
+            assert!(
+                parsed["recommended_next_tools"]
+                    .as_array()
+                    .expect("recommended_next_tools must be an array")
+                    .iter()
+                    .any(|tool| tool.as_str() == Some("execute_sql")),
+                "summary should preserve execute_sql as an escape hatch: {parsed}",
+            );
+        });
     }
 
     #[test]

@@ -1834,8 +1834,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_cp_acp_lossless_rejects_chars_outside_codepage() {
-        // U+1F600 (😀) is supplementary-plane — no Windows ANSI
-        // codepage encodes it, so the round-trip fails on every locale.
+        // On systems configured for UTF-8 ACP, every Unicode scalar can round
+        // trip through CP_ACP, so there is no "outside the active codepage"
+        // character to assert against.
+        if windows_cp_acp_lossless(Path::new("\u{1F600}")) {
+            return;
+        }
+
+        // U+1F600 is outside legacy Windows ANSI codepages.
         assert!(!windows_cp_acp_lossless(Path::new("\u{1F600}")));
         assert!(!windows_cp_acp_lossless(Path::new(
             "C:\\foo\\\u{1F600}.trace"
@@ -1886,6 +1892,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resolve_trace_path_for_shell_rejects_when_codepage_incompatible_and_no_short_name() {
+        if windows_cp_acp_lossless(Path::new("\u{1F600}")) {
+            return;
+        }
+
         let p = PathBuf::from("C:\\Users\\nonexistent\\\u{1F600}\\trace.bin");
         let err = resolve_trace_path_for_shell(&p)
             .expect_err("unrepresentable non-existent path must surface an error");

@@ -4,6 +4,42 @@
 use crate::error::{PerfettoError, MAX_ROWS};
 use crate::params::ChromeMainThreadHotspotsFilters;
 
+/// Trace-level metadata used by `load_trace` to avoid leaving callers in a
+/// routing vacuum after a successful load. Kept intentionally small: selected
+/// metadata keys plus cheap scalar probes.
+pub const LOAD_TRACE_METADATA_SQL: &str = "SELECT name, str_value, int_value \
+     FROM metadata \
+     WHERE name IN ( \
+       'trace_type', \
+       'system_name', \
+       'system_machine', \
+       'android_build_fingerprint', \
+       'android_sdk_version', \
+       'cr-os-name', \
+       'cr-2-os-name', \
+       'cr-product-version', \
+       'cr-2-product-version' \
+     ) \
+     ORDER BY name";
+
+/// Scalar overview for `load_trace` routing hints.
+///
+/// `trace_start()` / `trace_end()` / `trace_dur()` expose trace_processor's
+/// capture interval; they are a better default than deriving duration from
+/// slices because traces can contain sparse or no slices. `EXISTS` probes stop
+/// at the first row and avoid materializing large tables.
+pub const LOAD_TRACE_OVERVIEW_SQL: &str = "SELECT \
+       trace_start() AS start_ts, \
+       trace_end() AS end_ts, \
+       trace_dur() AS duration_ns, \
+       (SELECT COUNT(*) FROM process) AS process_count, \
+       (SELECT COUNT(*) FROM thread) AS thread_count, \
+       EXISTS(SELECT 1 FROM slice) AS has_slices, \
+       EXISTS(SELECT 1 FROM counter) AS has_counters, \
+       EXISTS(SELECT 1 FROM sched) AS has_sched, \
+       EXISTS(SELECT 1 FROM ftrace_event) AS has_ftrace, \
+       EXISTS(SELECT 1 FROM args WHERE flat_key = 'chrome.process_type') AS has_chrome";
+
 /// SQL for chrome_scroll_jank_summary. Exported for integration tests.
 /// Returns row-level janky frames (not pre-aggregated) so agents can do
 /// their own grouping, correlation, and deep-dive queries after the first call.

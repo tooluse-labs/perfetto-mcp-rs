@@ -178,7 +178,7 @@ it in place.
 
 | Tool | Purpose |
 |---|---|
-| `load_trace` | Open a Perfetto trace file (any trace_processor-readable format: `.pftrace`, `.perfetto-trace`, `.bin`, etc. — must be called first) |
+| `load_trace` | Open a Perfetto trace file and return a lightweight routing summary (type/profile, duration, platform, process/thread counts, capabilities, recommended next tools) |
 | `list_tables` | List tables/views in the loaded trace, optional GLOB filter |
 | `list_table_structure` | Show column names and types for a table |
 | `execute_sql` | Run a PerfettoSQL query, returns columnar JSON `{columns, rows}` (max 5000 rows) |
