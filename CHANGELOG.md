@@ -2,6 +2,10 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.14.3](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.3) (May 22, 2026)
+
+- **Rust 1.95 / Clippy compatibility fix.** Replaced a `3.14` floating-point test literal in the lenient f64 parameter parser tests with a non-special sample value so `clippy::approx_constant` no longer fails `cargo clippy --all-targets --all-features -- -D warnings`.
+
 ### [0.14.2](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.2) (May 22, 2026)
 
 - **Download retry with exponential backoff.** Transient failures (HTTP 5xx, 429, connect/timeout errors, mid-stream I/O errors) now retry up to 2 times with 1s/2s delays. URLs are redacted in error messages to prevent credential leaks in logs.

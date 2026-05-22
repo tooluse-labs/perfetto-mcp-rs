@@ -286,8 +286,8 @@ mod tests {
 
     #[test]
     fn lenient_f64_accepts_number_and_string() {
-        let from_num: F64Wrapper = serde_json::from_str(r#"{"val": 3.14}"#).unwrap();
-        assert!((from_num.val.unwrap() - 3.14).abs() < f64::EPSILON);
+        let from_num: F64Wrapper = serde_json::from_str(r#"{"val": 1.25}"#).unwrap();
+        assert!((from_num.val.unwrap() - 1.25).abs() < f64::EPSILON);
 
         let from_str: F64Wrapper = serde_json::from_str(r#"{"val": "2.5"}"#).unwrap();
         assert!((from_str.val.unwrap() - 2.5).abs() < f64::EPSILON);
