@@ -18,10 +18,10 @@
 
 use std::path::Path;
 
-use perfetto_mcp_rs::server::{
-    chrome_main_thread_hotspots_sql, ChromeMainThreadHotspotsFilters, CHROME_PAGE_LOAD_SUMMARY_SQL,
-    CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_SQL, CHROME_TRACE_PREFLIGHT_SQL,
-    CHROME_WEB_CONTENT_INTERACTIONS_SQL,
+use perfetto_mcp_rs::params::ChromeMainThreadHotspotsFilters;
+use perfetto_mcp_rs::sql_templates::{
+    chrome_main_thread_hotspots_sql, CHROME_PAGE_LOAD_SUMMARY_SQL, CHROME_SCROLL_JANK_SUMMARY_SQL,
+    CHROME_STARTUP_SUMMARY_SQL, CHROME_TRACE_PREFLIGHT_SQL, CHROME_WEB_CONTENT_INTERACTIONS_SQL,
 };
 use perfetto_mcp_rs::tp_manager::TraceProcessorManager;
 
