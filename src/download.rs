@@ -262,15 +262,21 @@ fn binary_url(config: &DownloadConfig, arch: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+const DOWNLOAD_MAX_RETRIES: u32 = 2;
+const DOWNLOAD_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const STREAM_ERROR_CONTEXT_PREFIX: &str = "streaming from ";
+
 /// Download trace_processor_shell atomically: stream into a
 /// `NamedTempFile` co-located with the cache dir, hash on the fly, then
 /// atomic-rename into place and write the sidecar.
+///
+/// Transient network failures (connect timeout, stream interruption, HTTP
+/// 429/5xx) are retried up to `DOWNLOAD_MAX_RETRIES` times with exponential
+/// backoff. Permanent client errors (400/401/403/404) and post-download
+/// validation failures fail immediately.
 async fn download_binary(config: &DownloadConfig, dest: &Path) -> Result<()> {
     let arch = platform_arch()?;
     let url = binary_url(config, arch)?;
-    // Never put the raw URL in logs or error text — an authenticated mirror
-    // may carry userinfo or a token query string. reqwest errors can still
-    // surface the raw URL; that residual leak is out of scope.
     let redacted_url = redact_url(&url);
 
     tracing::info!("downloading trace_processor_shell {TP_VERSION} ({arch}) from {redacted_url}");
@@ -280,12 +286,73 @@ async fn download_binary(config: &DownloadConfig, dest: &Path) -> Result<()> {
         .read_timeout(Duration::from_secs(120))
         .build()?;
 
-    // `reqwest::Error`'s Display embeds `" for url ({url})"`, which would
-    // leak userinfo and query tokens from authenticated mirrors. Strip the
-    // URL field before anyhow formats the chain, and attach our own
-    // already-redacted context.
+    let parent = dest
+        .parent()
+        .context("cache dir missing from binary path")?;
+    tokio::fs::create_dir_all(parent).await?;
+
+    let (tmp, hex_digest) =
+        download_with_retry(&client, &url, &redacted_url, parent, DOWNLOAD_MAX_RETRIES).await?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    persist_with_retry(tmp, dest).await?;
+    write_sidecar_atomically(dest, &hex_digest)?;
+
+    tracing::info!("saved trace_processor_shell to {}", dest.display());
+    Ok(())
+}
+
+/// Attempt the HTTP fetch + stream loop, retrying on transient errors.
+/// Returns the completed temp file and its SHA-256 hex digest on success.
+async fn download_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    redacted_url: &str,
+    tmp_dir: &Path,
+    max_retries: u32,
+) -> Result<(NamedTempFile, String)> {
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let delay = DOWNLOAD_RETRY_BASE_DELAY * 2u32.saturating_pow(attempt - 1);
+            tracing::warn!(
+                "retrying download (attempt {}/{}) after {delay:?}",
+                attempt + 1,
+                max_retries + 1,
+            );
+            tokio::time::sleep(delay).await;
+        }
+
+        match download_once(client, url, redacted_url, tmp_dir).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if !is_transient_download_error(&e) {
+                    return Err(e);
+                }
+                tracing::warn!("transient download error: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("download failed after retries")))
+}
+
+/// Single download attempt: HTTP GET → stream chunks → hash → temp file.
+async fn download_once(
+    client: &reqwest::Client,
+    url: &str,
+    redacted_url: &str,
+    tmp_dir: &Path,
+) -> Result<(NamedTempFile, String)> {
     let resp = client
-        .get(&url)
+        .get(url)
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -301,24 +368,15 @@ async fn download_binary(config: &DownloadConfig, dest: &Path) -> Result<()> {
         }
     }
 
-    let parent = dest
-        .parent()
-        .context("cache dir missing from binary path")?;
-    tokio::fs::create_dir_all(parent).await?;
-
-    // Reopening `tmp.path()` would fail on Windows with a sharing violation
-    // against the handle NamedTempFile already holds, so write via as_file_mut().
-    let mut tmp = NamedTempFile::new_in(parent)?;
+    let mut tmp = NamedTempFile::new_in(tmp_dir)?;
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
 
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        // Same URL-scrub as send()/error_for_status above — chunk errors
-        // also carry the request URL in their Display.
         let chunk = chunk
             .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("streaming from {redacted_url}"))?;
+            .with_context(|| format!("{STREAM_ERROR_CONTEXT_PREFIX}{redacted_url}"))?;
         hasher.update(&chunk);
         total += chunk.len() as u64;
         tmp.as_file_mut().write_all(&chunk)?;
@@ -329,19 +387,49 @@ async fn download_binary(config: &DownloadConfig, dest: &Path) -> Result<()> {
         bail!("download from {redacted_url} too small: {total} bytes");
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))?;
+    let hex_digest = hex::encode(hasher.finalize());
+    Ok((tmp, hex_digest))
+}
+
+/// Classify whether a download error is transient (worth retrying) or
+/// permanent (fail immediately). Permanent errors: 400, 401, 403, 404,
+/// and post-download Content-Length/size validation failures.
+fn is_transient_download_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+
+    if msg.contains("unexpected Content-Length") || msg.contains("too small") {
+        return false;
     }
 
-    persist_with_retry(tmp, dest).await?;
+    // Stream I/O errors (connection reset, EOF) produced by download_once.
+    // Must check before the reqwest downcast chain — body decode errors are
+    // reqwest::Error variants where is_connect/is_timeout are both false,
+    // so the chain loop would short-circuit to `false` if we checked later.
+    if msg.contains(STREAM_ERROR_CONTEXT_PREFIX) {
+        return true;
+    }
 
-    let hex_digest = hex::encode(hasher.finalize());
-    write_sidecar_atomically(dest, &hex_digest)?;
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            return is_retryable_status(status);
+        }
+        return reqwest_err.is_connect() || reqwest_err.is_timeout();
+    }
 
-    tracing::info!("saved trace_processor_shell to {}", dest.display());
-    Ok(())
+    for cause in err.chain() {
+        if let Some(reqwest_err) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = reqwest_err.status() {
+                return is_retryable_status(status);
+            }
+            return reqwest_err.is_connect() || reqwest_err.is_timeout();
+        }
+    }
+
+    false
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 /// Atomic rename with a small retry loop for Windows, where antivirus can
@@ -387,6 +475,7 @@ fn platform_arch() -> Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::thread::sleep;
 
     #[test]
@@ -714,5 +803,187 @@ mod tests {
         sweep_stale_temp_files(dir.path(), Duration::from_millis(1));
 
         assert!(keep.exists(), "sweep removed a non-tmp file");
+    }
+
+    #[test]
+    fn is_transient_classifies_stream_error_as_retryable() {
+        // The classifier recognizes STREAM_ERROR_CONTEXT_PREFIX (injected by
+        // download_once) as a transient I/O error (connection reset, EOF, etc.).
+        let err = anyhow::anyhow!("error streaming from https://example.com: connection reset");
+        assert!(
+            is_transient_download_error(&err),
+            "stream errors should be transient"
+        );
+    }
+
+    #[test]
+    fn is_transient_classifies_stream_context_over_io_error_as_retryable() {
+        // Regression: download_once wraps chunk errors as:
+        //   anyhow context("streaming from ...") -> inner error
+        // The STREAM_ERROR_CONTEXT_PREFIX check must fire before the reqwest
+        // downcast chain to avoid short-circuiting on false for body errors.
+        let inner = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let err = anyhow::Error::from(inner)
+            .context(format!("{STREAM_ERROR_CONTEXT_PREFIX}https://example.com"));
+        assert!(
+            is_transient_download_error(&err),
+            "stream error wrapping an I/O cause must be transient"
+        );
+    }
+
+    #[test]
+    fn is_transient_rejects_content_length_error() {
+        let err = anyhow::anyhow!(
+            "unexpected Content-Length 42 from https://example.com \
+             (expected >=1000000 for trace_processor_shell)"
+        );
+        assert!(
+            !is_transient_download_error(&err),
+            "Content-Length validation failure must not retry"
+        );
+    }
+
+    #[test]
+    fn is_transient_rejects_too_small_error() {
+        let err = anyhow::anyhow!("download from https://example.com too small: 500 bytes");
+        assert!(
+            !is_transient_download_error(&err),
+            "too-small validation failure must not retry"
+        );
+    }
+
+    #[test]
+    fn is_retryable_status_accepts_429_and_5xx() {
+        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(is_retryable_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(is_retryable_status(reqwest::StatusCode::GATEWAY_TIMEOUT));
+    }
+
+    #[test]
+    fn is_retryable_status_rejects_4xx() {
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(reqwest::StatusCode::FORBIDDEN));
+        assert!(!is_retryable_status(reqwest::StatusCode::NOT_FOUND));
+    }
+
+    // The 503 is caught by error_for_status() (classified as retryable 5xx),
+    // not by the post-download size validator — the response body never reaches
+    // the streaming loop on non-2xx status codes.
+    #[tokio::test]
+    async fn download_with_retry_succeeds_after_transient_failure() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_server = Arc::clone(&attempt_count);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let n = attempt_count_server.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First attempt: return 503
+                    let body = b"service unavailable";
+                    let headers = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                } else {
+                    // Subsequent: return 200 with a valid-size body
+                    let payload = vec![0x42u8; MIN_EXPECTED_SIZE as usize];
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n",
+                        payload.len(),
+                    );
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let _ = stream.write_all(&payload).await;
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/binary");
+        let redacted = redact_url(&url);
+
+        let result = download_with_retry(&client, &url, &redacted, tmp.path(), 2).await;
+
+        assert!(result.is_ok(), "should succeed on retry, got: {result:?}");
+        assert_eq!(
+            attempt_count.load(Ordering::SeqCst),
+            2,
+            "should have made exactly 2 attempts (1 failure + 1 success)"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_with_retry_fails_fast_on_404() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_server = Arc::clone(&attempt_count);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                attempt_count_server.fetch_add(1, Ordering::SeqCst);
+                let body = b"not found";
+                let headers = format!(
+                    "HTTP/1.1 404 Not Found\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                    body.len(),
+                );
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/binary");
+        let redacted = redact_url(&url);
+
+        let result = download_with_retry(&client, &url, &redacted, tmp.path(), 2).await;
+
+        assert!(result.is_err(), "404 must not be retried");
+        assert_eq!(
+            attempt_count.load(Ordering::SeqCst),
+            1,
+            "404 must fail on first attempt without retry"
+        );
     }
 }
