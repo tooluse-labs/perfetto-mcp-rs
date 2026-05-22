@@ -2,7 +2,7 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
-### [0.14.1](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.1) (May 22, 2026)
+### [0.14.2](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.2) (May 22, 2026)
 
 - **Download retry with exponential backoff.** Transient failures (HTTP 5xx, 429, connect/timeout errors, mid-stream I/O errors) now retry up to 2 times with 1s/2s delays. URLs are redacted in error messages to prevent credential leaks in logs.
 - **Module split.** Extracted `params`, `sql_templates`, `stdlib_catalog` out of `server.rs` (2672 → 1971 lines). Pure mechanical extraction — zero semantic changes.
