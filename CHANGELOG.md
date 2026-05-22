@@ -2,6 +2,13 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.14.4](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.4) (May 22, 2026)
+
+- **`load_trace` now returns routing context for LLM consumers.** Successful loads include a compact JSON `Trace summary` with trace type/profile, platform, trace duration, file size, process/thread counts, capability tags, and recommended next tools. Summary collection is best-effort: if the summary query fails, the trace still loads and the response marks the summary unavailable. The duration fields use Perfetto's `trace_start()`, `trace_end()`, and `trace_dur()` helper functions rather than reading `trace_bounds` directly.
+- **Chrome main-thread hotspot detection is more resilient.** `chrome_main_thread_hotspots` now includes `ts` in the result and falls back to Chrome's `Cr*Main` thread-name convention when `thread.is_main_thread` is missing or incorrect, reducing empty results on Chromium-family traces with incomplete thread metadata.
+- **MCP surface planning artifacts.** Added repository guidance, context-efficiency plans, and a GitHub issue creation helper for the next round of MCP routing/output-shaping work.
+- **Windows UTF-8 ACP test compatibility.** Codepage tests now tolerate systems configured with UTF-8 ACP, where emoji can legitimately round-trip through `CP_ACP`.
+
 ### [0.14.3](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.3) (May 22, 2026)
 
 - **Rust 1.95 / Clippy compatibility fix.** Replaced a `3.14` floating-point test literal in the lenient f64 parameter parser tests with a non-special sample value so `clippy::approx_constant` no longer fails `cargo clippy --all-targets --all-features -- -D warnings`.
