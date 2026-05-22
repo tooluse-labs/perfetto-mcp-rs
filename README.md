@@ -186,7 +186,7 @@ it in place.
 | `list_threads_in_process` | List threads under a process name (up to 2000) |
 | `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame (Chrome trace) |
 | `chrome_page_load_summary` | Page loads: URL, FCP, LCP, DCL, load timings in ms (Chrome trace) |
-| `chrome_main_thread_hotspots` | Top main-thread tasks by duration with cpu_pct, uses is_main_thread (Chrome trace) |
+| `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts and cpu_pct, using is_main_thread plus Chrome Cr*Main fallback (Chrome trace) |
 | `chrome_startup_summary` | Browser startup events and time-to-first-visible-content (Chrome trace) |
 | `chrome_web_content_interactions` | Web content interactions (clicks, taps, INP) ranked by duration (Chrome trace) |
 | `list_stdlib_modules` | List available PerfettoSQL stdlib modules with usage examples (no trace needed) |

@@ -446,10 +446,12 @@ impl PerfettoMcpServer {
 
     #[tool(
         name = "chrome_main_thread_hotspots",
-        description = "Top Chrome main-thread tasks by wall duration: id, name, \
-                       task_type, thread_name, process_name, dur_ms, cpu_pct \
-                       (thread_dur/dur), thread_dur_ms. Uses `chrome.tasks` and \
-                       `thread.is_main_thread = 1` (tid == pid per Linux convention).\n\
+        description = "Top Chrome main-thread tasks by wall duration: id, ts, \
+                       name, task_type, thread_name, process_name, dur_ms, cpu_pct \
+                       (thread_dur/dur), thread_dur_ms. Uses `chrome.tasks`, \
+                       `thread.is_main_thread = 1` when available, and Chrome's \
+                       `Cr*Main` thread-name convention as a fallback for traces \
+                       where thread metadata is incomplete or incorrect.\n\
                        \n\
                        Use when: investigating main-thread responsiveness, finding hot \
                        tasks during scroll/load, comparing CPU vs wall time, scoping \
@@ -474,12 +476,9 @@ impl PerfettoMcpServer {
                        - `limit`: max rows (default 100, capped at 5000). Must be > 0 \
                          if set.\n\
                        \n\
-                       Empty result: either no main-thread tasks exceeded `min_dur_ms` \
-                       (good performance at that threshold), or thread metadata is \
-                       incomplete (`is_main_thread` is NULL). If the latter is \
-                       suspected, retry with `execute_sql` filtering on `thread_name \
-                       IN ('CrBrowserMain', 'CrRendererMain')` to bypass the \
-                       `is_main_thread` filter."
+                       Empty result: no detected main-thread tasks exceeded `min_dur_ms` \
+                       at the selected process/window threshold, or the trace uses \
+                       non-standard main-thread names outside the `Cr*Main` fallback."
     )]
     async fn chrome_main_thread_hotspots(
         &self,
@@ -1601,14 +1600,17 @@ mod tests {
         }
     }
 
-    /// No-filter SQL keeps the same `JOIN process p ON ct.upid = p.upid` clause
+    /// No-filter SQL keeps the same `LEFT JOIN process p ON ct.upid = p.upid` clause
     /// as the filtered variants, so the join is harmless when no pid filter is
     /// set — this means handlers can always use the same builder.
     #[test]
     fn chrome_main_thread_hotspots_sql_no_filter_runs_all_main_threads() {
         let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters::default())
             .expect("builder must succeed");
-        assert!(sql.contains("WHERE t.is_main_thread = 1"));
+        assert!(sql.contains("ct.ts"));
+        assert!(sql.contains("LEFT JOIN thread t ON ct.utid = t.utid"));
+        assert!(sql.contains("LEFT JOIN process p ON ct.upid = p.upid"));
+        assert!(sql.contains("WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main')"));
         assert!(sql.contains("AND ct.dur > 16000000"));
         assert!(sql.contains("ORDER BY ct.dur DESC LIMIT 100"));
         assert!(
@@ -1622,6 +1624,16 @@ mod tests {
         assert!(
             !sql.contains("p.upid ="),
             "no-filter SQL must not emit upid filter, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_main_thread_hotspots_sql_uses_name_fallback_for_chromium_traces() {
+        let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters::default())
+            .expect("builder must succeed");
+        assert!(
+            sql.contains("ct.thread_name GLOB 'Cr*Main'"),
+            "main-thread detection must fall back to Chrome thread names, got: {sql}",
         );
     }
 

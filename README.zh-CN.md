@@ -183,7 +183,7 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 | `list_threads_in_process` | 列出指定进程名下的线程（最多 2000 条） |
 | `chrome_scroll_jank_summary` | 按原因汇总最严重的 Chrome 滚动卡顿帧（仅 Chrome trace） |
 | `chrome_page_load_summary` | 页面加载的 URL / FCP / LCP / DCL / load 耗时（仅 Chrome trace） |
-| `chrome_main_thread_hotspots` | 主线程任务按耗时排序，使用 is_main_thread 识别（仅 Chrome trace） |
+| `chrome_main_thread_hotspots` | 主线程任务按耗时排序，带 ts 和 cpu_pct，使用 is_main_thread 加 Chrome Cr*Main 兜底（仅 Chrome trace） |
 | `chrome_startup_summary` | 浏览器启动事件与首次可见内容时间（仅 Chrome trace） |
 | `chrome_web_content_interactions` | Web 内容交互（点击、触摸、INP）按耗时排序（仅 Chrome trace） |
 | `list_stdlib_modules` | 列出 PerfettoSQL stdlib 模块及用法示例（不需要先加载 trace） |

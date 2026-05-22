@@ -40,19 +40,16 @@ pub const CHROME_PAGE_LOAD_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.p
 
 /// SQL builder for `chrome_main_thread_hotspots`. Exported for integration tests.
 ///
-/// Uses `thread.is_main_thread = 1` (tid == pid in trace_processor).
-/// CAVEAT: `is_main_thread` is CppOptional and may be NULL for traces that
-/// lack complete thread creation metadata — in that case the tool returns
-/// empty rows (no SQL error). If empty, agents can fall back to execute_sql
-/// with `WHERE thread_name IN ('CrBrowserMain', 'CrRendererMain')`.
+/// Uses `thread.is_main_thread = 1` when trace_processor populated it, plus
+/// Chrome's `Cr*Main` thread-name convention as a fallback for Chromium-family
+/// traces that carry main-thread names but do not set the flag correctly.
 ///
 /// All set filter clauses AND together — the redundancy is harmless (e.g.
 /// `upid=3 AND pid=12800` still hits when the pair refers to one process).
-/// The base SQL picks up a `JOIN process p ON ct.upid = p.upid` so `p.pid`
+/// The base SQL picks up a `LEFT JOIN process p ON ct.upid = p.upid` so `p.pid`
 /// and `p.upid` are referenceable; the join is harmless when no process
 /// filter is present. `ChromeMainThreadHotspotsFilters::default()` is
-/// byte-equivalent to the legacy hardcoded SQL save for the `JOIN process`
-/// clause.
+/// equivalent to the default tool behavior.
 pub fn chrome_main_thread_hotspots_sql(
     filters: ChromeMainThreadHotspotsFilters<'_>,
 ) -> Result<String, PerfettoError> {
@@ -87,6 +84,7 @@ pub fn chrome_main_thread_hotspots_sql(
         "INCLUDE PERFETTO MODULE chrome.tasks; \
          SELECT \
            ct.id, \
+           ct.ts, \
            ct.name, \
            ct.task_type, \
            ct.thread_name, \
@@ -97,9 +95,9 @@ pub fn chrome_main_thread_hotspots_sql(
            END AS cpu_pct, \
            ct.thread_dur / 1e6 AS thread_dur_ms \
          FROM chrome_tasks ct \
-         JOIN thread t ON ct.utid = t.utid \
-         JOIN process p ON ct.upid = p.upid \
-         WHERE t.is_main_thread = 1 \
+         LEFT JOIN thread t ON ct.utid = t.utid \
+         LEFT JOIN process p ON ct.upid = p.upid \
+         WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main') \
            AND ct.dur > {min_dur_ns}",
     );
     if let Some(name) = process_name {

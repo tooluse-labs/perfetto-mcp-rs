@@ -9,7 +9,8 @@
 //! - scroll_jank.pftrace: chrome_janky_frames (6 rows) — strong e2e for
 //!   scroll_jank_summary.
 //! - page_loads.pftrace: chrome_page_loads (8 rows) — strong e2e for
-//!   page_load_summary. Also has 1684 is_main_thread tasks but **zero**
+//!   page_load_summary. It has main-thread tasks available via
+//!   `is_main_thread` and/or Chrome `Cr*Main` naming, but zero verified tasks
 //!   exceed the 16 ms threshold the tool filters by, so main_thread_hotspots
 //!   falls back to a weak assertion.
 //! - Neither fixture has chrome_startups or chrome_web_content_interactions
@@ -97,8 +98,8 @@ fn e2e_chrome_page_load_summary_against_fixture() {
 
 #[test]
 fn e2e_chrome_main_thread_hotspots_against_fixture() {
-    // Weak assertion: SQL executes cleanly. page_loads.pftrace has 1684
-    // is_main_thread tasks but verified 0 of them exceed the 16 ms threshold
+    // Weak assertion: SQL executes cleanly. page_loads.pftrace has
+    // main-thread tasks, but verified 0 of them exceed the 16 ms threshold
     // (all tasks well under frame budget on that capture), so empty rows is
     // a valid passing state here. scroll_jank.pftrace is not usable — it has
     // 0 chrome_tasks rows total. Upgrade to a strong assertion when a fixture
@@ -123,6 +124,7 @@ fn e2e_chrome_main_thread_hotspots_against_fixture() {
         // Structure check only when rows are present — row count is not asserted.
         for i in 0..table.len() {
             assert!(table.cell(i, "id").is_some(), "row {i} missing id");
+            assert!(table.cell(i, "ts").is_some(), "row {i} missing ts");
             assert!(table.cell(i, "name").is_some(), "row {i} missing name");
             assert!(
                 table.cell(i, "thread_name").is_some(),
