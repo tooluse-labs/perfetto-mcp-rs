@@ -98,6 +98,34 @@ pub struct LoadTraceParams {
 pub struct ExecuteSqlParams {
     /// SQL query to execute (PerfettoSQL syntax).
     pub sql: String,
+    /// Optional output row cap. This trims returned rows only; it does not
+    /// rewrite or limit the SQL that trace_processor executes. Mutually
+    /// exclusive with `head`. Accepts both numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+    /// Agent-friendly alias for `limit`: return only the first N decoded rows.
+    /// This trims returned rows only; it does not rewrite the SQL. Mutually
+    /// exclusive with `limit`. Accepts both numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub head: Option<u32>,
+    /// Return only column names and row-count metadata; omit row values.
+    #[serde(default)]
+    pub columns_only: bool,
+    /// Return column names, row-count metadata, and a small sample of rows.
+    /// Defaults to 10 sample rows unless `head` or `limit` is provided.
+    #[serde(default)]
+    pub summary: bool,
+    /// Include decoded row-count metadata with a row-returning shaped response.
+    #[serde(default)]
+    pub include_row_count: bool,
+    /// Optional per-string-cell character cap applied to returned rows only.
+    /// Accepts both numbers and numeric strings. Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub max_string_len: Option<u32>,
+    /// Redact common sensitive strings in returned cells (headers, tokens, and
+    /// local user-profile path segments). Defaults off for compatibility.
+    #[serde(default)]
+    pub redact_strings: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]

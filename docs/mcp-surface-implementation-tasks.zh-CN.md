@@ -10,6 +10,23 @@
 - **输出塑形不能改变 SQL 语义。** 只能改变返回给 LLM 的结果量和形态，不能自动改写查询。
 - **用测试锁住上下文成本。** 防止 instructions、tool descriptions 和大结果集悄悄膨胀。
 
+## 真实会话证据
+
+样本：`C:\Users\admin3\Documents\trace5.json` 的性能分析日志
+`C:\Users\admin3\Documents\log`。
+
+- 正向证据：`load_trace` summary 成功把 agent 路由到 Chrome domain tools；
+  `chrome_page_load_summary` 快速暴露 FCP / load 约 10.7 秒；
+  `chrome_scroll_jank_summary` 和 `chrome_web_content_interactions` 的空结果帮助排除
+  滚动 / 交互卡顿；`chrome_main_thread_hotspots` 暴露 Renderer 主线程长任务。
+- 主要缺口：后续定位“哪个资源或加载阶段卡住”依赖大量手写 SQL，尤其是
+  `slice` / `args` join、递归展开 descendants、按 navigation/FCP 时间窗口过滤。
+- 输出问题：多处结果在客户端 UI 中被 `...` 截断，`list_table_structure` 和长
+  `args.display_value` 噪声较高；输出里还包含本地路径、headers、User-Agent 等
+  可能敏感的字符串。
+- 错误模式：一次递归 SQL 因 `ambiguous column name: depth` 失败，agent 能修复，
+  但说明稳定 SQL 模式应被工具化或至少被错误 hint 明确引导。
+
 ## P0：最高优先级
 
 ### T0.1 实现 `inspect_trace` / `trace_overview`
@@ -58,15 +75,22 @@
   - `columns_only`：只返回列信息。
   - `summary`：返回列、行数状态、少量样本行。
   - `include_row_count`：请求返回解码行数或已知行数状态。
+  - `max_string_len`：限制单个字符串单元格长度，默认值应足够保留 URL / slice 名称
+    的关键信息。
+  - `redact_strings`：对 headers、cookies、tokens、本地用户路径等常见敏感字符串
+    做保守脱敏。
 - **返回元数据：**
   - `returned_rows`
   - `truncated`
   - `row_count_known`
+  - `string_truncated`
+  - `redacted`
   - `note`: 明确说明“仅输出层截断，SQL 执行语义未改变”。
 - **验收：**
   - `execute_sql(sql)` 默认行为保持兼容。
   - 塑形不会自动向 SQL 注入 `LIMIT`。
   - 样本或截断结果永远带 `truncated` / `returned_rows` 标记。
+  - 长字符串截断不会破坏 JSON；脱敏策略有测试覆盖，并允许显式关闭。
 
 ### T0.3 建立上下文预算测试
 
@@ -80,6 +104,26 @@
   - CI 能发现常驻上下文超预算。
   - 失败信息指出具体超预算项。
   - 调整预算必须显式修改测试，避免无意识膨胀。
+
+### T0.4 实现 `slice_descendants_summary`
+
+- **动机：** 真实会话中 agent 多次手写 `WITH RECURSIVE descendants...` 展开
+  slice 子树，并出现 `ambiguous column name: depth`。这是高频、稳定、易错的
+  Perfetto 分析子任务。
+- **输入：**
+  - `slice_ids`: 根 slice id 列表。
+  - `min_dur_ms`: 子 slice 最小时长，默认 1ms。
+  - `max_depth`: 最大递归深度，防止异常 trace 或 query 失控。
+  - `include_args`: 是否返回匹配子树中的 args 摘要，默认 false。
+  - `limit`: 返回行数上限。
+- **输出：**
+  - 按 `root_id`、`depth`、`slice.name` 聚合的 `count`、`total_ms`、`max_ms`。
+  - 可选 args 摘要使用字符串截断 / 脱敏策略。
+- **验收：**
+  - 对真实日志中的长任务 slice id 可复现手写 SQL 的核心结果。
+  - 不要求调用方理解 recursive CTE。
+  - 输出包含 `root_id`，支持一次分析多个根 slice。
+  - 对无效 slice id 返回空 rows，而不是 SQL 错误。
 
 ## P1：导航与知识按需化
 
@@ -109,6 +153,30 @@
   - 无参数调用保持兼容。
   - LLM 可用 `query: "binder"` 或 `domain: "android"` 减少无关返回。
 
+### T1.4 实现 Chrome page-load 二级分析工具
+
+- **候选名称：** `chrome_page_load_detail` 或
+  `chrome_resource_loading_summary`。
+- **动机：** `chrome_page_load_summary` 能发现 FCP / load 慢，但真实会话中 agent
+  仍需大量手写 SQL 才定位到 `EnhanceConfigManager::GetResource` / URL request
+  链路和关键 JS 文件。
+- **输入：**
+  - `navigation_id` 或 `page_load_id`。
+  - 可选 `url_substring`，用于聚焦特定站点或资源族。
+  - `start_ms` / `end_ms` 或 `phase`，支持导航开始、DCL、FCP、load 后窗口。
+  - `limit`。
+- **输出：**
+  - navigation 关键时间点：DCL、FCP、load、LCP（如有）。
+  - Browser 主线程导航阻塞摘要。
+  - Renderer 主线程长任务摘要。
+  - 资源请求摘要：URL / 文件名、first_ms、last_end_ms、max_ms、total_ms、
+    关键 slice 名称。
+  - 输出应保留行级证据，不直接写死自然语言根因结论。
+- **验收：**
+  - 能把“FCP 10.7s”后续分析压缩为一次或少数几次工具调用。
+  - 对无资源 URL 的 trace 返回空资源段并保留 navigation / long task 段。
+  - URL 和 headers 默认使用截断 / 脱敏。
+
 ## P2：运行效率与可观测性
 
 ### T2.1 缓存 schema 查询
@@ -131,15 +199,28 @@
 - **记录字段：** tool name、SQL 长度、duration、row count、truncated、error kind。
 - **验收：** 能区分 trace_processor 慢、SQL 慢、decode 慢、输出体积过大。
 
+### T2.4 增强 SQL 错误分类与 hint
+
+- **新增候选 `QueryErrorKind`：**
+  - `AmbiguousColumn`
+  - `SyntaxError`
+- **动机：** 真实会话中 `ambiguous column name: depth` 来自递归 CTE 与 `slice`
+  表同名列冲突。agent 可以修复，但错误 hint 可以直接提示使用表别名或 CTE
+  别名。
+- **验收：**
+  - `ambiguous column name:` 错误返回明确建议：给列加表/CTE alias。
+  - 仍保留原始 trace_processor 错误文本。
+
 ## P3：谨慎扩展分析工具
 
 ### T3.1 补少量高频 domain tools
 
 - **优先候选：**
-  1. `android_startup_summary`
-  2. `anr_suspects`
-  3. `cpu_hot_threads`
-  4. `memory_growth_summary`
+  1. `chrome_page_load_detail` / `chrome_resource_loading_summary`
+  2. `android_startup_summary`
+  3. `anr_suspects`
+  4. `cpu_hot_threads`
+  5. `memory_growth_summary`
 - **准入标准：**
   - 比 `execute_sql + stdlib-quickref` 明显减少试错。
   - 有 fixture / e2e。
@@ -148,16 +229,19 @@
 
 ## 推荐实施顺序
 
-1. T0.1 实现 `inspect_trace` / `trace_overview`。
-2. T0.2 增强 `execute_sql` 输出塑形。
-3. T0.3 建立上下文预算测试。
-4. T1.1 实现 `stdlib-quickref` Resource。
-5. T1.2 压缩 instructions 和 descriptions。
-6. T1.3 增强 `list_stdlib_modules` 筛选。
-7. T2.1 缓存 schema 查询。
-8. T2.2 增加 tool annotations。
-9. T2.3 增加 tracing spans。
-10. T3.1 按真实使用频率补 domain tools。
+1. T0.2 增强 `execute_sql` 输出塑形，先解决真实会话中结果被 `...` 截断的问题。
+2. T0.1 实现 `inspect_trace` / `trace_overview`。
+3. T0.4 实现 `slice_descendants_summary`。
+4. T0.3 建立上下文预算测试。
+5. T1.4 实现 Chrome page-load 二级分析工具。
+6. T1.1 实现 `stdlib-quickref` Resource。
+7. T1.2 压缩 instructions 和 descriptions。
+8. T1.3 增强 `list_stdlib_modules` 筛选。
+9. T2.1 缓存 schema 查询。
+10. T2.2 增加 tool annotations。
+11. T2.3 增加 tracing spans。
+12. T2.4 增强 SQL 错误分类与 hint。
+13. T3.1 按真实使用频率补 domain tools。
 
 ## 暂不实施
 

@@ -126,7 +126,11 @@ impl PerfettoMcpServer {
                        \n\
                        Parameters: `sql` is a single PerfettoSQL statement (the `INCLUDE \
                        PERFETTO MODULE foo;` and `SELECT ...` can be in the same call). \
-                       Requires `load_trace` to have run first.\n\
+                       Optional output shaping (`head`/`limit`, `columns_only`, \
+                       `summary`, `include_row_count`, `max_string_len`, \
+                       `redact_strings`) only changes what this tool returns; it \
+                       does not rewrite the SQL. Requires `load_trace` to have run \
+                       first.\n\
                        \n\
                        Empty `rows` means the query matched nothing — distinct from a SQL \
                        error, which is returned as an error string with a hint pointing \
@@ -149,7 +153,7 @@ impl PerfettoMcpServer {
             .query(&params.sql)
             .await
             .map_err(format_execute_sql_error)?;
-        serde_json::to_string(&table).map_err(|e| format!("Failed to serialize results: {e}"))
+        format_execute_sql_response(table, &params)
     }
 
     #[tool(
@@ -682,6 +686,401 @@ fn format_execute_sql_error(err: PerfettoError) -> String {
     }
 }
 
+const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
+const EXECUTE_SQL_SHAPING_NOTE: &str =
+    "Output shaping only changes rows returned by this tool; SQL execution semantics are unchanged.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecuteSqlOutputMode {
+    FullRows,
+    LimitedRows(usize),
+    Summary(usize),
+    ColumnsOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExecuteSqlOutputShape {
+    mode: ExecuteSqlOutputMode,
+    active: bool,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecuteSqlRowsResponse {
+    columns: Vec<String>,
+    rows: Vec<Vec<serde_json::Value>>,
+    row_count: usize,
+    returned_rows: usize,
+    truncated: bool,
+    row_count_known: bool,
+    string_truncated: bool,
+    redacted: bool,
+    note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecuteSqlSummaryResponse {
+    columns: Vec<String>,
+    sample_rows: Vec<Vec<serde_json::Value>>,
+    row_count: usize,
+    returned_rows: usize,
+    truncated: bool,
+    row_count_known: bool,
+    string_truncated: bool,
+    redacted: bool,
+    note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecuteSqlColumnsOnlyResponse {
+    columns: Vec<String>,
+    row_count: usize,
+    returned_rows: usize,
+    truncated: bool,
+    row_count_known: bool,
+    string_truncated: bool,
+    redacted: bool,
+    note: &'static str,
+}
+
+fn format_execute_sql_response(
+    table: DecodedTable,
+    params: &ExecuteSqlParams,
+) -> Result<String, String> {
+    let shape = execute_sql_output_shape(params)?;
+    if !shape.active {
+        return serde_json::to_string(&table)
+            .map_err(|e| format!("Failed to serialize results: {e}"));
+    }
+
+    let row_count = table.rows.len();
+    match shape.mode {
+        ExecuteSqlOutputMode::ColumnsOnly => {
+            serde_json::to_string(&ExecuteSqlColumnsOnlyResponse {
+                columns: table.columns,
+                row_count,
+                returned_rows: 0,
+                truncated: false,
+                row_count_known: true,
+                string_truncated: false,
+                redacted: false,
+                note: EXECUTE_SQL_SHAPING_NOTE,
+            })
+            .map_err(|e| format!("Failed to serialize results: {e}"))
+        }
+        ExecuteSqlOutputMode::Summary(limit) => {
+            let (sample_rows, string_truncated, redacted) =
+                transform_rows(table.rows.iter().take(limit), shape);
+            serde_json::to_string(&ExecuteSqlSummaryResponse {
+                columns: table.columns,
+                returned_rows: sample_rows.len(),
+                sample_rows,
+                row_count,
+                truncated: row_count > limit,
+                row_count_known: true,
+                string_truncated,
+                redacted,
+                note: EXECUTE_SQL_SHAPING_NOTE,
+            })
+            .map_err(|e| format!("Failed to serialize results: {e}"))
+        }
+        ExecuteSqlOutputMode::LimitedRows(limit) => {
+            let (rows, string_truncated, redacted) =
+                transform_rows(table.rows.iter().take(limit), shape);
+            serde_json::to_string(&ExecuteSqlRowsResponse {
+                columns: table.columns,
+                returned_rows: rows.len(),
+                rows,
+                row_count,
+                truncated: row_count > limit,
+                row_count_known: true,
+                string_truncated,
+                redacted,
+                note: EXECUTE_SQL_SHAPING_NOTE,
+            })
+            .map_err(|e| format!("Failed to serialize results: {e}"))
+        }
+        ExecuteSqlOutputMode::FullRows => {
+            let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+            serde_json::to_string(&ExecuteSqlRowsResponse {
+                columns: table.columns,
+                returned_rows: rows.len(),
+                rows,
+                row_count,
+                truncated: false,
+                row_count_known: true,
+                string_truncated,
+                redacted,
+                note: EXECUTE_SQL_SHAPING_NOTE,
+            })
+            .map_err(|e| format!("Failed to serialize results: {e}"))
+        }
+    }
+}
+
+fn execute_sql_output_shape(params: &ExecuteSqlParams) -> Result<ExecuteSqlOutputShape, String> {
+    if params.head.is_some() && params.limit.is_some() {
+        return Err("`head` and `limit` are aliases; provide only one.".to_owned());
+    }
+    let row_limit = params.head.or(params.limit);
+    if row_limit == Some(0) {
+        return Err("`head` / `limit` must be > 0 when set.".to_owned());
+    }
+    if params.max_string_len == Some(0) {
+        return Err("`max_string_len` must be > 0 when set.".to_owned());
+    }
+    if params.columns_only && params.summary {
+        return Err("`columns_only` and `summary` are mutually exclusive.".to_owned());
+    }
+    if params.columns_only && row_limit.is_some() {
+        return Err("`columns_only` cannot be combined with `head` or `limit`.".to_owned());
+    }
+
+    let max_string_len = params.max_string_len.map(|n| n as usize);
+    let active = params.columns_only
+        || params.summary
+        || row_limit.is_some()
+        || params.include_row_count
+        || max_string_len.is_some()
+        || params.redact_strings;
+    let mode = if params.columns_only {
+        ExecuteSqlOutputMode::ColumnsOnly
+    } else if params.summary {
+        ExecuteSqlOutputMode::Summary(
+            row_limit
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_EXECUTE_SQL_SUMMARY_ROWS),
+        )
+    } else if let Some(limit) = row_limit {
+        ExecuteSqlOutputMode::LimitedRows(limit as usize)
+    } else {
+        ExecuteSqlOutputMode::FullRows
+    };
+
+    Ok(ExecuteSqlOutputShape {
+        mode,
+        active,
+        max_string_len,
+        redact_strings: params.redact_strings,
+    })
+}
+
+fn transform_rows<'a>(
+    rows: impl Iterator<Item = &'a Vec<serde_json::Value>>,
+    shape: ExecuteSqlOutputShape,
+) -> (Vec<Vec<serde_json::Value>>, bool, bool) {
+    let mut any_truncated = false;
+    let mut any_redacted = false;
+    let transformed = rows
+        .map(|row| {
+            row.iter()
+                .map(|value| {
+                    let (value, truncated, redacted) =
+                        transform_value(value, shape.max_string_len, shape.redact_strings);
+                    any_truncated |= truncated;
+                    any_redacted |= redacted;
+                    value
+                })
+                .collect()
+        })
+        .collect();
+    (transformed, any_truncated, any_redacted)
+}
+
+fn transform_value(
+    value: &serde_json::Value,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+) -> (serde_json::Value, bool, bool) {
+    match value {
+        serde_json::Value::String(s) => {
+            let (redacted_text, redacted) = if redact_strings {
+                redact_string_cell(s)
+            } else {
+                (s.clone(), false)
+            };
+            let (text, truncated) = match max_string_len {
+                Some(max) => truncate_string_cell(&redacted_text, max),
+                None => (redacted_text, false),
+            };
+            (serde_json::Value::String(text), truncated, redacted)
+        }
+        serde_json::Value::Array(values) => {
+            let mut any_truncated = false;
+            let mut any_redacted = false;
+            let transformed = values
+                .iter()
+                .map(|value| {
+                    let (value, truncated, redacted) =
+                        transform_value(value, max_string_len, redact_strings);
+                    any_truncated |= truncated;
+                    any_redacted |= redacted;
+                    value
+                })
+                .collect();
+            (
+                serde_json::Value::Array(transformed),
+                any_truncated,
+                any_redacted,
+            )
+        }
+        serde_json::Value::Object(map) => {
+            let mut any_truncated = false;
+            let mut any_redacted = false;
+            let transformed = map
+                .iter()
+                .map(|(key, value)| {
+                    let (value, truncated, redacted) =
+                        transform_value(value, max_string_len, redact_strings);
+                    any_truncated |= truncated;
+                    any_redacted |= redacted;
+                    (key.clone(), value)
+                })
+                .collect();
+            (
+                serde_json::Value::Object(transformed),
+                any_truncated,
+                any_redacted,
+            )
+        }
+        _ => (value.clone(), false, false),
+    }
+}
+
+fn truncate_string_cell(s: &str, max_chars: usize) -> (String, bool) {
+    if s.chars().count() <= max_chars {
+        return (s.to_owned(), false);
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push_str("...<truncated>");
+    (out, true)
+}
+
+fn redact_string_cell(s: &str) -> (String, bool) {
+    let (s, redacted_headers) = redact_sensitive_header_lines(s);
+    let (s, redacted_paths) = redact_user_path_segments(&s);
+    let (s, redacted_assignments) = redact_sensitive_assignments(&s);
+    (
+        s,
+        redacted_headers || redacted_paths || redacted_assignments,
+    )
+}
+
+fn redact_sensitive_header_lines(s: &str) -> (String, bool) {
+    let mut changed = false;
+    let mut out = String::with_capacity(s.len());
+    for part in s.split_inclusive('\n') {
+        let (line, suffix) = part
+            .strip_suffix('\n')
+            .map_or((part, ""), |line| (line, "\n"));
+        let line_without_cr = line.strip_suffix('\r').unwrap_or(line);
+        let cr = if line.ends_with('\r') { "\r" } else { "" };
+        let trimmed = line_without_cr.trim_start();
+        let leading_len = line_without_cr.len() - trimmed.len();
+        let lower = trimmed.to_ascii_lowercase();
+        let sensitive = [
+            "authorization:",
+            "proxy-authorization:",
+            "cookie:",
+            "set-cookie:",
+            "x-api-key:",
+            "x-auth-token:",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+        if sensitive {
+            let key = trimmed
+                .split_once(':')
+                .map(|(key, _)| key)
+                .unwrap_or(trimmed);
+            out.push_str(&line_without_cr[..leading_len]);
+            out.push_str(key);
+            out.push_str(": <redacted>");
+            out.push_str(cr);
+            out.push_str(suffix);
+            changed = true;
+        } else {
+            out.push_str(part);
+        }
+    }
+    (out, changed)
+}
+
+fn redact_user_path_segments(s: &str) -> (String, bool) {
+    let mut out = s.to_owned();
+    let mut changed = false;
+    for prefix in ["C:\\Users\\", "C:/Users/", "/Users/", "/home/"] {
+        let mut search_from = 0;
+        while let Some(rel) = out[search_from..].find(prefix) {
+            let start = search_from + rel + prefix.len();
+            let tail = &out[start..];
+            let end = tail
+                .char_indices()
+                .find(|(_, c)| *c == '\\' || *c == '/')
+                .map(|(idx, _)| start + idx)
+                .unwrap_or(out.len());
+            if start < end && &out[start..end] != "<user>" {
+                out.replace_range(start..end, "<user>");
+                changed = true;
+                search_from = start + "<user>".len();
+            } else {
+                search_from = (end + 1).min(out.len());
+            }
+        }
+    }
+    (out, changed)
+}
+
+fn redact_sensitive_assignments(s: &str) -> (String, bool) {
+    let mut out = s.to_owned();
+    let mut changed = false;
+    let markers = [
+        "access_token=",
+        "refresh_token=",
+        "id_token=",
+        "token=",
+        "auth=",
+        "authorization=",
+        "password=",
+        "passwd=",
+        "secret=",
+        "apikey=",
+        "api_key=",
+        "session=",
+        "sessionid=",
+        "sid=",
+    ];
+    for marker in markers {
+        let mut search_from = 0;
+        loop {
+            if search_from >= out.len() {
+                break;
+            }
+            let lower = out.to_ascii_lowercase();
+            let Some(rel) = lower[search_from..].find(marker) else {
+                break;
+            };
+            let value_start = search_from + rel + marker.len();
+            let value_end = out[value_start..]
+                .char_indices()
+                .find(|(_, c)| matches!(*c, '&' | ' ' | '\r' | '\n' | '"' | '\'' | ';'))
+                .map(|(idx, _)| value_start + idx)
+                .unwrap_or(out.len());
+            if value_start < value_end && &out[value_start..value_end] != "<redacted>" {
+                out.replace_range(value_start..value_end, "<redacted>");
+                changed = true;
+                search_from = (value_start + "<redacted>".len()).min(out.len());
+            } else if value_end >= out.len() {
+                break;
+            } else {
+                search_from = value_end + 1;
+            }
+        }
+    }
+    (out, changed)
+}
+
 /// Chrome-tool error hint assumes `ensure_chrome_trace` has already rejected
 /// non-Chrome traces upstream. So MissingTable here means the expected
 /// stdlib view isn't present on a valid Chrome trace (stdlib schema drift
@@ -1156,6 +1555,19 @@ mod tests {
         }
     }
 
+    fn execute_sql_params(sql: &str) -> ExecuteSqlParams {
+        ExecuteSqlParams {
+            sql: sql.to_owned(),
+            limit: None,
+            head: None,
+            columns_only: false,
+            summary: false,
+            include_row_count: false,
+            max_string_len: None,
+            redact_strings: false,
+        }
+    }
+
     #[test]
     fn load_trace_summary_classifies_android_chrome_trace() {
         let metadata = decoded_table(
@@ -1414,6 +1826,204 @@ mod tests {
             formatted.contains("aggregate"),
             "row-cap message must push agents toward aggregation, got: {formatted}",
         );
+    }
+
+    #[test]
+    fn execute_sql_response_without_shaping_preserves_legacy_shape() {
+        let table = decoded_table(&["a"], vec![vec![json!("abcdef")]]);
+        let params = execute_sql_params("SELECT 'abcdef' AS a");
+
+        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(
+            parsed,
+            json!({"columns": ["a"], "rows": [["abcdef"]]}),
+            "default execute_sql response must stay wire-compatible",
+        );
+    }
+
+    #[test]
+    fn execute_sql_head_limits_returned_rows_and_marks_truncation() {
+        let table = decoded_table(&["n"], vec![vec![json!(1)], vec![json!(2)]]);
+        let mut params = execute_sql_params("SELECT n FROM nums");
+        params.head = Some(1);
+
+        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(parsed["rows"], json!([[1]]));
+        assert_eq!(parsed["row_count"], json!(2));
+        assert_eq!(parsed["returned_rows"], json!(1));
+        assert_eq!(parsed["truncated"], json!(true));
+        assert_eq!(parsed["row_count_known"], json!(true));
+        assert!(
+            parsed["note"]
+                .as_str()
+                .expect("note string")
+                .contains("SQL execution semantics are unchanged"),
+            "note must prevent SQL-limit confusion: {parsed}",
+        );
+    }
+
+    #[test]
+    fn execute_sql_summary_uses_default_sample_rows() {
+        let rows = (0..12).map(|n| vec![json!(n)]).collect();
+        let table = decoded_table(&["n"], rows);
+        let mut params = execute_sql_params("SELECT n FROM nums");
+        params.summary = true;
+
+        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(
+            parsed["sample_rows"].as_array().expect("sample rows").len(),
+            DEFAULT_EXECUTE_SQL_SUMMARY_ROWS,
+        );
+        assert_eq!(parsed["row_count"], json!(12));
+        assert_eq!(parsed["returned_rows"], json!(10));
+        assert_eq!(parsed["truncated"], json!(true));
+        assert!(
+            parsed.get("rows").is_none(),
+            "summary must not emit full rows"
+        );
+    }
+
+    #[test]
+    fn execute_sql_columns_only_omits_rows() {
+        let table = decoded_table(&["a", "b"], vec![vec![json!(1), json!("x")]]);
+        let mut params = execute_sql_params("SELECT 1 AS a, 'x' AS b");
+        params.columns_only = true;
+
+        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(parsed["columns"], json!(["a", "b"]));
+        assert_eq!(parsed["row_count"], json!(1));
+        assert_eq!(parsed["returned_rows"], json!(0));
+        assert!(parsed.get("rows").is_none(), "columns_only must omit rows");
+        assert!(
+            parsed.get("sample_rows").is_none(),
+            "columns_only must omit sample_rows"
+        );
+    }
+
+    #[test]
+    fn execute_sql_max_string_len_truncates_returned_cells() {
+        let table = decoded_table(&["s"], vec![vec![json!("abcdefghijklmnopqrstuvwxyz")]]);
+        let mut params = execute_sql_params("SELECT long_string AS s");
+        params.max_string_len = Some(8);
+
+        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(parsed["rows"][0][0], json!("abcdefgh...<truncated>"));
+        assert_eq!(parsed["string_truncated"], json!(true));
+        assert_eq!(parsed["redacted"], json!(false));
+    }
+
+    #[test]
+    fn execute_sql_redact_strings_masks_common_sensitive_values() {
+        let table = decoded_table(
+            &["header", "path", "url"],
+            vec![vec![
+                json!("Authorization: Bearer secret\r\nUser-Agent: test"),
+                json!("C:\\Users\\FanTao\\AppData\\Local\\Qianwen"),
+                json!("https://example.test/?access_token=secret-token&ok=1"),
+            ]],
+        );
+        let mut params = execute_sql_params("SELECT sensitive_cells");
+        params.redact_strings = true;
+
+        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(
+            parsed["rows"][0][0],
+            json!("Authorization: <redacted>\r\nUser-Agent: test")
+        );
+        assert_eq!(
+            parsed["rows"][0][1],
+            json!("C:\\Users\\<user>\\AppData\\Local\\Qianwen")
+        );
+        assert_eq!(
+            parsed["rows"][0][2],
+            json!("https://example.test/?access_token=<redacted>&ok=1")
+        );
+        assert_eq!(parsed["redacted"], json!(true));
+    }
+
+    #[test]
+    fn execute_sql_redact_strings_handles_token_at_eof() {
+        let table = decoded_table(
+            &["url"],
+            vec![vec![json!(
+                "https://example.test/?access_token=secret-token"
+            )]],
+        );
+        let mut params = execute_sql_params("SELECT url");
+        params.redact_strings = true;
+
+        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(
+            parsed["rows"][0][0],
+            json!("https://example.test/?access_token=<redacted>")
+        );
+        assert_eq!(parsed["redacted"], json!(true));
+    }
+
+    #[test]
+    fn execute_sql_redact_strings_masks_terminal_user_profile_paths() {
+        let table = decoded_table(
+            &["win", "win_slash", "mac", "linux"],
+            vec![vec![
+                json!("C:\\Users\\Alice"),
+                json!("C:/Users/Alice"),
+                json!("/Users/Alice"),
+                json!("/home/alice"),
+            ]],
+        );
+        let mut params = execute_sql_params("SELECT profile_paths");
+        params.redact_strings = true;
+
+        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(parsed["rows"][0][0], json!("C:\\Users\\<user>"));
+        assert_eq!(parsed["rows"][0][1], json!("C:/Users/<user>"));
+        assert_eq!(parsed["rows"][0][2], json!("/Users/<user>"));
+        assert_eq!(parsed["rows"][0][3], json!("/home/<user>"));
+        assert_eq!(parsed["redacted"], json!(true));
+    }
+
+    #[test]
+    fn execute_sql_output_shape_rejects_conflicting_or_zero_limits() {
+        let mut params = execute_sql_params("SELECT 1");
+        params.head = Some(1);
+        params.limit = Some(1);
+        let err = execute_sql_output_shape(&params).expect_err("head + limit must reject");
+        assert!(err.contains("head"), "got: {err}");
+
+        let mut params = execute_sql_params("SELECT 1");
+        params.limit = Some(0);
+        let err = execute_sql_output_shape(&params).expect_err("limit=0 must reject");
+        assert!(err.contains("> 0"), "got: {err}");
+
+        let mut params = execute_sql_params("SELECT 1");
+        params.max_string_len = Some(0);
+        let err = execute_sql_output_shape(&params).expect_err("max_string_len=0 must reject");
+        assert!(err.contains("max_string_len"), "got: {err}");
+    }
+
+    #[test]
+    fn execute_sql_params_accept_stringified_numeric_shaping_fields() {
+        let p: ExecuteSqlParams =
+            serde_json::from_str(r#"{"sql": "SELECT 1", "head": "3", "max_string_len": "40"}"#)
+                .expect("stringified numeric shaping fields must deserialize");
+        assert_eq!(p.head, Some(3));
+        assert_eq!(p.max_string_len, Some(40));
     }
 
     // The description is a proc-macro string literal so it can't interpolate

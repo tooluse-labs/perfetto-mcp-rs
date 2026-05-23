@@ -2,6 +2,14 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.15.0](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.0) (May 23, 2026)
+
+- **`execute_sql` output shaping for LLM consumers.** `execute_sql` keeps the legacy `{columns, rows}` response by default, but now accepts optional shaping fields for large or exploratory queries: `head` / `limit` to cap returned rows, `summary` for a compact sample response, `columns_only` for schema-first exploration, and `include_row_count` for explicit completeness metadata. Shaped responses report `returned_rows`, `truncated`, and `row_count_known` so agents can tell sample evidence from complete evidence instead of guessing from UI truncation.
+- **Best-effort string redaction before SQL results reach the LLM.** New `redact_strings` masks common sensitive values in returned string cells, including auth headers, cookies, token-like query parameters, passwords/secrets/API keys, and local user-profile path segments such as `C:\Users\<user>` / `/home/<user>`. This is intended for real trace/log analysis where URLs, headers, and local filesystem paths can appear in query results.
+- **Large-string context control.** New `max_string_len` truncates long returned strings and marks `string_truncated` in shaped responses, reducing context waste from large JSON blobs, URLs, SQL text, or trace payload strings while preserving row/column structure.
+- **Redaction edge-case hardening.** Added regression coverage for token-at-EOF URLs such as `access_token=...` and terminal profile paths such as `C:\Users\Alice`, `/Users/Alice`, and `/home/alice`, ensuring redaction does not panic and does not leak the username when no trailing path separator is present.
+- **Real-session optimization notes.** The context-efficiency and MCP-surface planning docs now capture lessons from a real Chrome trace analysis session, including the need for progressive SQL sampling, explicit output metadata, string truncation/redaction, and dedicated follow-up tools for page-load subanalysis.
+
 ### [0.14.4](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.14.4) (May 22, 2026)
 
 - **`load_trace` now returns routing context for LLM consumers.** Successful loads include a compact JSON `Trace summary` with trace type/profile, platform, trace duration, file size, process/thread counts, capability tags, and recommended next tools. Summary collection is best-effort: if the summary query fails, the trace still loads and the response marks the summary unavailable. The duration fields use Perfetto's `trace_start()`, `trace_end()`, and `trace_dur()` helper functions rather than reading `trace_bounds` directly.

@@ -1,6 +1,6 @@
 # perfetto-mcp-rs 上下文与 Token 效率优化方案
 
-Last updated: 2026-05-11
+Last updated: 2026-05-23
 
 ## 背景
 
@@ -33,6 +33,53 @@ Last updated: 2026-05-11
 - `STDLIB_INSTRUCTIONS` 和 `execute_sql` description 承载了大量教学内容，能提升 agent 行为，但可能成为固定上下文成本。
 - `execute_sql` 已有 `MAX_ROWS = 5000` 的硬上限，但缺少 `head`、`count`、`columns_only`、`summary` 等结果塑形模式。
 - roadmap 中已有 Milestone 6：`execute_sql` summary、schema cache、query cancellation，与本方案一致。
+
+## 真实会话观察：`trace5.json`
+
+样本：用户请求“分析性能问题”，agent 使用 `perfetto-rs` 分析
+`C:\Users\admin3\Documents\trace5.json`，日志保存在
+`C:\Users\admin3\Documents\log`。该 trace 约 204.5 秒、Chrome 130、
+24 个进程、289 个线程。
+
+有效信号：
+
+- `load_trace` summary 和 `recommended_next_tools` 起效。agent 先调用
+  `chrome_page_load_summary`、`chrome_scroll_jank_summary`、
+  `chrome_web_content_interactions`、`chrome_main_thread_hotspots`，没有直接
+  退回盲目扫 `slice`。
+- Chrome domain tools 给出了正确的一层判断：页面
+  `https://www.qianwen.com/chat` 的 FCP / load 约 10.7 秒；没有滚动卡顿和
+  Web content interaction；Renderer 主线程存在 500ms 级长任务。
+- 后续自定义 SQL 能定位到有价值根因：关键 JS 约导航后 3 秒发起，但
+  `EnhanceConfigManager::GetResource` / URL request 相关链路卡住约
+  5.8-6.35 秒，之后才进入 V8 解析和执行。
+
+暴露的问题：
+
+- 多处工具结果在会话 UI 中被省略成 `...`，尤其是 `list_table_structure`、
+  大 rows、`args.display_value`、headers / URL / 本地路径等长字符串。LLM
+  仍能推进，但实际上是在不完整结果上推理。
+- agent 反复手写 `WITH RECURSIVE descendants...` 来展开 slice 子树，并出现
+  一次 `ambiguous column name: depth`。错误被自动修复，但这是稳定、可工具化
+  的重复模式。
+- 从 `chrome_page_load_summary` 到“哪个资源或导航阶段卡住”仍需要大量手写
+  SQL。现有 Chrome 工具能发现 FCP 慢，但缺少 page-load 二级细分入口。
+- `chrome_main_thread_hotspots` 缺少时间窗口参数。日志里反复手写
+  `ts >= navigation_start`、`ts >= fcp_ts`、`ms_from_nav`，说明 LLM 需要按
+  navigation / FCP / 交互窗口过滤热点。
+- 输出中包含本地用户目录、请求 headers、User-Agent、URL 参数等敏感或高噪声
+  字符串。当前工具没有统一的截断 / 脱敏策略。
+
+优先级影响：
+
+- `execute_sql` 输出塑形应排在上下文优化的第一梯队。它不仅节省 token，也能
+  让 agent 明确知道结果是否被截断，而不是依赖客户端 UI 的 `...`。
+- 需要新增一个小而强的 slice 子树分析工具，避免递归 SQL 重写和 alias 错误。
+- Chrome page-load 场景需要二级工具：页面加载慢时，直接汇总导航阻塞、资源
+  请求、Renderer 长任务和关键 URL，而不是让 agent 从原始 `slice` / `args`
+  反复试探。
+- 长字符串截断和常见敏感字段脱敏应作为结果塑形的一部分，而不是留给每个
+  domain tool 单独处理。
 
 ## 设计原则
 
@@ -164,15 +211,16 @@ stdlib quick reference when unsure.
 
 ## 建议实施顺序
 
-1. 先加预算测试，锁定当前成本。
-2. 压缩 `STDLIB_INSTRUCTIONS` 和工具 description。
-3. 新增 stdlib quickref resource，并更新 README。
-4. 实现 `execute_sql` 输出层塑形。
+1. 实现 `execute_sql` 输出层塑形，优先解决真实会话里结果被 UI 省略的问题。
+2. 先加预算测试，锁定当前成本。
+3. 压缩 `STDLIB_INSTRUCTIONS` 和工具 description。
+4. 新增 stdlib quickref resource，并更新 README。
 5. 增强 `list_stdlib_modules` 筛选。
-6. 实现 schema 查询内存缓存。
-7. 最后做 cancellation 和 tracing spans。
+6. 新增 slice 子树分析和 page-load 二级分析工具。
+7. 实现 schema 查询内存缓存。
+8. 最后做 cancellation 和 tracing spans。
 
-这个顺序的好处是：先建立防回归约束，再移动教学内容，随后降低最大 token 来源，即大查询结果。缓存和取消属于运行体验优化，可在上下文成本稳定后推进。
+这个顺序的好处是：先降低最大实际 token 来源，即大查询结果，再建立防回归约束并移动教学内容。真实日志显示，大结果和长字符串对会话质量的影响比工具声明体积更直接。缓存和取消属于运行体验优化，可在上下文成本稳定后推进。
 
 ## 风险与缓解
 

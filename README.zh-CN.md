@@ -178,7 +178,7 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 | `load_trace` | 打开一个 Perfetto trace 文件，并返回轻量路由摘要（类型/profile、时长、平台、进程/线程数、能力标签、推荐下一步工具） |
 | `list_tables` | 列出 trace 里的表和视图，支持 GLOB 过滤 |
 | `list_table_structure` | 查看某张表的列名和类型 |
-| `execute_sql` | 执行 PerfettoSQL 查询，返回列式 JSON `{columns, rows}`（最多 5000 行） |
+| `execute_sql` | 执行 PerfettoSQL 查询，返回列式 JSON `{columns, rows}`（最多 5000 行）；可选输出塑形支持 `head`/`limit`、`summary`、`columns_only`、`include_row_count`、`max_string_len`、`redact_strings` |
 | `list_processes` | 列出 trace 里的进程（pid、名称、起止时间戳） |
 | `list_threads_in_process` | 列出指定进程名下的线程（最多 2000 条） |
 | `chrome_scroll_jank_summary` | 按原因汇总最严重的 Chrome 滚动卡顿帧（仅 Chrome trace） |

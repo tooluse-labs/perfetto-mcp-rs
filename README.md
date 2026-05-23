@@ -181,7 +181,7 @@ it in place.
 | `load_trace` | Open a Perfetto trace file and return a lightweight routing summary (type/profile, duration, platform, process/thread counts, capabilities, recommended next tools) |
 | `list_tables` | List tables/views in the loaded trace, optional GLOB filter |
 | `list_table_structure` | Show column names and types for a table |
-| `execute_sql` | Run a PerfettoSQL query, returns columnar JSON `{columns, rows}` (max 5000 rows) |
+| `execute_sql` | Run a PerfettoSQL query, returns columnar JSON `{columns, rows}` (max 5000 rows); optional output shaping supports `head`/`limit`, `summary`, `columns_only`, `include_row_count`, `max_string_len`, and `redact_strings` |
 | `list_processes` | List processes in the trace (pid, name, start/end timestamps) |
 | `list_threads_in_process` | List threads under a process name (up to 2000) |
 | `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame (Chrome trace) |
