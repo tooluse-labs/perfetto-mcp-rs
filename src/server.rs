@@ -404,7 +404,8 @@ impl PerfettoMcpServer {
                        same view.\n\
                        \n\
                        Parameters: optional `max_string_len` caps returned string \
-                       cells (defaults to 240 chars). Operates on the loaded trace.\n\
+                       cells. Unset preserves full strings for precision. Operates \
+                       on the loaded trace.\n\
                        \n\
                        Output: metadata-first JSON preserving `columns` / \
                        `rows`; `truncated=true` means the row cap was reached; \
@@ -440,7 +441,8 @@ impl PerfettoMcpServer {
                        `chrome.page_loads` module.\n\
                        \n\
                        Parameters: optional `max_string_len` caps returned string \
-                       cells (defaults to 240 chars). Operates on the loaded trace.\n\
+                       cells. Unset preserves full strings for precision. Operates \
+                       on the loaded trace.\n\
                        \n\
                        Output: metadata-first JSON preserving `columns` / \
                        `rows`; `truncated=true` means the row cap was reached; \
@@ -493,9 +495,8 @@ impl PerfettoMcpServer {
                          100 to focus on bigger stutters.\n\
                         - `limit`: max rows (default 100, capped at 5000). Must be > 0 \
                           if set.\n\
-                        - `max_string_len`: cap returned string cells. Defaults to 240 \
-                          chars; pass a larger value when full task names or URLs matter. \
-                          Must be > 0 if set.\n\
+                        - `max_string_len`: optional cap for returned string cells. \
+                          Unset preserves full strings for precision. Must be > 0 if set.\n\
                         \n\
                         Output: metadata-first JSON preserving `columns` / \
                         `rows`; `truncated=true` means the row cap was reached; \
@@ -545,7 +546,8 @@ impl PerfettoMcpServer {
                        `chrome_main_thread_hotspots`.\n\
                        \n\
                        Parameters: optional `max_string_len` caps returned string \
-                       cells (defaults to 240 chars). Operates on the loaded trace.\n\
+                       cells. Unset preserves full strings for precision. Operates \
+                       on the loaded trace.\n\
                        \n\
                        Output: metadata-first JSON preserving `columns` / \
                        `rows`; `truncated=true` means the row cap was reached; \
@@ -582,7 +584,8 @@ impl PerfettoMcpServer {
                        `execute_sql` against `chrome.web_content_interactions`.\n\
                        \n\
                        Parameters: optional `max_string_len` caps returned string \
-                       cells (defaults to 240 chars). Operates on the loaded trace.\n\
+                       cells. Unset preserves full strings for precision. Operates \
+                       on the loaded trace.\n\
                        \n\
                        Output: metadata-first JSON preserving `columns` / \
                        `rows`; `truncated=true` means the row cap was reached; \
@@ -720,7 +723,7 @@ fn format_execute_sql_error(err: PerfettoError) -> String {
 }
 
 const DEFAULT_CHROME_TOOL_ROWS: usize = 100;
-const DEFAULT_CHROME_TOOL_MAX_STRING_LEN: usize = 240;
+const DEFAULT_CHROME_TOOL_MAX_STRING_LEN: Option<usize> = None;
 const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 const EXECUTE_SQL_SHAPING_NOTE: &str =
     "row_count is post-SQL decoded rows; head/limit only trims returned tool rows.";
@@ -841,10 +844,10 @@ fn chrome_hotspots_effective_limit(limit: Option<u32>) -> usize {
     }
 }
 
-fn chrome_tool_max_string_len(max_string_len: Option<u32>) -> Result<usize, String> {
+fn chrome_tool_max_string_len(max_string_len: Option<u32>) -> Result<Option<usize>, String> {
     match max_string_len {
         Some(0) => Err("`max_string_len` must be > 0 when set.".to_owned()),
-        Some(n) => Ok(n as usize),
+        Some(n) => Ok(Some(n as usize)),
         None => Ok(DEFAULT_CHROME_TOOL_MAX_STRING_LEN),
     }
 }
@@ -865,13 +868,13 @@ fn format_chrome_tool_response(
 fn format_chrome_tool_response_with_redaction(
     table: DecodedTable,
     effective_limit: usize,
-    max_string_len: usize,
+    max_string_len: Option<usize>,
     redact_strings: bool,
 ) -> Result<String, String> {
     let shape = ExecuteSqlOutputShape {
         mode: ExecuteSqlOutputMode::FullRows,
         active: true,
-        max_string_len: Some(max_string_len),
+        max_string_len,
         redact_strings,
     };
     let returned_rows = table.rows.len();
@@ -2176,22 +2179,39 @@ mod tests {
     }
 
     #[test]
-    fn chrome_tool_response_truncates_long_strings_by_default() {
+    fn chrome_tool_response_preserves_long_strings_by_default() {
         let long = "abcdefghijklmnopqrstuvwxyz".repeat(12);
-        let table = decoded_table(&["name"], vec![vec![json!(long)]]);
+        let table = decoded_table(&["name"], vec![vec![json!(long.clone())]]);
 
         let response =
             format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, None).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         let returned = parsed["rows"][0][0].as_str().expect("string cell");
+        assert_eq!(
+            returned, long,
+            "Chrome-tool strings should be precise by default"
+        );
+        assert_eq!(parsed["string_truncated"], json!(false));
+    }
+
+    #[test]
+    fn chrome_tool_response_truncates_long_strings_when_requested() {
+        let long = "abcdefghijklmnopqrstuvwxyz".repeat(12);
+        let table = decoded_table(&["name"], vec![vec![json!(long)]]);
+
+        let response = format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, Some(24))
+            .expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        let returned = parsed["rows"][0][0].as_str().expect("string cell");
         assert!(
             returned.ends_with("...<truncated>"),
-            "long Chrome-tool strings should be capped by default: {returned}"
+            "explicit max_string_len should cap long Chrome-tool strings: {returned}"
         );
         assert_eq!(
             returned.chars().count(),
-            DEFAULT_CHROME_TOOL_MAX_STRING_LEN + "...<truncated>".chars().count()
+            24 + "...<truncated>".chars().count()
         );
         assert_eq!(parsed["string_truncated"], json!(true));
     }

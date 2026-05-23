@@ -199,6 +199,10 @@ forensic work, start the server with
 `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`; `load_trace` reports the active
 policy in its summary.
 
+Precision note: dedicated Chrome tools preserve full string cells by default.
+Use `max_string_len` only when you explicitly want to trade detail for a
+smaller response.
+
 Typical flow depends on trace type:
 
 - **Chrome traces**: `load_trace` → dedicated `chrome_*` tools

@@ -190,6 +190,8 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 
 隐私提示：MCP tool 的结果通常会进入 LLM 上下文，而真实 trace 里可能包含 URL、header、cookie、本地路径等个人或凭据相关信息。`execute_sql` 和专用 Chrome 工具默认遮蔽这类敏感字符串，同时保留诊断结构。需要原始取证数据时，可在启动服务端前设置 `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`；`load_trace` 会在摘要里报告当前策略。
 
+精度提示：专用 Chrome 工具默认保留完整字符串单元格。只有在明确想用细节换取更小响应时，才使用 `max_string_len`。
+
 典型流程按 trace 类型走：
 
 - **Chrome trace**：`load_trace` → 直接用专用的 `chrome_*` 工具

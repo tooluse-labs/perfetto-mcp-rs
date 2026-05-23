@@ -180,7 +180,7 @@ pub struct ListThreadsInProcessParams {
 #[serde(deny_unknown_fields)]
 pub struct ChromeTraceParams {
     /// Optional per-string-cell character cap applied to returned Chrome-tool
-    /// rows only. Defaults to the server's Chrome-tool cap; accepts both
+    /// rows only. Unset preserves full strings for precision; accepts both
     /// numbers and numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
@@ -219,7 +219,7 @@ pub struct ChromeMainThreadHotspotsParams {
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,
     /// Optional per-string-cell character cap applied to returned rows only.
-    /// Defaults to the server's Chrome-tool cap; accepts both numbers and
+    /// Unset preserves full strings for precision; accepts both numbers and
     /// numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
