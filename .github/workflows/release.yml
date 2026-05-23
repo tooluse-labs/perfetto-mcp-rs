@@ -47,6 +47,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.x"
+          repo-token: ${{ github.token }}
 
       - name: Install musl-tools (musl targets only)
         if: contains(matrix.target, 'musl')
@@ -264,6 +265,7 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.x"
+          repo-token: ${{ github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
 
