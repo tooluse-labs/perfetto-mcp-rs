@@ -178,7 +178,7 @@ it in place.
 
 | Tool | Purpose |
 |---|---|
-| `load_trace` | Open a Perfetto trace file and return a lightweight routing summary (type/profile, duration, platform, process/thread counts, capabilities, recommended next tools) |
+| `load_trace` | Open a Perfetto trace file and return a lightweight routing summary (type/profile, duration, platform, process/thread counts, capabilities, current redaction policy, recommended next tools) |
 | `list_tables` | List tables/views in the loaded trace, optional GLOB filter |
 | `list_table_structure` | Show column names and types for a table |
 | `execute_sql` | Run a PerfettoSQL query (max 5000 rows); optional output shaping supports `head`/`limit`, `summary`, `columns_only`, `include_row_count`, and `max_string_len`; server-side privacy redaction masks sensitive URL/header/cookie/path values by default |
@@ -195,7 +195,8 @@ Privacy note: MCP tool results are normally visible to the LLM context, and
 real traces can contain URLs, headers, cookies, and local paths. `execute_sql`
 masks sensitive user and credential-like string values by default while keeping
 the diagnostic structure visible. For raw forensic work, start the server with
-`PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`.
+`PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`; `load_trace` reports the active
+policy in its summary.
 
 Typical flow depends on trace type:
 

@@ -48,7 +48,7 @@ impl ServerHandler for PerfettoMcpServer {
                 website_url: None,
             },
             capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some(STDLIB_INSTRUCTIONS.into()),
+            instructions: Some(server_instructions()),
             ..Default::default()
         }
     }
@@ -691,6 +691,42 @@ fn format_execute_sql_error(err: PerfettoError) -> String {
 const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 const EXECUTE_SQL_SHAPING_NOTE: &str =
     "Output shaping only changes rows returned by this tool; SQL execution semantics are unchanged.";
+const REDACTION_POLICY_NOTE: &str =
+    "execute_sql string cells may contain <redacted>; this is server-side policy, not a tool parameter.";
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct RedactionPolicy {
+    execute_sql_string_cells: bool,
+    env_var: &'static str,
+    note: &'static str,
+}
+
+fn redaction_policy_for(enabled: bool) -> RedactionPolicy {
+    RedactionPolicy {
+        execute_sql_string_cells: enabled,
+        env_var: REDACT_STRINGS_DEFAULT_ENV,
+        note: REDACTION_POLICY_NOTE,
+    }
+}
+
+fn current_redaction_policy() -> RedactionPolicy {
+    redaction_policy_for(default_redact_strings())
+}
+
+fn server_instructions() -> String {
+    server_instructions_for_redaction(default_redact_strings())
+}
+
+fn server_instructions_for_redaction(enabled: bool) -> String {
+    let state = if enabled { "enabled" } else { "disabled" };
+    format!(
+        "{STDLIB_INSTRUCTIONS}\n\n\
+         Privacy policy: execute_sql string redaction is {state}. \
+         This is server-side policy, not a tool parameter; users control it \
+         before startup with {REDACT_STRINGS_DEFAULT_ENV}. If redaction is enabled, \
+         execute_sql string cells may contain <redacted> while preserving diagnostic structure."
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecuteSqlOutputMode {
@@ -1300,6 +1336,7 @@ struct LoadTraceSummary {
     thread_count: Option<i64>,
     capabilities: Vec<String>,
     recommended_next_tools: Vec<String>,
+    redaction_policy: RedactionPolicy,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
 }
@@ -1424,6 +1461,7 @@ fn build_load_trace_summary(
         thread_count: overview_i64(overview, "thread_count"),
         capabilities,
         recommended_next_tools,
+        redaction_policy: current_redaction_policy(),
         warnings,
     }
 }
@@ -1438,6 +1476,7 @@ fn format_load_trace_response(
         Err(error) => serde_json::to_string(&serde_json::json!({
             "available": false,
             "error": error,
+            "redaction_policy": current_redaction_policy(),
         }))
         .map_err(|e| format!("Failed to serialize load summary: {e}"))?,
     };
@@ -1763,6 +1802,7 @@ mod tests {
             thread_count: Some(4),
             capabilities: vec!["slices".to_owned()],
             recommended_next_tools: recommended_tools("generic"),
+            redaction_policy: redaction_policy_for(true),
             warnings: vec![],
         };
 
@@ -1782,6 +1822,15 @@ mod tests {
             response.contains("recommended_next_tools"),
             "response should expose routing data, got: {response}",
         );
+        assert_eq!(
+            parsed["redaction_policy"]["execute_sql_string_cells"],
+            json!(true),
+            "response should expose current privacy policy, got: {response}",
+        );
+        assert_eq!(
+            parsed["redaction_policy"]["env_var"],
+            json!(REDACT_STRINGS_DEFAULT_ENV)
+        );
     }
 
     #[test]
@@ -1797,6 +1846,10 @@ mod tests {
 
         assert_eq!(parsed["available"], json!(false));
         assert_eq!(parsed["error"], json!("boom"));
+        assert!(
+            parsed.get("redaction_policy").is_some(),
+            "summary failure must still expose privacy policy: {response}",
+        );
         assert!(
             response.starts_with("Trace loaded successfully"),
             "summary failure must not make load_trace look failed: {response}",
@@ -2264,6 +2317,25 @@ mod tests {
         assert!(
             instructions.contains("INCLUDE PERFETTO MODULE"),
             "instructions must tell agents to INCLUDE stdlib modules before querying"
+        );
+    }
+
+    #[test]
+    fn instructions_surface_server_redaction_policy() {
+        let enabled = server_instructions_for_redaction(true);
+        assert!(
+            enabled.contains("execute_sql string redaction is enabled"),
+            "instructions must surface enabled privacy policy: {enabled}",
+        );
+        assert!(
+            enabled.contains(REDACT_STRINGS_DEFAULT_ENV),
+            "instructions must tell users how to control the policy: {enabled}",
+        );
+
+        let disabled = server_instructions_for_redaction(false);
+        assert!(
+            disabled.contains("execute_sql string redaction is disabled"),
+            "instructions must surface disabled privacy policy: {disabled}",
         );
     }
 

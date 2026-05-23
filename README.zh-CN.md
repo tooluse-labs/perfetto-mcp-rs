@@ -175,7 +175,7 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 
 | 工具 | 用途 |
 |---|---|
-| `load_trace` | 打开一个 Perfetto trace 文件，并返回轻量路由摘要（类型/profile、时长、平台、进程/线程数、能力标签、推荐下一步工具） |
+| `load_trace` | 打开一个 Perfetto trace 文件，并返回轻量路由摘要（类型/profile、时长、平台、进程/线程数、能力标签、当前脱敏策略、推荐下一步工具） |
 | `list_tables` | 列出 trace 里的表和视图，支持 GLOB 过滤 |
 | `list_table_structure` | 查看某张表的列名和类型 |
 | `execute_sql` | 执行 PerfettoSQL 查询（最多 5000 行）；可选输出塑形支持 `head`/`limit`、`summary`、`columns_only`、`include_row_count`、`max_string_len`；服务端默认会对 URL/header/cookie/路径中的敏感值做隐私遮蔽 |
@@ -188,7 +188,7 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 | `chrome_web_content_interactions` | Web 内容交互（点击、触摸、INP）按耗时排序（仅 Chrome trace） |
 | `list_stdlib_modules` | 列出 PerfettoSQL stdlib 模块及用法示例（不需要先加载 trace） |
 
-隐私提示：MCP tool 的结果通常会进入 LLM 上下文，而真实 trace 里可能包含 URL、header、cookie、本地路径等个人或凭据相关信息。`execute_sql` 默认遮蔽这类敏感字符串，同时保留诊断结构。需要原始取证数据时，可在启动服务端前设置 `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`。
+隐私提示：MCP tool 的结果通常会进入 LLM 上下文，而真实 trace 里可能包含 URL、header、cookie、本地路径等个人或凭据相关信息。`execute_sql` 默认遮蔽这类敏感字符串，同时保留诊断结构。需要原始取证数据时，可在启动服务端前设置 `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`；`load_trace` 会在摘要里报告当前策略。
 
 典型流程按 trace 类型走：
 
