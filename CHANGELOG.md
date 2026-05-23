@@ -2,7 +2,7 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
-### Unreleased
+### [0.15.5](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.5) (May 23, 2026)
 
 - **Windows shell installer handles release-asset TLS failures more defensively.** `install.sh` now retries downloads with a longer retry budget, falls back to `curl --ssl-no-revoke` on Windows, and then falls back to PowerShell when Git Bash/MSYS curl cannot complete the GitHub release TLS handshake. `install.ps1` now retries transient `Invoke-WebRequest` failures too.
 - **Chrome dedicated tools preserve full string cells by default again.** Diagnostic precision is the default priority: `v0.15.4` capped Chrome-tool string cells at 240 characters by default, which reduced context size but could hide task names, URLs, and `posted_from` detail that LLM agents need for accurate root-cause analysis. `max_string_len` remains available as an explicit opt-in cap.
