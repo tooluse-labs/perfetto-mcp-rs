@@ -184,17 +184,18 @@ it in place.
 | `execute_sql` | Run a PerfettoSQL query (max 5000 rows); optional output shaping supports `head`/`limit`, `summary`, `columns_only`, `include_row_count`, and `max_string_len`; server-side privacy redaction masks sensitive URL/header/cookie/path values by default |
 | `list_processes` | List processes in the trace (pid, name, start/end timestamps) |
 | `list_threads_in_process` | List threads under a process name (up to 2000) |
-| `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame (Chrome trace) |
-| `chrome_page_load_summary` | Page loads: URL, FCP, LCP, DCL, load timings in ms (Chrome trace) |
-| `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts and cpu_pct, using is_main_thread plus Chrome Cr*Main fallback (Chrome trace) |
-| `chrome_startup_summary` | Browser startup events and time-to-first-visible-content (Chrome trace) |
-| `chrome_web_content_interactions` | Web content interactions (clicks, taps, INP) ranked by duration (Chrome trace) |
+| `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame; returns metadata before rows (Chrome trace) |
+| `chrome_page_load_summary` | Page loads: URL, FCP, LCP, DCL, load timings in ms; returns metadata before rows (Chrome trace) |
+| `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts and cpu_pct; returns metadata before rows (Chrome trace) |
+| `chrome_startup_summary` | Browser startup events and time-to-first-visible-content; returns metadata before rows (Chrome trace) |
+| `chrome_web_content_interactions` | Web content interactions (clicks, taps, INP) ranked by duration; returns metadata before rows (Chrome trace) |
 | `list_stdlib_modules` | List available PerfettoSQL stdlib modules with usage examples (no trace needed) |
 
 Privacy note: MCP tool results are normally visible to the LLM context, and
 real traces can contain URLs, headers, cookies, and local paths. `execute_sql`
-masks sensitive user and credential-like string values by default while keeping
-the diagnostic structure visible. For raw forensic work, start the server with
+and the dedicated Chrome tools mask sensitive user and credential-like string
+values by default while keeping the diagnostic structure visible. For raw
+forensic work, start the server with
 `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`; `load_trace` reports the active
 policy in its summary.
 

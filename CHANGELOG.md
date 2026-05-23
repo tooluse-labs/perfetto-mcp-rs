@@ -2,6 +2,11 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.15.3](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.3) (May 23, 2026)
+
+- **Chrome dedicated tools now return metadata before row payloads.** `chrome_scroll_jank_summary`, `chrome_page_load_summary`, `chrome_main_thread_hotspots`, `chrome_startup_summary`, and `chrome_web_content_interactions` still preserve `columns` / `rows`, but now add `returned_rows`, `truncated`, `row_count_known`, `string_truncated`, and `redacted` before `rows`. This helps LLM consumers see whether a built-in tool limit was reached before client-side output truncation hides the evidence.
+- **Server-side string redaction now covers Chrome dedicated-tool rows too.** URL/path/header-like strings returned by Chrome tools use the same user-controlled `PERFETTO_MCP_REDACT_STRINGS_DEFAULT` policy as `execute_sql`, so privacy protection is consistent across the first tools an agent calls on Chrome traces.
+
 ### [0.15.2](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.2) (May 23, 2026)
 
 - **`execute_sql` string redaction is now server-side policy and defaults on.** MCP tool results normally enter the LLM context, so privacy cannot depend on the model remembering to opt in per query. Sensitive URL/header/cookie/path-like string values are masked by default while preserving the row/column diagnostic structure. Users who need raw forensic output can start the server with `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`.

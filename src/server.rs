@@ -405,6 +405,10 @@ impl PerfettoMcpServer {
                        \n\
                        Parameters: none — operates on the loaded trace.\n\
                        \n\
+                       Output: metadata-first JSON that preserves `columns` / \
+                       `rows`; `truncated=true` means the built-in tool limit \
+                       was reached and lower-ranked rows may be omitted.\n\
+                       \n\
                        Empty result: no janky frames detected (clean trace) or no \
                        scrolls occurred during capture."
     )]
@@ -418,7 +422,7 @@ impl PerfettoMcpServer {
             .query(CHROME_SCROLL_JANK_SUMMARY_SQL)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome scroll jank summary", e))?;
-        serde_json::to_string(&table).map_err(|e| format!("Failed to serialize results: {e}"))
+        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS)
     }
 
     #[tool(
@@ -436,6 +440,10 @@ impl PerfettoMcpServer {
                        \n\
                        Parameters: none — operates on the loaded trace.\n\
                        \n\
+                       Output: metadata-first JSON that preserves `columns` / \
+                       `rows`; `truncated=true` means the built-in tool limit \
+                       was reached and lower-ranked rows may be omitted.\n\
+                       \n\
                        Empty result: no navigations occurred during capture (e.g. trace \
                        started after the page was already loaded)."
     )]
@@ -449,7 +457,7 @@ impl PerfettoMcpServer {
             .query(CHROME_PAGE_LOAD_SUMMARY_SQL)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page load summary", e))?;
-        serde_json::to_string(&table).map_err(|e| format!("Failed to serialize results: {e}"))
+        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS)
     }
 
     #[tool(
@@ -481,11 +489,15 @@ impl PerfettoMcpServer {
                        - `min_dur_ms`: minimum task duration. Defaults to 16 (one \
                          60 Hz frame). Pass 0 for ALL tasks; raise to 33 (30 Hz) or \
                          100 to focus on bigger stutters.\n\
-                       - `limit`: max rows (default 100, capped at 5000). Must be > 0 \
-                         if set.\n\
-                       \n\
-                       Empty result: no detected main-thread tasks exceeded `min_dur_ms` \
-                       at the selected process/window threshold, or the trace uses \
+                        - `limit`: max rows (default 100, capped at 5000). Must be > 0 \
+                          if set.\n\
+                        \n\
+                        Output: metadata-first JSON that preserves `columns` / \
+                        `rows`; `truncated=true` means the requested/effective \
+                        row limit was reached and lower-ranked rows may be omitted.\n\
+                        \n\
+                        Empty result: no detected main-thread tasks exceeded `min_dur_ms` \
+                        at the selected process/window threshold, or the trace uses \
                        non-standard main-thread names outside the `Cr*Main` fallback."
     )]
     async fn chrome_main_thread_hotspots(
@@ -506,7 +518,7 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome main-thread hotspots", e))?;
-        serde_json::to_string(&table).map_err(|e| format!("Failed to serialize results: {e}"))
+        format_chrome_tool_response(table, chrome_hotspots_effective_limit(params.limit))
     }
 
     #[tool(
@@ -525,6 +537,10 @@ impl PerfettoMcpServer {
                        \n\
                        Parameters: none — operates on the loaded trace.\n\
                        \n\
+                       Output: metadata-first JSON that preserves `columns` / \
+                       `rows`; `truncated=true` means the built-in tool limit \
+                       was reached and lower-ranked rows may be omitted.\n\
+                       \n\
                        Empty result: trace started after the browser was already \
                        running (most cases — startup is captured only when tracing \
                        began before launch)."
@@ -539,7 +555,7 @@ impl PerfettoMcpServer {
             .query(CHROME_STARTUP_SUMMARY_SQL)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome startup summary", e))?;
-        serde_json::to_string(&table).map_err(|e| format!("Failed to serialize results: {e}"))
+        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS)
     }
 
     #[tool(
@@ -557,6 +573,10 @@ impl PerfettoMcpServer {
                        \n\
                        Parameters: none — operates on the loaded trace.\n\
                        \n\
+                       Output: metadata-first JSON that preserves `columns` / \
+                       `rows`; `truncated=true` means the built-in tool limit \
+                       was reached and lower-ranked rows may be omitted.\n\
+                       \n\
                        Empty result: no interactions captured (trace started before \
                        user input or interaction tracking was disabled in tracing \
                        config)."
@@ -571,7 +591,7 @@ impl PerfettoMcpServer {
             .query(CHROME_WEB_CONTENT_INTERACTIONS_SQL)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome web content interactions", e))?;
-        serde_json::to_string(&table).map_err(|e| format!("Failed to serialize results: {e}"))
+        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS)
     }
 
     #[tool(
@@ -688,15 +708,19 @@ fn format_execute_sql_error(err: PerfettoError) -> String {
     }
 }
 
+const DEFAULT_CHROME_TOOL_ROWS: usize = 100;
 const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 const EXECUTE_SQL_SHAPING_NOTE: &str =
     "Output shaping only changes rows returned by this tool; SQL execution semantics are unchanged.";
+const CHROME_TOOL_SHAPING_NOTE: &str =
+    "Chrome tool output preserves columns/rows and adds completeness/privacy metadata before rows. row_count is null because Chrome tools use built-in SQL limits; truncated=true means the limit was reached and lower-ranked rows may be omitted.";
 const REDACTION_POLICY_NOTE: &str =
-    "execute_sql string cells may contain <redacted>; this is server-side policy, not a tool parameter.";
+    "execute_sql and Chrome dedicated-tool string cells may contain <redacted>; this is server-side policy, not a tool parameter.";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct RedactionPolicy {
     execute_sql_string_cells: bool,
+    chrome_tool_string_cells: bool,
     env_var: &'static str,
     note: &'static str,
 }
@@ -704,6 +728,7 @@ struct RedactionPolicy {
 fn redaction_policy_for(enabled: bool) -> RedactionPolicy {
     RedactionPolicy {
         execute_sql_string_cells: enabled,
+        chrome_tool_string_cells: enabled,
         env_var: REDACT_STRINGS_DEFAULT_ENV,
         note: REDACTION_POLICY_NOTE,
     }
@@ -721,10 +746,11 @@ fn server_instructions_for_redaction(enabled: bool) -> String {
     let state = if enabled { "enabled" } else { "disabled" };
     format!(
         "{STDLIB_INSTRUCTIONS}\n\n\
-         Privacy policy: execute_sql string redaction is {state}. \
+         Privacy policy: SQL/Chrome tool string redaction is {state}. \
          This is server-side policy, not a tool parameter; users control it \
          before startup with {REDACT_STRINGS_DEFAULT_ENV}. If redaction is enabled, \
-         execute_sql string cells may contain <redacted> while preserving diagnostic structure."
+         execute_sql and Chrome dedicated-tool string cells may contain <redacted> \
+         while preserving diagnostic structure."
     )
 }
 
@@ -780,6 +806,61 @@ struct ExecuteSqlColumnsOnlyResponse {
     string_truncated: bool,
     redacted: bool,
     note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ChromeToolRowsResponse {
+    columns: Vec<String>,
+    row_count: Option<usize>,
+    returned_rows: usize,
+    truncated: bool,
+    row_count_known: bool,
+    string_truncated: bool,
+    redacted: bool,
+    note: &'static str,
+    rows: Vec<Vec<serde_json::Value>>,
+}
+
+fn chrome_hotspots_effective_limit(limit: Option<u32>) -> usize {
+    match limit {
+        Some(n) if (n as usize) > MAX_ROWS => MAX_ROWS,
+        Some(n) => n as usize,
+        None => DEFAULT_CHROME_TOOL_ROWS,
+    }
+}
+
+fn format_chrome_tool_response(
+    table: DecodedTable,
+    effective_limit: usize,
+) -> Result<String, String> {
+    format_chrome_tool_response_with_redaction(table, effective_limit, default_redact_strings())
+}
+
+fn format_chrome_tool_response_with_redaction(
+    table: DecodedTable,
+    effective_limit: usize,
+    redact_strings: bool,
+) -> Result<String, String> {
+    let shape = ExecuteSqlOutputShape {
+        mode: ExecuteSqlOutputMode::FullRows,
+        active: true,
+        max_string_len: None,
+        redact_strings,
+    };
+    let returned_rows = table.rows.len();
+    let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+    serde_json::to_string(&ChromeToolRowsResponse {
+        columns: table.columns,
+        row_count: None,
+        returned_rows,
+        truncated: effective_limit > 0 && returned_rows >= effective_limit,
+        row_count_known: false,
+        string_truncated,
+        redacted,
+        note: CHROME_TOOL_SHAPING_NOTE,
+        rows,
+    })
+    .map_err(|e| format!("Failed to serialize results: {e}"))
 }
 
 fn format_execute_sql_response(
@@ -1828,6 +1909,11 @@ mod tests {
             "response should expose current privacy policy, got: {response}",
         );
         assert_eq!(
+            parsed["redaction_policy"]["chrome_tool_string_cells"],
+            json!(true),
+            "response should expose Chrome tool privacy policy, got: {response}",
+        );
+        assert_eq!(
             parsed["redaction_policy"]["env_var"],
             json!(REDACT_STRINGS_DEFAULT_ENV)
         );
@@ -1995,6 +2081,62 @@ mod tests {
             json!({"columns": ["a"], "rows": [["abcdef"]]}),
             "default execute_sql response must stay wire-compatible",
         );
+    }
+
+    #[test]
+    fn chrome_tool_response_adds_metadata_before_rows_without_dropping_rows() {
+        let table = decoded_table(
+            &["id", "url"],
+            vec![
+                vec![json!(1), json!("https://example.test/a")],
+                vec![json!(2), json!("https://example.test/b")],
+            ],
+        );
+
+        let response =
+            format_chrome_tool_response_with_redaction(table, 2, false).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_json_key_order(&response, "\"truncated\":", "\"rows\":");
+        assert_eq!(parsed["columns"], json!(["id", "url"]));
+        assert_eq!(
+            parsed["rows"],
+            json!([[1, "https://example.test/a"], [2, "https://example.test/b"]])
+        );
+        assert_eq!(parsed["row_count"], serde_json::Value::Null);
+        assert_eq!(parsed["returned_rows"], json!(2));
+        assert_eq!(parsed["truncated"], json!(true));
+        assert_eq!(parsed["row_count_known"], json!(false));
+        assert_eq!(parsed["redacted"], json!(false));
+        assert!(
+            parsed["note"]
+                .as_str()
+                .expect("note string")
+                .contains("built-in SQL limits"),
+            "note must explain Chrome tool completeness metadata: {parsed}",
+        );
+    }
+
+    #[test]
+    fn chrome_tool_response_uses_server_side_string_redaction() {
+        let table = decoded_table(
+            &["url"],
+            vec![vec![json!(
+                "https://px.effirst.com/api/v1/otelconfig?wpk-header=secret&ok=1"
+            )]],
+        );
+
+        let response =
+            format_chrome_tool_response_with_redaction(table, DEFAULT_CHROME_TOOL_ROWS, true)
+                .expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(
+            parsed["rows"][0][0],
+            json!("https://px.effirst.com/api/v1/otelconfig?wpk-header=<redacted>&ok=1")
+        );
+        assert_eq!(parsed["redacted"], json!(true));
+        assert_eq!(parsed["string_truncated"], json!(false));
     }
 
     #[test]
@@ -2324,7 +2466,7 @@ mod tests {
     fn instructions_surface_server_redaction_policy() {
         let enabled = server_instructions_for_redaction(true);
         assert!(
-            enabled.contains("execute_sql string redaction is enabled"),
+            enabled.contains("SQL/Chrome tool string redaction is enabled"),
             "instructions must surface enabled privacy policy: {enabled}",
         );
         assert!(
@@ -2334,7 +2476,7 @@ mod tests {
 
         let disabled = server_instructions_for_redaction(false);
         assert!(
-            disabled.contains("execute_sql string redaction is disabled"),
+            disabled.contains("SQL/Chrome tool string redaction is disabled"),
             "instructions must surface disabled privacy policy: {disabled}",
         );
     }
