@@ -2,6 +2,14 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.15.2](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.2) (May 23, 2026)
+
+- **`execute_sql` string redaction is now server-side policy and defaults on.** MCP tool results normally enter the LLM context, so privacy cannot depend on the model remembering to opt in per query. Sensitive URL/header/cookie/path-like string values are masked by default while preserving the row/column diagnostic structure. Users who need raw forensic output can start the server with `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`.
+- **Redaction control is no longer exposed to the LLM.** `redact_strings` was removed from the `execute_sql` input schema; passing it now fails as an unknown field. The setting is controlled only by the server environment, keeping privacy policy in user/admin hands rather than per-call model behavior.
+- **`load_trace` and server instructions now report the active redaction policy.** The machine-readable `Trace summary` includes `redaction_policy`, and the MCP handshake instructions state whether `execute_sql` string redaction is enabled or disabled. This lets LLM consumers interpret `<redacted>` correctly without being able to change the policy.
+- **Redaction is broader but more precise.** URL signatures, encoded nested query parameters, and common user/device/token fields are masked, while short keys now require real parameter boundaries so ordinary fields such as `design`, `cloud`, and `guid` are not falsely redacted. Regression tests also cover non-ASCII prefix cases and token-at-EOF handling.
+- **Shaped `execute_sql` responses put metadata before row payloads.** For `summary`/`head`/`limit` responses, completeness and redaction flags appear before bulky rows so LLMs can see whether evidence was sampled, truncated, or redacted even when clients truncate long tool output.
+
 ### [0.15.1](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.1) (May 23, 2026)
 
 - **Cold-cache trace_processor_shell acquisition is serialized inside one process.** Concurrent `load_trace` calls on a fresh machine can now share the same cache path without one task spawning `trace_processor_shell` while another task is still downloading, verifying, or replacing that executable. This fixes an Ubuntu CI failure where parallel tests raced on the cold cached binary and one `load_trace` failed before Chrome preflight assertions could run.
