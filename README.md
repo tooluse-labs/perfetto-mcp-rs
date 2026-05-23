@@ -181,7 +181,7 @@ it in place.
 | `load_trace` | Open a Perfetto trace file and return a lightweight routing summary (type/profile, duration, platform, process/thread counts, capabilities, recommended next tools) |
 | `list_tables` | List tables/views in the loaded trace, optional GLOB filter |
 | `list_table_structure` | Show column names and types for a table |
-| `execute_sql` | Run a PerfettoSQL query, returns columnar JSON `{columns, rows}` (max 5000 rows); optional output shaping supports `head`/`limit`, `summary`, `columns_only`, `include_row_count`, `max_string_len`, and `redact_strings` |
+| `execute_sql` | Run a PerfettoSQL query (max 5000 rows); optional output shaping supports `head`/`limit`, `summary`, `columns_only`, `include_row_count`, and `max_string_len`; server-side privacy redaction masks sensitive URL/header/cookie/path values by default |
 | `list_processes` | List processes in the trace (pid, name, start/end timestamps) |
 | `list_threads_in_process` | List threads under a process name (up to 2000) |
 | `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame (Chrome trace) |
@@ -190,6 +190,12 @@ it in place.
 | `chrome_startup_summary` | Browser startup events and time-to-first-visible-content (Chrome trace) |
 | `chrome_web_content_interactions` | Web content interactions (clicks, taps, INP) ranked by duration (Chrome trace) |
 | `list_stdlib_modules` | List available PerfettoSQL stdlib modules with usage examples (no trace needed) |
+
+Privacy note: MCP tool results are normally visible to the LLM context, and
+real traces can contain URLs, headers, cookies, and local paths. `execute_sql`
+masks sensitive user and credential-like string values by default while keeping
+the diagnostic structure visible. For raw forensic work, start the server with
+`PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`.
 
 Typical flow depends on trace type:
 

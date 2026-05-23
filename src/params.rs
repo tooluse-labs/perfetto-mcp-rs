@@ -6,6 +6,8 @@ use schemars::JsonSchema;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub const REDACT_STRINGS_DEFAULT_ENV: &str = "PERFETTO_MCP_REDACT_STRINGS_DEFAULT";
+
 // Note: serde aliases (`#[serde(alias = "trace_path")]`) are recognized as
 // the field they alias, so they don't trigger the unknown-field error.
 //
@@ -84,6 +86,20 @@ where
     }
 }
 
+pub(crate) fn default_redact_strings() -> bool {
+    let value = std::env::var(REDACT_STRINGS_DEFAULT_ENV).ok();
+    redact_strings_default_from_env_value(value.as_deref())
+}
+
+pub(crate) fn redact_strings_default_from_env_value(value: Option<&str>) -> bool {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(value) if matches!(value.as_str(), "" | "1" | "true" | "yes" | "y" | "on") => true,
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "n" | "off") => false,
+        Some(_) => true,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoadTraceParams {
@@ -122,10 +138,6 @@ pub struct ExecuteSqlParams {
     /// Accepts both numbers and numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
-    /// Redact common sensitive strings in returned cells (headers, tokens, and
-    /// local user-profile path segments). Defaults off for compatibility.
-    #[serde(default)]
-    pub redact_strings: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -337,6 +349,19 @@ mod tests {
 
         let too_big = serde_json::from_str::<U32Wrapper>(r#"{"val": 5000000000}"#);
         assert!(too_big.is_err());
+    }
+
+    #[test]
+    fn redact_strings_default_is_privacy_first_and_env_can_disable() {
+        assert!(redact_strings_default_from_env_value(None));
+        assert!(redact_strings_default_from_env_value(Some("")));
+        assert!(redact_strings_default_from_env_value(Some("true")));
+        assert!(redact_strings_default_from_env_value(Some("1")));
+        assert!(redact_strings_default_from_env_value(Some("unexpected")));
+        assert!(!redact_strings_default_from_env_value(Some("false")));
+        assert!(!redact_strings_default_from_env_value(Some("0")));
+        assert!(!redact_strings_default_from_env_value(Some("off")));
+        assert!(!redact_strings_default_from_env_value(Some("no")));
     }
 
     #[test]

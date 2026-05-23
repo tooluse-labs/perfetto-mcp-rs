@@ -127,10 +127,12 @@ impl PerfettoMcpServer {
                        Parameters: `sql` is a single PerfettoSQL statement (the `INCLUDE \
                        PERFETTO MODULE foo;` and `SELECT ...` can be in the same call). \
                        Optional output shaping (`head`/`limit`, `columns_only`, \
-                       `summary`, `include_row_count`, `max_string_len`, \
-                       `redact_strings`) only changes what this tool returns; it \
-                       does not rewrite the SQL. Requires `load_trace` to have run \
-                       first.\n\
+                       `summary`, `include_row_count`, `max_string_len`) only \
+                       changes what this tool returns; it does not rewrite the \
+                       SQL. String results may be redacted by the server privacy \
+                       policy before they are returned, preserving diagnostic \
+                       structure while masking sensitive URL/header/cookie/path \
+                       values. Requires `load_trace` to have run first.\n\
                        \n\
                        Empty `rows` means the query matched nothing — distinct from a SQL \
                        error, which is returned as an error string with a hint pointing \
@@ -709,7 +711,6 @@ struct ExecuteSqlOutputShape {
 #[derive(Debug, Serialize)]
 struct ExecuteSqlRowsResponse {
     columns: Vec<String>,
-    rows: Vec<Vec<serde_json::Value>>,
     row_count: usize,
     returned_rows: usize,
     truncated: bool,
@@ -717,12 +718,12 @@ struct ExecuteSqlRowsResponse {
     string_truncated: bool,
     redacted: bool,
     note: &'static str,
+    rows: Vec<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
 struct ExecuteSqlSummaryResponse {
     columns: Vec<String>,
-    sample_rows: Vec<Vec<serde_json::Value>>,
     row_count: usize,
     returned_rows: usize,
     truncated: bool,
@@ -730,6 +731,7 @@ struct ExecuteSqlSummaryResponse {
     string_truncated: bool,
     redacted: bool,
     note: &'static str,
+    sample_rows: Vec<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -748,7 +750,15 @@ fn format_execute_sql_response(
     table: DecodedTable,
     params: &ExecuteSqlParams,
 ) -> Result<String, String> {
-    let shape = execute_sql_output_shape(params)?;
+    format_execute_sql_response_with_redaction(table, params, default_redact_strings())
+}
+
+fn format_execute_sql_response_with_redaction(
+    table: DecodedTable,
+    params: &ExecuteSqlParams,
+    redact_strings: bool,
+) -> Result<String, String> {
+    let shape = execute_sql_output_shape(params, redact_strings)?;
     if !shape.active {
         return serde_json::to_string(&table)
             .map_err(|e| format!("Failed to serialize results: {e}"));
@@ -819,7 +829,10 @@ fn format_execute_sql_response(
     }
 }
 
-fn execute_sql_output_shape(params: &ExecuteSqlParams) -> Result<ExecuteSqlOutputShape, String> {
+fn execute_sql_output_shape(
+    params: &ExecuteSqlParams,
+    redact_strings: bool,
+) -> Result<ExecuteSqlOutputShape, String> {
     if params.head.is_some() && params.limit.is_some() {
         return Err("`head` and `limit` are aliases; provide only one.".to_owned());
     }
@@ -843,7 +856,7 @@ fn execute_sql_output_shape(params: &ExecuteSqlParams) -> Result<ExecuteSqlOutpu
         || row_limit.is_some()
         || params.include_row_count
         || max_string_len.is_some()
-        || params.redact_strings;
+        || redact_strings;
     let mode = if params.columns_only {
         ExecuteSqlOutputMode::ColumnsOnly
     } else if params.summary {
@@ -862,7 +875,7 @@ fn execute_sql_output_shape(params: &ExecuteSqlParams) -> Result<ExecuteSqlOutpu
         mode,
         active,
         max_string_len,
-        redact_strings: params.redact_strings,
+        redact_strings,
     })
 }
 
@@ -1035,50 +1048,125 @@ fn redact_user_path_segments(s: &str) -> (String, bool) {
 fn redact_sensitive_assignments(s: &str) -> (String, bool) {
     let mut out = s.to_owned();
     let mut changed = false;
-    let markers = [
-        "access_token=",
-        "refresh_token=",
-        "id_token=",
-        "token=",
-        "auth=",
-        "authorization=",
-        "password=",
-        "passwd=",
-        "secret=",
-        "apikey=",
-        "api_key=",
-        "session=",
-        "sessionid=",
-        "sid=",
+    let sensitive_keys = [
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "token",
+        "auth",
+        "authorization",
+        "password",
+        "passwd",
+        "secret",
+        "apikey",
+        "api_key",
+        "session",
+        "sessionid",
+        "sid",
+        "signature",
+        "sig",
+        "sign",
+        "wpk-header",
+        "ud",
+        "uid",
+        "user_id",
+        "userid",
+        "device_id",
+        "deviceid",
+        "open_id",
+        "openid",
+        "access_key",
+        "accesskey",
     ];
-    for marker in markers {
-        let mut search_from = 0;
-        loop {
-            if search_from >= out.len() {
-                break;
-            }
-            let lower = out.to_ascii_lowercase();
-            let Some(rel) = lower[search_from..].find(marker) else {
-                break;
-            };
-            let value_start = search_from + rel + marker.len();
-            let value_end = out[value_start..]
-                .char_indices()
-                .find(|(_, c)| matches!(*c, '&' | ' ' | '\r' | '\n' | '"' | '\'' | ';'))
-                .map(|(idx, _)| value_start + idx)
-                .unwrap_or(out.len());
-            if value_start < value_end && &out[value_start..value_end] != "<redacted>" {
-                out.replace_range(value_start..value_end, "<redacted>");
-                changed = true;
-                search_from = (value_start + "<redacted>".len()).min(out.len());
-            } else if value_end >= out.len() {
-                break;
-            } else {
-                search_from = value_end + 1;
-            }
+    for key in sensitive_keys {
+        for separator in ["=", "%3d"] {
+            let marker = format!("{key}{separator}");
+            changed |= redact_sensitive_assignment_marker(&mut out, &marker, separator == "%3d");
         }
     }
     (out, changed)
+}
+
+fn redact_sensitive_assignment_marker(
+    out: &mut String,
+    marker: &str,
+    encoded_marker: bool,
+) -> bool {
+    let mut changed = false;
+    let mut search_from = 0;
+    loop {
+        if search_from >= out.len() {
+            break;
+        }
+        let lower = out.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(marker) else {
+            break;
+        };
+        let key_start = search_from + rel;
+        if !has_sensitive_key_boundary(out, key_start, encoded_marker) {
+            search_from = key_start + 1;
+            continue;
+        }
+
+        let value_start = key_start + marker.len();
+        let value_end = sensitive_assignment_value_end(out, value_start, encoded_marker);
+        if value_start < value_end && &out[value_start..value_end] != "<redacted>" {
+            out.replace_range(value_start..value_end, "<redacted>");
+            changed = true;
+            search_from = (value_start + "<redacted>".len()).min(out.len());
+        } else if value_end >= out.len() {
+            break;
+        } else {
+            search_from = value_end + 1;
+        }
+    }
+    changed
+}
+
+fn has_sensitive_key_boundary(s: &str, key_start: usize, encoded_marker: bool) -> bool {
+    if key_start == 0 {
+        return true;
+    }
+
+    if encoded_marker && has_ascii_suffix_ignore_case(&s[..key_start], "%26") {
+        return true;
+    }
+
+    let Some(prev) = s[..key_start].chars().next_back() else {
+        return true;
+    };
+    matches!(
+        prev,
+        '?' | '&' | ';' | ' ' | '\t' | '\r' | '\n' | '"' | '\'' | '(' | '[' | '{' | '<' | ','
+    )
+}
+
+fn has_ascii_suffix_ignore_case(s: &str, suffix: &str) -> bool {
+    let bytes = s.as_bytes();
+    let suffix = suffix.as_bytes();
+    bytes.len() >= suffix.len() && bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+fn sensitive_assignment_value_end(s: &str, value_start: usize, encoded_marker: bool) -> usize {
+    let tail = &s[value_start..];
+    let plain_end = tail
+        .char_indices()
+        .find(|(_, c)| matches!(*c, '&' | ' ' | '\r' | '\n' | '"' | '\'' | ';'))
+        .map(|(idx, _)| value_start + idx);
+    let encoded_amp_end = encoded_marker
+        .then(|| {
+            tail.to_ascii_lowercase()
+                .find("%26")
+                .map(|idx| value_start + idx)
+        })
+        .flatten();
+
+    match (plain_end, encoded_amp_end) {
+        (Some(plain), Some(encoded)) => plain.min(encoded),
+        (Some(plain), None) => plain,
+        (None, Some(encoded)) => encoded,
+        (None, None) => s.len(),
+    }
 }
 
 /// Chrome-tool error hint assumes `ensure_chrome_trace` has already rejected
@@ -1564,8 +1652,20 @@ mod tests {
             summary: false,
             include_row_count: false,
             max_string_len: None,
-            redact_strings: false,
         }
+    }
+
+    fn assert_json_key_order(response: &str, first: &str, second: &str) {
+        let first_pos = response
+            .find(first)
+            .unwrap_or_else(|| panic!("missing key fragment {first:?} in {response}"));
+        let second_pos = response
+            .find(second)
+            .unwrap_or_else(|| panic!("missing key fragment {second:?} in {response}"));
+        assert!(
+            first_pos < second_pos,
+            "expected {first:?} before {second:?}, got: {response}"
+        );
     }
 
     #[test]
@@ -1833,7 +1933,8 @@ mod tests {
         let table = decoded_table(&["a"], vec![vec![json!("abcdef")]]);
         let params = execute_sql_params("SELECT 'abcdef' AS a");
 
-        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, false).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_eq!(
@@ -1849,10 +1950,12 @@ mod tests {
         let mut params = execute_sql_params("SELECT n FROM nums");
         params.head = Some(1);
 
-        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, false).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_eq!(parsed["rows"], json!([[1]]));
+        assert_json_key_order(&response, "\"truncated\":", "\"rows\":");
         assert_eq!(parsed["row_count"], json!(2));
         assert_eq!(parsed["returned_rows"], json!(1));
         assert_eq!(parsed["truncated"], json!(true));
@@ -1873,9 +1976,11 @@ mod tests {
         let mut params = execute_sql_params("SELECT n FROM nums");
         params.summary = true;
 
-        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, false).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
+        assert_json_key_order(&response, "\"truncated\":", "\"sample_rows\":");
         assert_eq!(
             parsed["sample_rows"].as_array().expect("sample rows").len(),
             DEFAULT_EXECUTE_SQL_SUMMARY_ROWS,
@@ -1895,7 +2000,8 @@ mod tests {
         let mut params = execute_sql_params("SELECT 1 AS a, 'x' AS b");
         params.columns_only = true;
 
-        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, false).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_eq!(parsed["columns"], json!(["a", "b"]));
@@ -1914,7 +2020,8 @@ mod tests {
         let mut params = execute_sql_params("SELECT long_string AS s");
         params.max_string_len = Some(8);
 
-        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, false).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_eq!(parsed["rows"][0][0], json!("abcdefgh...<truncated>"));
@@ -1932,10 +2039,10 @@ mod tests {
                 json!("https://example.test/?access_token=secret-token&ok=1"),
             ]],
         );
-        let mut params = execute_sql_params("SELECT sensitive_cells");
-        params.redact_strings = true;
+        let params = execute_sql_params("SELECT sensitive_cells");
 
-        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_eq!(
@@ -1961,15 +2068,71 @@ mod tests {
                 "https://example.test/?access_token=secret-token"
             )]],
         );
-        let mut params = execute_sql_params("SELECT url");
-        params.redact_strings = true;
+        let params = execute_sql_params("SELECT url");
 
-        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_eq!(
             parsed["rows"][0][0],
             json!("https://example.test/?access_token=<redacted>")
+        );
+        assert_eq!(parsed["redacted"], json!(true));
+    }
+
+    #[test]
+    fn execute_sql_redact_strings_masks_query_signatures_and_encoded_values() {
+        let table = decoded_table(
+            &["top_level", "encoded_nested"],
+            vec![vec![
+                json!(
+                    "https://px.effirst.com/api/v1/jconfig?wpk-header=app%3Dueocxfzk%26ud%3Duser-42%26sign%3Dabc123&ok=1"
+                ),
+                json!("payload=app%3Ddemo%26sign%3Dabc123%26ud%3Duser-42%26safe%3Dkeep"),
+            ]],
+        );
+        let params = execute_sql_params("SELECT url_args");
+
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(
+            parsed["rows"][0][0],
+            json!("https://px.effirst.com/api/v1/jconfig?wpk-header=<redacted>&ok=1")
+        );
+        assert_eq!(
+            parsed["rows"][0][1],
+            json!("payload=app%3Ddemo%26sign%3D<redacted>%26ud%3D<redacted>%26safe%3Dkeep")
+        );
+        assert_eq!(parsed["redacted"], json!(true));
+    }
+
+    #[test]
+    fn execute_sql_redact_strings_respects_query_key_boundaries() {
+        let table = decoded_table(
+            &["false_positive", "encoded_false_positive", "mixed"],
+            vec![vec![
+                json!("https://example.test/?design=dark&cloud=prod&guid=abc"),
+                json!("prefixéésign%3Dabc"),
+                json!("https://example.test/?design=dark&sign=real&cloud=prod&uid=user-42"),
+            ]],
+        );
+        let params = execute_sql_params("SELECT url_args");
+
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(
+            parsed["rows"][0][0],
+            json!("https://example.test/?design=dark&cloud=prod&guid=abc")
+        );
+        assert_eq!(parsed["rows"][0][1], json!("prefixéésign%3Dabc"));
+        assert_eq!(
+            parsed["rows"][0][2],
+            json!("https://example.test/?design=dark&sign=<redacted>&cloud=prod&uid=<redacted>")
         );
         assert_eq!(parsed["redacted"], json!(true));
     }
@@ -1985,10 +2148,10 @@ mod tests {
                 json!("/home/alice"),
             ]],
         );
-        let mut params = execute_sql_params("SELECT profile_paths");
-        params.redact_strings = true;
+        let params = execute_sql_params("SELECT profile_paths");
 
-        let response = format_execute_sql_response(table, &params).expect("serialize");
+        let response =
+            format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_eq!(parsed["rows"][0][0], json!("C:\\Users\\<user>"));
@@ -2003,17 +2166,18 @@ mod tests {
         let mut params = execute_sql_params("SELECT 1");
         params.head = Some(1);
         params.limit = Some(1);
-        let err = execute_sql_output_shape(&params).expect_err("head + limit must reject");
+        let err = execute_sql_output_shape(&params, false).expect_err("head + limit must reject");
         assert!(err.contains("head"), "got: {err}");
 
         let mut params = execute_sql_params("SELECT 1");
         params.limit = Some(0);
-        let err = execute_sql_output_shape(&params).expect_err("limit=0 must reject");
+        let err = execute_sql_output_shape(&params, false).expect_err("limit=0 must reject");
         assert!(err.contains("> 0"), "got: {err}");
 
         let mut params = execute_sql_params("SELECT 1");
         params.max_string_len = Some(0);
-        let err = execute_sql_output_shape(&params).expect_err("max_string_len=0 must reject");
+        let err =
+            execute_sql_output_shape(&params, false).expect_err("max_string_len=0 must reject");
         assert!(err.contains("max_string_len"), "got: {err}");
     }
 
@@ -2024,6 +2188,18 @@ mod tests {
                 .expect("stringified numeric shaping fields must deserialize");
         assert_eq!(p.head, Some(3));
         assert_eq!(p.max_string_len, Some(40));
+    }
+
+    #[test]
+    fn execute_sql_rejects_redaction_as_tool_parameter() {
+        let err = serde_json::from_str::<ExecuteSqlParams>(
+            r#"{"sql": "SELECT 1", "redact_strings": true}"#,
+        )
+        .expect_err("redaction must be controlled by server policy, not the LLM");
+        assert!(
+            err.to_string().contains("redact_strings"),
+            "error must name the rejected field, got: {err}",
+        );
     }
 
     // The description is a proc-macro string literal so it can't interpolate
@@ -2359,6 +2535,23 @@ mod tests {
         assert!(
             !desc.contains("{columns:"),
             "execute_sql description must not spell out the columnar shape, got: {desc}",
+        );
+    }
+
+    #[test]
+    fn execute_sql_schema_does_not_expose_redaction_control() {
+        let server = test_server();
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "execute_sql")
+            .expect("execute_sql tool must exist");
+        let schema =
+            serde_json::to_string(&tool.input_schema).expect("input schema must serialize");
+        assert!(
+            !schema.contains("redact_strings"),
+            "redaction is server-side policy and must not be exposed to the LLM: {schema}",
         );
     }
 
