@@ -26,6 +26,7 @@ const STALE_TEMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// alone cannot stop a misbehaving mirror that drip-feeds bytes below the
 /// per-read threshold forever, so we cap the entire download.
 const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+static ENSURE_BINARY_CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
@@ -94,6 +95,11 @@ pub async fn ensure_binary(config: &DownloadConfig) -> Result<PathBuf> {
     if let Ok(path) = which::which("trace_processor_shell") {
         return Ok(path);
     }
+
+    // Cold-cache callers share one executable path. Serialize cache
+    // verification/download so one task cannot spawn while another is
+    // replacing the same binary.
+    let _guard = ENSURE_BINARY_CACHE_LOCK.lock().await;
 
     let cache_dir = cache_dir()?;
     let binary_path = cache_dir.join(BINARY_NAME);

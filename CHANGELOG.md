@@ -2,6 +2,11 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.15.1](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.1) (May 23, 2026)
+
+- **Cold-cache trace_processor_shell acquisition is serialized inside one process.** Concurrent `load_trace` calls on a fresh machine can now share the same cache path without one task spawning `trace_processor_shell` while another task is still downloading, verifying, or replacing that executable. This fixes an Ubuntu CI failure where parallel tests raced on the cold cached binary and one `load_trace` failed before Chrome preflight assertions could run.
+- **No MCP surface changes from v0.15.0.** The `execute_sql` output-shaping and `redact_strings` capabilities remain the release highlight; v0.15.1 only hardens the binary acquisition path used before trace analysis starts.
+
 ### [0.15.0](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.0) (May 23, 2026)
 
 - **`execute_sql` output shaping for LLM consumers.** `execute_sql` keeps the legacy `{columns, rows}` response by default, but now accepts optional shaping fields for large or exploratory queries: `head` / `limit` to cap returned rows, `summary` for a compact sample response, `columns_only` for schema-first exploration, and `include_row_count` for explicit completeness metadata. Shaped responses report `returned_rows`, `truncated`, and `row_count_known` so agents can tell sample evidence from complete evidence instead of guessing from UI truncation.
