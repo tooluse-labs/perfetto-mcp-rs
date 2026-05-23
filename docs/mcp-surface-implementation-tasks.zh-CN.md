@@ -76,21 +76,22 @@
   - `summary`：返回列、行数状态、少量样本行。
   - `include_row_count`：请求返回解码行数或已知行数状态。
   - `max_string_len`：限制单个字符串单元格长度，默认值应足够保留 URL / slice 名称
-    的关键信息。
-  - `redact_strings`：对 headers、cookies、tokens、本地用户路径等常见敏感字符串
-    做保守脱敏。
+    的关键信息；实际缩短时必须设置 `string_truncated`。
+  - 敏感字符串脱敏由 server 策略控制，不暴露给 LLM；对 headers、cookies、
+    tokens、本地用户路径等常见敏感字符串做保守遮蔽。
 - **返回元数据：**
   - `returned_rows`
   - `truncated`
   - `row_count_known`
   - `string_truncated`
   - `redacted`
-  - `note`: 明确说明“仅输出层截断，SQL 执行语义未改变”。
+  - `note`: 短句说明 `row_count` 是 SQL 执行后的解码行数，`head` / `limit`
+    只裁剪返回给 tool caller 的行。
 - **验收：**
   - `execute_sql(sql)` 默认行为保持兼容。
   - 塑形不会自动向 SQL 注入 `LIMIT`。
   - 样本或截断结果永远带 `truncated` / `returned_rows` 标记。
-  - 长字符串截断不会破坏 JSON；脱敏策略有测试覆盖，并允许显式关闭。
+  - 长字符串预算不会破坏 JSON；脱敏策略有测试覆盖，并只能由用户通过环境变量关闭。
 
 ### T0.3 建立上下文预算测试
 

@@ -2,6 +2,12 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.15.4](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.4) (May 23, 2026)
+
+- **Chrome dedicated-tool metadata notes are shorter and more explicit.** The note now distinguishes row-cap truncation from string-cell shortening, so LLM consumers do not have to infer whether missing detail came from server shaping or client display clipping.
+- **Chrome dedicated tools now budget long string cells.** Returned string cells have a default 240-character cap and set `string_truncated=true` only when a value is actually shortened; callers can raise `max_string_len` when the full task name or URL matters.
+- **`execute_sql` shaping notes now clarify row-count semantics.** `row_count` is the decoded result count after the SQL has run, while `head` / `limit` only trim rows returned by the tool response.
+
 ### [0.15.3](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.3) (May 23, 2026)
 
 - **Chrome dedicated tools now return metadata before row payloads.** `chrome_scroll_jank_summary`, `chrome_page_load_summary`, `chrome_main_thread_hotspots`, `chrome_startup_summary`, and `chrome_web_content_interactions` still preserve `columns` / `rows`, but now add `returned_rows`, `truncated`, `row_count_known`, `string_truncated`, and `redacted` before `rows`. This helps LLM consumers see whether a built-in tool limit was reached before client-side output truncation hides the evidence.

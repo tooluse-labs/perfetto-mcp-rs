@@ -403,18 +403,19 @@ impl PerfettoMcpServer {
                        causes outside the top 100, drop to `execute_sql` against the \
                        same view.\n\
                        \n\
-                       Parameters: none — operates on the loaded trace.\n\
+                       Parameters: optional `max_string_len` caps returned string \
+                       cells (defaults to 240 chars). Operates on the loaded trace.\n\
                        \n\
-                       Output: metadata-first JSON that preserves `columns` / \
-                       `rows`; `truncated=true` means the built-in tool limit \
-                       was reached and lower-ranked rows may be omitted.\n\
+                       Output: metadata-first JSON preserving `columns` / \
+                       `rows`; `truncated=true` means the row cap was reached; \
+                       `string_truncated=true` means cell text was shortened.\n\
                        \n\
                        Empty result: no janky frames detected (clean trace) or no \
                        scrolls occurred during capture."
     )]
     async fn chrome_scroll_jank_summary(
         &self,
-        Parameters(_params): Parameters<ChromeTraceParams>,
+        Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome scroll jank summary").await?;
@@ -422,7 +423,7 @@ impl PerfettoMcpServer {
             .query(CHROME_SCROLL_JANK_SUMMARY_SQL)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome scroll jank summary", e))?;
-        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS)
+        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
     }
 
     #[tool(
@@ -438,18 +439,19 @@ impl PerfettoMcpServer {
                        timings inside one navigation, drop to `execute_sql` against the \
                        `chrome.page_loads` module.\n\
                        \n\
-                       Parameters: none — operates on the loaded trace.\n\
+                       Parameters: optional `max_string_len` caps returned string \
+                       cells (defaults to 240 chars). Operates on the loaded trace.\n\
                        \n\
-                       Output: metadata-first JSON that preserves `columns` / \
-                       `rows`; `truncated=true` means the built-in tool limit \
-                       was reached and lower-ranked rows may be omitted.\n\
+                       Output: metadata-first JSON preserving `columns` / \
+                       `rows`; `truncated=true` means the row cap was reached; \
+                       `string_truncated=true` means cell text was shortened.\n\
                        \n\
                        Empty result: no navigations occurred during capture (e.g. trace \
                        started after the page was already loaded)."
     )]
     async fn chrome_page_load_summary(
         &self,
-        Parameters(_params): Parameters<ChromeTraceParams>,
+        Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page load summary").await?;
@@ -457,7 +459,7 @@ impl PerfettoMcpServer {
             .query(CHROME_PAGE_LOAD_SUMMARY_SQL)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page load summary", e))?;
-        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS)
+        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
     }
 
     #[tool(
@@ -491,10 +493,13 @@ impl PerfettoMcpServer {
                          100 to focus on bigger stutters.\n\
                         - `limit`: max rows (default 100, capped at 5000). Must be > 0 \
                           if set.\n\
+                        - `max_string_len`: cap returned string cells. Defaults to 240 \
+                          chars; pass a larger value when full task names or URLs matter. \
+                          Must be > 0 if set.\n\
                         \n\
-                        Output: metadata-first JSON that preserves `columns` / \
-                        `rows`; `truncated=true` means the requested/effective \
-                        row limit was reached and lower-ranked rows may be omitted.\n\
+                        Output: metadata-first JSON preserving `columns` / \
+                        `rows`; `truncated=true` means the row cap was reached; \
+                        `string_truncated=true` means cell text was shortened.\n\
                         \n\
                         Empty result: no detected main-thread tasks exceeded `min_dur_ms` \
                         at the selected process/window threshold, or the trace uses \
@@ -518,7 +523,11 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome main-thread hotspots", e))?;
-        format_chrome_tool_response(table, chrome_hotspots_effective_limit(params.limit))
+        format_chrome_tool_response(
+            table,
+            chrome_hotspots_effective_limit(params.limit),
+            params.max_string_len,
+        )
     }
 
     #[tool(
@@ -535,11 +544,12 @@ impl PerfettoMcpServer {
                        work during steady state is covered by \
                        `chrome_main_thread_hotspots`.\n\
                        \n\
-                       Parameters: none — operates on the loaded trace.\n\
+                       Parameters: optional `max_string_len` caps returned string \
+                       cells (defaults to 240 chars). Operates on the loaded trace.\n\
                        \n\
-                       Output: metadata-first JSON that preserves `columns` / \
-                       `rows`; `truncated=true` means the built-in tool limit \
-                       was reached and lower-ranked rows may be omitted.\n\
+                       Output: metadata-first JSON preserving `columns` / \
+                       `rows`; `truncated=true` means the row cap was reached; \
+                       `string_truncated=true` means cell text was shortened.\n\
                        \n\
                        Empty result: trace started after the browser was already \
                        running (most cases — startup is captured only when tracing \
@@ -547,7 +557,7 @@ impl PerfettoMcpServer {
     )]
     async fn chrome_startup_summary(
         &self,
-        Parameters(_params): Parameters<ChromeTraceParams>,
+        Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome startup summary").await?;
@@ -555,7 +565,7 @@ impl PerfettoMcpServer {
             .query(CHROME_STARTUP_SUMMARY_SQL)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome startup summary", e))?;
-        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS)
+        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
     }
 
     #[tool(
@@ -571,11 +581,12 @@ impl PerfettoMcpServer {
                        outside the top 100 or filtered by `interaction_type`, drop to \
                        `execute_sql` against `chrome.web_content_interactions`.\n\
                        \n\
-                       Parameters: none — operates on the loaded trace.\n\
+                       Parameters: optional `max_string_len` caps returned string \
+                       cells (defaults to 240 chars). Operates on the loaded trace.\n\
                        \n\
-                       Output: metadata-first JSON that preserves `columns` / \
-                       `rows`; `truncated=true` means the built-in tool limit \
-                       was reached and lower-ranked rows may be omitted.\n\
+                       Output: metadata-first JSON preserving `columns` / \
+                       `rows`; `truncated=true` means the row cap was reached; \
+                       `string_truncated=true` means cell text was shortened.\n\
                        \n\
                        Empty result: no interactions captured (trace started before \
                        user input or interaction tracking was disabled in tracing \
@@ -583,7 +594,7 @@ impl PerfettoMcpServer {
     )]
     async fn chrome_web_content_interactions(
         &self,
-        Parameters(_params): Parameters<ChromeTraceParams>,
+        Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome web content interactions").await?;
@@ -591,7 +602,7 @@ impl PerfettoMcpServer {
             .query(CHROME_WEB_CONTENT_INTERACTIONS_SQL)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome web content interactions", e))?;
-        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS)
+        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
     }
 
     #[tool(
@@ -709,11 +720,12 @@ fn format_execute_sql_error(err: PerfettoError) -> String {
 }
 
 const DEFAULT_CHROME_TOOL_ROWS: usize = 100;
+const DEFAULT_CHROME_TOOL_MAX_STRING_LEN: usize = 240;
 const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 const EXECUTE_SQL_SHAPING_NOTE: &str =
-    "Output shaping only changes rows returned by this tool; SQL execution semantics are unchanged.";
+    "row_count is post-SQL decoded rows; head/limit only trims returned tool rows.";
 const CHROME_TOOL_SHAPING_NOTE: &str =
-    "Chrome tool output preserves columns/rows and adds completeness/privacy metadata before rows. row_count is null because Chrome tools use built-in SQL limits; truncated=true means the limit was reached and lower-ranked rows may be omitted.";
+    "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened.";
 const REDACTION_POLICY_NOTE: &str =
     "execute_sql and Chrome dedicated-tool string cells may contain <redacted>; this is server-side policy, not a tool parameter.";
 
@@ -829,22 +841,37 @@ fn chrome_hotspots_effective_limit(limit: Option<u32>) -> usize {
     }
 }
 
+fn chrome_tool_max_string_len(max_string_len: Option<u32>) -> Result<usize, String> {
+    match max_string_len {
+        Some(0) => Err("`max_string_len` must be > 0 when set.".to_owned()),
+        Some(n) => Ok(n as usize),
+        None => Ok(DEFAULT_CHROME_TOOL_MAX_STRING_LEN),
+    }
+}
+
 fn format_chrome_tool_response(
     table: DecodedTable,
     effective_limit: usize,
+    max_string_len: Option<u32>,
 ) -> Result<String, String> {
-    format_chrome_tool_response_with_redaction(table, effective_limit, default_redact_strings())
+    format_chrome_tool_response_with_redaction(
+        table,
+        effective_limit,
+        chrome_tool_max_string_len(max_string_len)?,
+        default_redact_strings(),
+    )
 }
 
 fn format_chrome_tool_response_with_redaction(
     table: DecodedTable,
     effective_limit: usize,
+    max_string_len: usize,
     redact_strings: bool,
 ) -> Result<String, String> {
     let shape = ExecuteSqlOutputShape {
         mode: ExecuteSqlOutputMode::FullRows,
         active: true,
-        max_string_len: None,
+        max_string_len: Some(max_string_len),
         redact_strings,
     };
     let returned_rows = table.rows.len();
@@ -2093,8 +2120,13 @@ mod tests {
             ],
         );
 
-        let response =
-            format_chrome_tool_response_with_redaction(table, 2, false).expect("serialize");
+        let response = format_chrome_tool_response_with_redaction(
+            table,
+            2,
+            DEFAULT_CHROME_TOOL_MAX_STRING_LEN,
+            false,
+        )
+        .expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_json_key_order(&response, "\"truncated\":", "\"rows\":");
@@ -2112,7 +2144,7 @@ mod tests {
             parsed["note"]
                 .as_str()
                 .expect("note string")
-                .contains("built-in SQL limits"),
+                .contains("row_count unknown"),
             "note must explain Chrome tool completeness metadata: {parsed}",
         );
     }
@@ -2126,9 +2158,13 @@ mod tests {
             )]],
         );
 
-        let response =
-            format_chrome_tool_response_with_redaction(table, DEFAULT_CHROME_TOOL_ROWS, true)
-                .expect("serialize");
+        let response = format_chrome_tool_response_with_redaction(
+            table,
+            DEFAULT_CHROME_TOOL_ROWS,
+            DEFAULT_CHROME_TOOL_MAX_STRING_LEN,
+            true,
+        )
+        .expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
         assert_eq!(
@@ -2137,6 +2173,37 @@ mod tests {
         );
         assert_eq!(parsed["redacted"], json!(true));
         assert_eq!(parsed["string_truncated"], json!(false));
+    }
+
+    #[test]
+    fn chrome_tool_response_truncates_long_strings_by_default() {
+        let long = "abcdefghijklmnopqrstuvwxyz".repeat(12);
+        let table = decoded_table(&["name"], vec![vec![json!(long)]]);
+
+        let response =
+            format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, None).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        let returned = parsed["rows"][0][0].as_str().expect("string cell");
+        assert!(
+            returned.ends_with("...<truncated>"),
+            "long Chrome-tool strings should be capped by default: {returned}"
+        );
+        assert_eq!(
+            returned.chars().count(),
+            DEFAULT_CHROME_TOOL_MAX_STRING_LEN + "...<truncated>".chars().count()
+        );
+        assert_eq!(parsed["string_truncated"], json!(true));
+    }
+
+    #[test]
+    fn chrome_tool_response_rejects_zero_max_string_len() {
+        let table = decoded_table(&["name"], vec![vec![json!("short")]]);
+
+        let err = format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, Some(0))
+            .expect_err("zero max_string_len must reject");
+
+        assert!(err.contains("max_string_len"), "got: {err}");
     }
 
     #[test]
@@ -2159,7 +2226,7 @@ mod tests {
             parsed["note"]
                 .as_str()
                 .expect("note string")
-                .contains("SQL execution semantics are unchanged"),
+                .contains("post-SQL decoded rows"),
             "note must prevent SQL-limit confusion: {parsed}",
         );
     }
@@ -2656,7 +2723,9 @@ mod tests {
                 .expect("load_trace on non-chrome fixture must succeed");
 
             let r = server
-                .chrome_scroll_jank_summary(Parameters(ChromeTraceParams {}))
+                .chrome_scroll_jank_summary(Parameters(ChromeTraceParams {
+                    max_string_len: None,
+                }))
                 .await;
             let err = r
                 .map(|_| ())
@@ -2666,7 +2735,9 @@ mod tests {
             assert!(err.contains("list_stdlib_modules"), "got: {err}");
 
             let r = server
-                .chrome_page_load_summary(Parameters(ChromeTraceParams {}))
+                .chrome_page_load_summary(Parameters(ChromeTraceParams {
+                    max_string_len: None,
+                }))
                 .await;
             let err = r
                 .map(|_| ())
@@ -2682,6 +2753,7 @@ mod tests {
                     upid: None,
                     min_dur_ms: None,
                     limit: None,
+                    max_string_len: None,
                 }))
                 .await;
             let err = r
@@ -2692,7 +2764,9 @@ mod tests {
             assert!(err.contains("list_stdlib_modules"), "got: {err}");
 
             let r = server
-                .chrome_startup_summary(Parameters(ChromeTraceParams {}))
+                .chrome_startup_summary(Parameters(ChromeTraceParams {
+                    max_string_len: None,
+                }))
                 .await;
             let err = r
                 .map(|_| ())
@@ -2702,7 +2776,9 @@ mod tests {
             assert!(err.contains("list_stdlib_modules"), "got: {err}");
 
             let r = server
-                .chrome_web_content_interactions(Parameters(ChromeTraceParams {}))
+                .chrome_web_content_interactions(Parameters(ChromeTraceParams {
+                    max_string_len: None,
+                }))
                 .await;
             let err = r
                 .map(|_| ())
@@ -2812,12 +2888,21 @@ mod tests {
     /// successfully into the typed params.
     #[test]
     fn chrome_main_thread_hotspots_params_accepts_stringified_numerics() {
-        let p: ChromeMainThreadHotspotsParams =
-            serde_json::from_str(r#"{"pid": "12800", "min_dur_ms": "50", "limit": "30"}"#)
-                .expect("stringified numerics must deserialize after v0.11.3");
+        let p: ChromeMainThreadHotspotsParams = serde_json::from_str(
+            r#"{"pid": "12800", "min_dur_ms": "50", "limit": "30", "max_string_len": "260"}"#,
+        )
+        .expect("stringified numerics must deserialize after v0.11.3");
         assert_eq!(p.pid, Some(12800));
         assert_eq!(p.min_dur_ms, Some(50.0));
         assert_eq!(p.limit, Some(30));
+        assert_eq!(p.max_string_len, Some(260));
+    }
+
+    #[test]
+    fn chrome_trace_params_accept_stringified_max_string_len() {
+        let p: ChromeTraceParams = serde_json::from_str(r#"{"max_string_len": "300"}"#)
+            .expect("stringified Chrome max_string_len must deserialize");
+        assert_eq!(p.max_string_len, Some(300));
     }
 
     /// JsonSchema must still advertise strict types so well-behaved LLMs
@@ -2848,6 +2933,7 @@ mod tests {
             ("upid", "integer"),
             ("min_dur_ms", "number"),
             ("limit", "integer"),
+            ("max_string_len", "integer"),
         ];
         for (field, expected_type) in strict_pairs {
             let prop = props

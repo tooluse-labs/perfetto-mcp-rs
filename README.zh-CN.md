@@ -181,11 +181,11 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 | `execute_sql` | 执行 PerfettoSQL 查询（最多 5000 行）；可选输出塑形支持 `head`/`limit`、`summary`、`columns_only`、`include_row_count`、`max_string_len`；服务端默认会对 URL/header/cookie/路径中的敏感值做隐私遮蔽 |
 | `list_processes` | 列出 trace 里的进程（pid、名称、起止时间戳） |
 | `list_threads_in_process` | 列出指定进程名下的线程（最多 2000 条） |
-| `chrome_scroll_jank_summary` | 按原因汇总最严重的 Chrome 滚动卡顿帧；行数据前返回元信息（仅 Chrome trace） |
-| `chrome_page_load_summary` | 页面加载的 URL / FCP / LCP / DCL / load 耗时；行数据前返回元信息（仅 Chrome trace） |
-| `chrome_main_thread_hotspots` | 主线程任务按耗时排序，带 ts 和 cpu_pct；行数据前返回元信息（仅 Chrome trace） |
-| `chrome_startup_summary` | 浏览器启动事件与首次可见内容时间；行数据前返回元信息（仅 Chrome trace） |
-| `chrome_web_content_interactions` | Web 内容交互（点击、触摸、INP）按耗时排序；行数据前返回元信息（仅 Chrome trace） |
+| `chrome_scroll_jank_summary` | 按原因汇总最严重的 Chrome 滚动卡顿帧；元信息标记行/字符串是否截断（仅 Chrome trace） |
+| `chrome_page_load_summary` | 页面加载的 URL / FCP / LCP / DCL / load 耗时；元信息标记行/字符串是否截断（仅 Chrome trace） |
+| `chrome_main_thread_hotspots` | 主线程任务按耗时排序，带 ts 和 cpu_pct；元信息标记行/字符串是否截断（仅 Chrome trace） |
+| `chrome_startup_summary` | 浏览器启动事件与首次可见内容时间；元信息标记行/字符串是否截断（仅 Chrome trace） |
+| `chrome_web_content_interactions` | Web 内容交互（点击、触摸、INP）按耗时排序；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `list_stdlib_modules` | 列出 PerfettoSQL stdlib 模块及用法示例（不需要先加载 trace） |
 
 隐私提示：MCP tool 的结果通常会进入 LLM 上下文，而真实 trace 里可能包含 URL、header、cookie、本地路径等个人或凭据相关信息。`execute_sql` 和专用 Chrome 工具默认遮蔽这类敏感字符串，同时保留诊断结构。需要原始取证数据时，可在启动服务端前设置 `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`；`load_trace` 会在摘要里报告当前策略。

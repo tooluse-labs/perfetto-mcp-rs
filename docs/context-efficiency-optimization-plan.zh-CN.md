@@ -59,6 +59,9 @@ Last updated: 2026-05-23
 - 多处工具结果在会话 UI 中被省略成 `...`，尤其是 `list_table_structure`、
   大 rows、`args.display_value`、headers / URL / 本地路径等长字符串。LLM
   仍能推进，但实际上是在不完整结果上推理。
+- 对 `trace5.json` 复跑确认：日志里的 Chrome 专用工具省略不是 server 默认
+  字符串截断，而是客户端显示层裁剪；当时返回体里也没有 `string_truncated`
+  元数据。输出塑形需要把这类不可观测裁剪前移为 server 端可标记状态。
 - agent 反复手写 `WITH RECURSIVE descendants...` 来展开 slice 子树，并出现
   一次 `ambiguous column name: depth`。错误被自动修复，但这是稳定、可工具化
   的重复模式。
@@ -78,8 +81,9 @@ Last updated: 2026-05-23
 - Chrome page-load 场景需要二级工具：页面加载慢时，直接汇总导航阻塞、资源
   请求、Renderer 长任务和关键 URL，而不是让 agent 从原始 `slice` / `args`
   反复试探。
-- 长字符串截断和常见敏感字段脱敏应作为结果塑形的一部分，而不是留给每个
-  domain tool 单独处理。
+- 长字符串预算和常见敏感字段脱敏应作为结果塑形的一部分，并通过
+  `string_truncated` / `redacted` 明确标记；不要只写“默认截断”，避免让
+  agent 误以为 SQL 或行集合被改写。
 
 ## 设计原则
 
