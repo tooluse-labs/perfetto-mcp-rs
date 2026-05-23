@@ -30,6 +30,20 @@ function Install-PerfettoMcp {
     function _info($m) { Write-Host "==> $m" }
     function _warn($m) { Write-Host "warning: $m" -ForegroundColor Yellow }
     function _fail($m) { Write-Host "error: $m" -ForegroundColor Red; throw $m }
+    function _download($url, $dest) {
+        for ($attempt = 1; $attempt -le 4; $attempt++) {
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+                return
+            } catch {
+                if ($attempt -eq 4) {
+                    throw
+                }
+                _warn "download attempt $attempt failed; retrying"
+                Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
+    }
 
     # Detect real OS architecture even when running under WOW64 (32-bit PS on
     # 64-bit Windows reports 'x86' in PROCESSOR_ARCHITECTURE).
@@ -72,7 +86,7 @@ function Install-PerfettoMcp {
     }
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+        _download $url $dest
     } catch {
         _fail "download failed: $url"
     }

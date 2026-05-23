@@ -2,6 +2,10 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### Unreleased
+
+- **Windows shell installer handles release-asset TLS failures more defensively.** `install.sh` now retries downloads with a longer retry budget, falls back to `curl --ssl-no-revoke` on Windows, and then falls back to PowerShell when Git Bash/MSYS curl cannot complete the GitHub release TLS handshake. `install.ps1` now retries transient `Invoke-WebRequest` failures too.
+
 ### [0.15.4](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.4) (May 23, 2026)
 
 - **Chrome dedicated-tool metadata notes are shorter and more explicit.** The note now distinguishes row-cap truncation from string-cell shortening, so LLM consumers do not have to infer whether missing detail came from server shaping or client display clipping.

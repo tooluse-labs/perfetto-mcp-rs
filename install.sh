@@ -131,6 +131,61 @@ add_to_user_path_windows() {
   esac
 }
 
+download_file() {
+  url="$1"
+  dest="$2"
+  platform="$3"
+  curl_retry_args="-fsSL --retry 5 --retry-delay 2 --connect-timeout 20 --max-time 300"
+  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    curl_retry_args="${curl_retry_args} --retry-all-errors"
+  fi
+
+  # shellcheck disable=SC2086
+  if curl $curl_retry_args -o "$dest" "$url"; then
+    return 0
+  fi
+
+  case "$platform" in
+    windows-*)
+      warn "curl download failed; retrying with Windows SSL revocation checks disabled"
+      # shellcheck disable=SC2086
+      if curl $curl_retry_args --ssl-no-revoke -o "$dest" "$url"; then
+        return 0
+      fi
+      if command -v powershell.exe >/dev/null 2>&1; then
+        warn "curl download still failed; retrying with PowerShell"
+        dest_win="$dest"
+        if command -v cygpath >/dev/null 2>&1; then
+          dest_win="$(cygpath -m "$dest")"
+        fi
+        if PERFETTO_DOWNLOAD_URL="$url" PERFETTO_DOWNLOAD_DEST="$dest_win" \
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+            $ErrorActionPreference = "Stop"
+            try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+            $url = $env:PERFETTO_DOWNLOAD_URL
+            $dest = $env:PERFETTO_DOWNLOAD_DEST
+            for ($attempt = 1; $attempt -le 4; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+                exit 0
+              } catch {
+                if ($attempt -eq 4) {
+                  Write-Error $_
+                  exit 1
+                }
+                Start-Sleep -Seconds (2 * $attempt)
+              }
+            }
+          '; then
+          return 0
+        fi
+      fi
+      ;;
+  esac
+
+  return 1
+}
+
 main() {
   need_cmd curl
   need_cmd uname
@@ -164,7 +219,7 @@ main() {
   fi
   tmp="$(mktemp)"
   trap 'rm -f "$tmp"' EXIT INT TERM
-  curl -fsSL --retry 3 -o "$tmp" "$url" \
+  download_file "$url" "$tmp" "$platform" \
     || err "download failed: ${url}"
 
   mkdir -p "$INSTALL_DIR"
