@@ -47,7 +47,6 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install musl-tools (musl targets only)
         if: contains(matrix.target, 'musl')
@@ -121,7 +120,7 @@ jobs:
 
       - name: Overwrite release body
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           gh release edit "$TAG" --notes-file release-notes.md
@@ -162,7 +161,7 @@ jobs:
 
       - name: Download release binaries
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.ver.outputs.tag }}
         shell: bash
         run: |
@@ -265,7 +264,6 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "28.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
 
