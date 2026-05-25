@@ -1,47 +1,55 @@
 // Copyright 2025 The perfetto-mcp-rs Authors
 // SPDX-License-Identifier: Apache-2.0
 
-/// Server-level `instructions` shipped on MCP handshake. Lists curated
-/// PerfettoSQL stdlib modules so agents stop hand-rolling `LIKE '%x%'` scans
-/// on the raw `slice` table. Module names and their exposed public
-/// tables/views are taken from the vendored Perfetto stdlib source.
-///
-/// The same stdlib guidance is also carried on the `execute_sql` tool
-/// description (the `tools/list` channel v0.3/0.4 samples confirmed reaches
-/// Claude Code agents). This multi-channel redundancy is by design:
-/// instructions token cost is paid once at handshake, so future agent
-/// frameworks or MCP clients that do route `instructions` into the system
-/// prompt get the nudge for free.
-pub const STDLIB_INSTRUCTIONS: &str = "Perfetto trace analysis server. \
-    Start by calling load_trace with a path to a Perfetto trace file (.pftrace, \
-    .perfetto-trace, .bin, or any other trace_processor-readable format), \
-    then use list_tables and list_table_structure to discover the schema, and \
-    execute_sql to query.\n\
-    \n\
-    PREFER PerfettoSQL stdlib over raw `slice` + `LIKE '%x%'` scans. Call \
-    `INCLUDE PERFETTO MODULE <name>` then query the exposed table/view \
-    (INCLUDE and SELECT can be in a single execute_sql call):\n\
-    \n\
-    Chrome traces:\n\
-    - chrome.page_loads -> chrome_page_loads (navigations, FCP, LCP, DCL)\n\
-    - chrome.scroll_jank.scroll_jank_v3 -> chrome_janky_frames (scroll jank causes)\n\
-    - chrome.tasks -> chrome_tasks (renderer/browser main-thread tasks)\n\
-    - chrome.startups -> chrome_startups (browser process startup)\n\
-    - chrome.web_content_interactions -> chrome_web_content_interactions (input latency, INP)\n\
-    \n\
-    Android traces:\n\
-    - android.startup.startups -> android_startups (app cold/warm start)\n\
-    - android.anrs -> android_anrs (ANR detection)\n\
-    - android.binder -> android_binder_txns (binder IPC)\n\
-    \n\
-    Generic (any trace):\n\
-    - slices.with_context -> thread_slice, process_slice (use INSTEAD OF manual \
-      thread_track -> thread -> process JOIN chain)\n\
-    - linux.cpu.frequency -> cpu_frequency_counters (CPU frequency)\n\
-    \n\
-    For modules not listed here (memory.*, wattson.*, sched.*, android.frames.*, \
-    etc.), fetch https://perfetto.dev/docs/analysis/stdlib-docs before falling \
-    back to raw slice scans.";
+/// Server-level `instructions` shipped on MCP handshake. Keep this short:
+/// many MCP clients inject it into every LLM session. Longer stdlib guidance
+/// lives in `STDLIB_QUICKREF`, exposed as a resource and mirrored by the
+/// structured `list_stdlib_modules` tool for tools-only clients.
+pub const STDLIB_INSTRUCTIONS: &str = "Call load_trace first. Use dedicated \
+    chrome_* tools for common Chrome questions. Use list_tables and \
+    list_table_structure for schema discovery, and execute_sql for custom \
+    PerfettoSQL. Prefer PerfettoSQL stdlib modules over raw slice LIKE scans; \
+    when unsure, read resource://perfetto-mcp/stdlib-quickref or call \
+    list_stdlib_modules.";
+
+pub const STDLIB_QUICKREF_URI: &str = "resource://perfetto-mcp/stdlib-quickref";
+pub const STDLIB_QUICKREF_MIME_TYPE: &str = "text/markdown";
+
+/// Human-readable stdlib guidance kept out of the default handshake. This is
+/// intentionally concise but still teaches the routing pattern and the most
+/// useful module names.
+pub const STDLIB_QUICKREF: &str = r#"# PerfettoSQL stdlib quick reference
+
+Use `INCLUDE PERFETTO MODULE <module>;` before querying a stdlib view. The
+`INCLUDE` and `SELECT` can be sent in one `execute_sql` call.
+
+Prefer stdlib views over raw `slice` scans when a module fits the question.
+Use `list_stdlib_modules` for structured filtering by domain or keyword, and
+`list_table_structure` after an `INCLUDE` if a column name is uncertain.
+
+## Chrome
+
+- `chrome.page_loads` -> `chrome_page_loads`: navigations, FCP, LCP, DCL, load.
+- `chrome.scroll_jank.scroll_jank_v3` -> `chrome_janky_frames`: scroll jank causes.
+- `chrome.tasks` -> `chrome_tasks`: browser/renderer tasks with process and thread context.
+- `chrome.startups` -> `chrome_startups`: browser startup events.
+- `chrome.web_content_interactions` -> `chrome_web_content_interactions`: input latency and INP.
+
+## Android
+
+- `android.startup.startups` -> `android_startups`: cold/warm app startup.
+- `android.anrs` -> `android_anrs`: ANR detection.
+- `android.binder` -> `android_binder_txns`: Binder IPC transactions.
+
+## Generic
+
+- `slices.with_context` -> `thread_slice`, `process_slice`: slice rows pre-joined
+  with thread/process context.
+- `linux.cpu.frequency` -> `cpu_frequency_counters`: CPU frequency counters.
+
+For modules outside this curated list, use the Perfetto stdlib docs:
+https://perfetto.dev/docs/analysis/stdlib-docs
+"#;
 
 /// Curated PerfettoSQL stdlib modules as a JSON array. Targets the default
 /// downloaded trace_processor_shell version. If PERFETTO_TP_PATH points to
@@ -125,23 +133,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stdlib_module_list_and_instructions_are_in_sync() {
+    fn stdlib_module_list_and_quickref_are_in_sync() {
         let list: Vec<serde_json::Value> =
             serde_json::from_str(STDLIB_MODULE_LIST).expect("STDLIB_MODULE_LIST is valid JSON");
         for entry in &list {
             let module = entry["module"].as_str().unwrap();
             assert!(
-                STDLIB_INSTRUCTIONS.contains(module),
-                "STDLIB_INSTRUCTIONS is missing module `{module}` that STDLIB_MODULE_LIST lists — \
-                 update STDLIB_INSTRUCTIONS or remove the module from the list",
+                STDLIB_QUICKREF.contains(module),
+                "STDLIB_QUICKREF is missing module `{module}` that STDLIB_MODULE_LIST lists — \
+                 update STDLIB_QUICKREF or remove the module from the list",
             );
             for view in entry["views"].as_array().unwrap() {
                 let view = view.as_str().unwrap();
                 assert!(
-                    STDLIB_INSTRUCTIONS.contains(view),
-                    "STDLIB_INSTRUCTIONS is missing view `{view}` for module `{module}`",
+                    STDLIB_QUICKREF.contains(view),
+                    "STDLIB_QUICKREF is missing view `{view}` for module `{module}`",
                 );
             }
         }
+    }
+
+    #[test]
+    fn stdlib_instructions_stay_routing_sized() {
+        assert!(
+            STDLIB_INSTRUCTIONS.len() <= 450,
+            "STDLIB_INSTRUCTIONS should stay short routing text, got {} chars",
+            STDLIB_INSTRUCTIONS.len(),
+        );
     }
 }

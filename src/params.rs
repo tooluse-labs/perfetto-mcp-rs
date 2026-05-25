@@ -227,7 +227,18 @@ pub struct ChromeMainThreadHotspotsParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ListStdlibModulesParams {}
+pub struct ListStdlibModulesParams {
+    /// Optional domain filter. Valid values: "chrome", "android", "generic".
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Optional case-insensitive search over module name, view names, and description.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Optional max entries to return. Must be > 0 when set; accepts both
+    /// numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+}
 
 /// Output of `list_tables`. Just the matching names; the count is implicit
 /// (`names.len()`).
@@ -382,5 +393,15 @@ mod tests {
             result.is_err(),
             "deny_unknown_fields must reject extra keys"
         );
+    }
+
+    #[test]
+    fn list_stdlib_modules_params_accept_filters() {
+        let params: ListStdlibModulesParams =
+            serde_json::from_str(r#"{"domain": "chrome", "query": "jank", "limit": "2"}"#)
+                .expect("filters must deserialize");
+        assert_eq!(params.domain.as_deref(), Some("chrome"));
+        assert_eq!(params.query.as_deref(), Some("jank"));
+        assert_eq!(params.limit, Some(2));
     }
 }

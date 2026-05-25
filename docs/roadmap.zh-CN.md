@@ -225,7 +225,7 @@ v0.2 已落地正确性修复、回归测试、错误模型收敛和下载硬化
 
 ### MCP Resource
 
-- [ ] 以 MCP Resource 形式暴露 stdlib 速查表 **(v0.3 P0——优先于领域工具)**
+- [x] 以 MCP Resource 形式暴露 stdlib 速查表 **(已在 v0.15.6-dev 落地)**
   - URI：`resource://perfetto-mcp/stdlib-quickref`
   - 精选最实用的 stdlib 模块，附一句话领域提示；与 `list_stdlib_modules` 互补——tool 负责枚举，resource 负责教学
   - 灵感来自 antarikshc/perfetto-mcp 的 MCP Resources 模式

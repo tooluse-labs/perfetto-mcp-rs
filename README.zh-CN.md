@@ -186,7 +186,13 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 | `chrome_main_thread_hotspots` | 主线程任务按耗时排序，带 ts 和 cpu_pct；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_startup_summary` | 浏览器启动事件与首次可见内容时间；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_web_content_interactions` | Web 内容交互（点击、触摸、INP）按耗时排序；元信息标记行/字符串是否截断（仅 Chrome trace） |
-| `list_stdlib_modules` | 列出 PerfettoSQL stdlib 模块及用法示例（不需要先加载 trace） |
+| `list_stdlib_modules` | 列出 PerfettoSQL stdlib 模块及用法示例，支持 `domain`、`query`、`limit` 过滤（不需要先加载 trace） |
+
+## Resources
+
+| Resource | 用途 |
+|---|---|
+| `resource://perfetto-mcp/stdlib-quickref` | 按需读取 Chrome、Android、通用 trace 的 PerfettoSQL stdlib 速查表 |
 
 隐私提示：MCP tool 的结果通常会进入 LLM 上下文，而真实 trace 里可能包含 URL、header、cookie、本地路径等个人或凭据相关信息。`execute_sql` 和专用 Chrome 工具默认遮蔽这类敏感字符串，同时保留诊断结构。需要原始取证数据时，可在启动服务端前设置 `PERFETTO_MCP_REDACT_STRINGS_DEFAULT=false`；`load_trace` 会在摘要里报告当前策略。
 
@@ -201,7 +207,8 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
   对返回的行做下一步查询。
 - **其他 trace**：`load_trace` → 用 `list_tables` / `list_table_structure`
   探索 schema → `execute_sql` 查询。如果分析涉及到 stdlib 模块（Android、
-  `slices.with_context` 这类通用模块），可以调 `list_stdlib_modules` 辅助。
+  `slices.with_context` 这类通用模块），可以调 `list_stdlib_modules` 或读取
+  `resource://perfetto-mcp/stdlib-quickref` 辅助。
 
 ## 示例
 

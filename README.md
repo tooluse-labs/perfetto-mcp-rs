@@ -189,7 +189,13 @@ it in place.
 | `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts and cpu_pct; metadata flags row/string truncation (Chrome trace) |
 | `chrome_startup_summary` | Browser startup events and time-to-first-visible-content; metadata flags row/string truncation (Chrome trace) |
 | `chrome_web_content_interactions` | Web content interactions (clicks, taps, INP) ranked by duration; metadata flags row/string truncation (Chrome trace) |
-| `list_stdlib_modules` | List available PerfettoSQL stdlib modules with usage examples (no trace needed) |
+| `list_stdlib_modules` | List available PerfettoSQL stdlib modules with optional `domain`, `query`, and `limit` filters (no trace needed) |
+
+## Resources
+
+| Resource | Purpose |
+|---|---|
+| `resource://perfetto-mcp/stdlib-quickref` | On-demand PerfettoSQL stdlib quick reference for Chrome, Android, and generic traces |
 
 Privacy note: MCP tool results are normally visible to the LLM context, and
 real traces can contain URLs, headers, cookies, and local paths. `execute_sql`
@@ -212,8 +218,9 @@ Typical flow depends on trace type:
   on the returned rows.
 - **Other traces**: `load_trace` → `list_tables` / `list_table_structure`
   for schema discovery → `execute_sql` for queries. Call
-  `list_stdlib_modules` as an auxiliary when stdlib modules might cover
-  your analysis (Android, generic modules like `slices.with_context`).
+  `list_stdlib_modules` or read `resource://perfetto-mcp/stdlib-quickref`
+  when stdlib modules might cover your analysis (Android, generic modules
+  like `slices.with_context`).
 
 ## Example
 

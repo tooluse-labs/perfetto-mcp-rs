@@ -228,7 +228,7 @@ Goal: upgrade from "generic SQL executor" to "analysis tool for common Perfetto 
 
 ### MCP Resource
 
-- [ ] Expose a stdlib quick-reference as an MCP Resource **(v0.3 P0 — lands before domain tools)**
+- [x] Expose a stdlib quick-reference as an MCP Resource **(landed v0.15.6-dev)**
   - URI: `resource://perfetto-mcp/stdlib-quickref`
   - Curated table of the most useful stdlib modules with one-line domain hints, complementing `list_stdlib_modules` — the tool enumerates, the resource teaches
   - Inspired by antarikshc/perfetto-mcp's MCP Resources pattern

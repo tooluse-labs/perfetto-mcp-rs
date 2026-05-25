@@ -6,8 +6,13 @@ use std::sync::Arc;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router, ServerHandler, ServiceExt,
+    model::{
+        AnnotateAble, ListResourcesResult, PaginatedRequestParams, RawResource,
+        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+        ServerInfo,
+    },
+    service::RequestContext,
+    tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -47,10 +52,44 @@ impl ServerHandler for PerfettoMcpServer {
                 icons: None,
                 website_url: None,
             },
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_resources()
+                .enable_tools()
+                .build(),
             instructions: Some(server_instructions()),
             ..Default::default()
         }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
+            stdlib_quickref_resource(),
+        ])))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        std::future::ready(match request.uri.as_str() {
+            STDLIB_QUICKREF_URI => Ok(ReadResourceResult {
+                contents: vec![ResourceContents::TextResourceContents {
+                    uri: STDLIB_QUICKREF_URI.to_owned(),
+                    mime_type: Some(STDLIB_QUICKREF_MIME_TYPE.to_owned()),
+                    text: STDLIB_QUICKREF.to_owned(),
+                    meta: None,
+                }],
+            }),
+            uri => Err(McpError::resource_not_found(
+                format!("Unknown resource: {uri}"),
+                None,
+            )),
+        })
     }
 }
 
@@ -80,7 +119,12 @@ impl PerfettoMcpServer {
                        trace, or `trace_processor_shell` fails to parse it (corrupt \
                        trace, version mismatch). On first run only, also errors if the \
                        `trace_processor_shell` binary fails to download from the \
-                       Perfetto LUCI bucket."
+                       Perfetto LUCI bucket.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn load_trace(
         &self,
@@ -144,7 +188,13 @@ impl PerfettoMcpServer {
                        https://perfetto.dev/docs/analysis/stdlib-docs (24 stdlib packages — \
                        chrome / android / sched / slices / linux / wattson / v8 / ...; use \
                        per-package anchors like `#package-chrome`), \
-                       https://perfetto.dev/docs/analysis/perfetto-sql-syntax (syntax)."
+                       https://perfetto.dev/docs/analysis/perfetto-sql-syntax (syntax).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn execute_sql(
         &self,
@@ -181,7 +231,13 @@ impl PerfettoMcpServer {
                        table is missing, retry with an explicit pattern in case \
                        it's marked internal.\n\
                        \n\
-                       Errors when: no trace is loaded — call `load_trace` first."
+                       Errors when: no trace is loaded — call `load_trace` first.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_tables(
         &self,
@@ -251,7 +307,13 @@ impl PerfettoMcpServer {
                        accepts the alias `name` (v0.11.3+).\n\
                        \n\
                        Errors when: the table doesn't exist or has no columns. Call \
-                       `list_tables` first if uncertain about the name."
+                       `list_tables` first if uncertain about the name.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_table_structure(
         &self,
@@ -298,7 +360,13 @@ impl PerfettoMcpServer {
                        Empty result: rare; would mean the trace captured no process \
                        metadata at all.\n\
                        \n\
-                       Errors when: no trace is loaded — call `load_trace` first."
+                       Errors when: no trace is loaded — call `load_trace` first.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_processes(
         &self,
@@ -333,7 +401,13 @@ impl PerfettoMcpServer {
                        \n\
                        When the 2000-row cap is hit (system_server, Chrome \
                        renderer-fork): drill down via `execute_sql` against the `thread` \
-                       table directly."
+                       table directly.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_threads_in_process(
         &self,
@@ -412,7 +486,13 @@ impl PerfettoMcpServer {
                        `string_truncated=true` means cell text was shortened.\n\
                        \n\
                        Empty result: no janky frames detected (clean trace) or no \
-                       scrolls occurred during capture."
+                       scrolls occurred during capture.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn chrome_scroll_jank_summary(
         &self,
@@ -449,7 +529,13 @@ impl PerfettoMcpServer {
                        `string_truncated=true` means cell text was shortened.\n\
                        \n\
                        Empty result: no navigations occurred during capture (e.g. trace \
-                       started after the page was already loaded)."
+                       started after the page was already loaded).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn chrome_page_load_summary(
         &self,
@@ -504,7 +590,13 @@ impl PerfettoMcpServer {
                         \n\
                         Empty result: no detected main-thread tasks exceeded `min_dur_ms` \
                         at the selected process/window threshold, or the trace uses \
-                       non-standard main-thread names outside the `Cr*Main` fallback."
+                       non-standard main-thread names outside the `Cr*Main` fallback.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn chrome_main_thread_hotspots(
         &self,
@@ -555,7 +647,13 @@ impl PerfettoMcpServer {
                        \n\
                        Empty result: trace started after the browser was already \
                        running (most cases — startup is captured only when tracing \
-                       began before launch)."
+                       began before launch).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn chrome_startup_summary(
         &self,
@@ -593,7 +691,13 @@ impl PerfettoMcpServer {
                        \n\
                        Empty result: no interactions captured (trace started before \
                        user input or interaction tracking was disabled in tracing \
-                       config)."
+                       config).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn chrome_web_content_interactions(
         &self,
@@ -610,34 +714,27 @@ impl PerfettoMcpServer {
 
     #[tool(
         name = "list_stdlib_modules",
-        description = "List a curated set of PerfettoSQL stdlib modules. Returns a JSON \
-                       array — each entry has `module` (the value for `INCLUDE PERFETTO \
-                       MODULE`), `domain` (chrome / android / generic), `views`, \
-                       `description`, and an illustrative `usage` query.\n\
+        description = "List curated PerfettoSQL stdlib modules as JSON entries with \
+                       `domain`, `module`, `views`, `description`, and `usage`. Use \
+                       when choosing an `INCLUDE PERFETTO MODULE ...` target; no trace \
+                       has to be loaded.\n\
                        \n\
-                       Use when: exploring what's available before writing SQL against \
-                       an unfamiliar trace type, or discovering modules outside the \
-                       dedicated `chrome_*` tools (memory, sched, wattson, v8, etc.). \
-                       Call this before `load_trace` if you want to scope your analysis \
-                       upfront — no trace needs to be loaded.\n\
-                       \n\
-                       Don't use for: discovering all stdlib modules — this is a \
-                       curated subset of the most useful ones. The exhaustive list \
-                       lives at https://perfetto.dev/docs/analysis/stdlib-docs.\n\
-                       \n\
-                       Parameters: none.\n\
-                       \n\
-                       Then use `execute_sql` with `INCLUDE PERFETTO MODULE <module>; \
-                       SELECT ...` (both can be in one call). If `PERFETTO_TP_PATH` \
-                       points to a custom binary, some modules may not exist in that \
-                       version — verify column names with `list_table_structure` if a \
-                       query fails."
+                       Optional filters: `domain` (`chrome`, `android`, `generic`), \
+                       `query` (case-insensitive search over module/view/description), \
+                       and `limit`. For longer guidance, read \
+                       resource://perfetto-mcp/stdlib-quickref.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_stdlib_modules(
         &self,
-        Parameters(_params): Parameters<ListStdlibModulesParams>,
+        Parameters(params): Parameters<ListStdlibModulesParams>,
     ) -> Result<String, String> {
-        Ok(STDLIB_MODULE_LIST.to_owned())
+        filtered_stdlib_modules_json(&params)
     }
 }
 
@@ -684,6 +781,94 @@ impl PerfettoMcpServer {
             .await
             .map_err(|e| format!("Failed to open trace {trace_path:?}: {e}"))
     }
+}
+
+fn stdlib_quickref_resource() -> rmcp::model::Resource {
+    RawResource {
+        uri: STDLIB_QUICKREF_URI.to_owned(),
+        name: "stdlib-quickref".to_owned(),
+        title: Some("PerfettoSQL stdlib quick reference".to_owned()),
+        description: Some(
+            "Curated PerfettoSQL stdlib modules and minimal routing examples.".to_owned(),
+        ),
+        mime_type: Some(STDLIB_QUICKREF_MIME_TYPE.to_owned()),
+        size: Some(STDLIB_QUICKREF.len() as u32),
+        icons: None,
+        meta: None,
+    }
+    .no_annotation()
+}
+
+fn filtered_stdlib_modules_json(params: &ListStdlibModulesParams) -> Result<String, String> {
+    if params.domain.is_none() && params.query.is_none() && params.limit.is_none() {
+        return Ok(STDLIB_MODULE_LIST.to_owned());
+    }
+
+    let domain = params
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    if let Some(domain) = domain.as_deref() {
+        if !matches!(domain, "chrome" | "android" | "generic") {
+            return Err(format!(
+                "`domain` must be one of chrome, android, generic; got {domain:?}"
+            ));
+        }
+    }
+
+    let query = params
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+
+    let limit = match params.limit {
+        Some(0) => return Err("`limit` must be > 0 when set.".to_owned()),
+        Some(n) => Some(n as usize),
+        None => None,
+    };
+
+    let modules: Vec<serde_json::Value> = serde_json::from_str(STDLIB_MODULE_LIST)
+        .map_err(|e| format!("Failed to parse stdlib module catalog: {e}"))?;
+    let iter = modules.into_iter().filter(|entry| {
+        let domain_matches = domain.as_deref().map_or(true, |domain| {
+            entry.get("domain").and_then(|v| v.as_str()) == Some(domain)
+        });
+        let query_matches = query
+            .as_deref()
+            .map_or(true, |query| stdlib_module_entry_matches(entry, query));
+        domain_matches && query_matches
+    });
+    let filtered: Vec<_> = match limit {
+        Some(limit) => iter.take(limit).collect(),
+        None => iter.collect(),
+    };
+
+    serde_json::to_string(&filtered).map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+fn stdlib_module_entry_matches(entry: &serde_json::Value, query: &str) -> bool {
+    for key in ["domain", "module", "description"] {
+        if entry
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map_or(false, |s| s.to_ascii_lowercase().contains(query))
+        {
+            return true;
+        }
+    }
+    entry
+        .get("views")
+        .and_then(|v| v.as_array())
+        .map_or(false, |views| {
+            views.iter().any(|view| {
+                view.as_str()
+                    .map_or(false, |s| s.to_ascii_lowercase().contains(query))
+            })
+        })
 }
 
 /// Hints are kind-gated so unrelated SQL errors don't get misrouted. The
@@ -2511,41 +2696,53 @@ mod tests {
         PerfettoMcpServer::new(manager)
     }
 
-    // Without this capability, clients skip `tools/list` on handshake and no
-    // tools are registered — the router still has them, but they're invisible.
+    // Without these capabilities, clients skip `tools/list` / `resources/list`
+    // on handshake and the router still has them, but they're invisible.
     #[test]
-    fn get_info_declares_tools_capability() {
+    fn get_info_declares_tools_and_resources_capabilities() {
         let info = test_server().get_info();
         assert!(
             info.capabilities.tools.is_some(),
             "server must declare `tools` capability so clients call tools/list"
         );
+        assert!(
+            info.capabilities.resources.is_some(),
+            "server must declare `resources` capability so clients can read quickrefs"
+        );
     }
 
     #[test]
-    fn instructions_list_core_stdlib_modules() {
+    fn instructions_stay_short_and_route_to_quickref() {
         let info = test_server().get_info();
         let instructions = info
             .instructions
-            .expect("server must ship instructions with stdlib module directory");
-        for module in [
-            "chrome.page_loads",
-            "chrome.scroll_jank.scroll_jank_v3",
-            "chrome.tasks",
-            "chrome.startups",
-            "android.startup.startups",
-            "android.anrs",
-            "android.binder",
-            "slices.with_context",
-        ] {
-            assert!(
-                instructions.contains(module),
-                "instructions missing stdlib module `{module}` — agents will fall back to raw slice scans"
-            );
-        }
+            .expect("server must ship short routing instructions");
         assert!(
-            instructions.contains("INCLUDE PERFETTO MODULE"),
-            "instructions must tell agents to INCLUDE stdlib modules before querying"
+            instructions.len() <= 900,
+            "instructions should stay routing-sized; got {} chars: {instructions}",
+            instructions.len(),
+        );
+        assert!(
+            instructions.contains(STDLIB_QUICKREF_URI),
+            "instructions must route long stdlib guidance to the quickref resource"
+        );
+        assert!(
+            instructions.contains("list_stdlib_modules"),
+            "instructions must preserve a tools-only fallback for stdlib discovery"
+        );
+    }
+
+    #[test]
+    fn stdlib_quickref_resource_metadata_is_exposed() {
+        let resource = stdlib_quickref_resource();
+        assert_eq!(resource.uri, STDLIB_QUICKREF_URI);
+        assert_eq!(
+            resource.mime_type.as_deref(),
+            Some(STDLIB_QUICKREF_MIME_TYPE)
+        );
+        assert!(
+            resource.size.unwrap_or_default() as usize >= STDLIB_QUICKREF.len(),
+            "resource size should describe the quickref payload"
         );
     }
 
@@ -2595,6 +2792,70 @@ mod tests {
                 "load_trace",
             ],
         );
+    }
+
+    #[test]
+    fn tool_annotations_surface_safety_hints() {
+        let server = test_server();
+        for tool in server.tool_router.list_all() {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool `{}` must carry annotations", tool.name));
+            assert_eq!(
+                annotations.open_world_hint,
+                Some(false),
+                "tool `{}` should advertise a closed-world trace-analysis domain",
+                tool.name,
+            );
+            assert_eq!(
+                annotations.destructive_hint,
+                Some(false),
+                "tool `{}` should advertise non-destructive behavior",
+                tool.name,
+            );
+            assert_eq!(
+                annotations.idempotent_hint,
+                Some(true),
+                "tool `{}` should advertise idempotence for repeated calls",
+                tool.name,
+            );
+            if tool.name == "load_trace" {
+                assert_eq!(
+                    annotations.read_only_hint, None,
+                    "load_trace changes server current-trace state, so it should not claim read-only"
+                );
+            } else {
+                assert_eq!(
+                    annotations.read_only_hint,
+                    Some(true),
+                    "tool `{}` should advertise read-only behavior",
+                    tool.name,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tool_descriptions_stay_within_context_budget() {
+        let server = test_server();
+        let tools = server.tool_router.list_all();
+        let total: usize = tools
+            .iter()
+            .map(|tool| tool.description.as_deref().unwrap_or("").len())
+            .sum();
+        assert!(
+            total <= 15_000,
+            "tool descriptions should stay routing-sized; total={total}"
+        );
+        for tool in tools {
+            let len = tool.description.as_deref().unwrap_or("").len();
+            assert!(
+                len <= 2_500,
+                "tool `{}` description is too large for default tools/list context: {len}",
+                tool.name,
+            );
+        }
     }
 
     #[test]
@@ -2714,6 +2975,42 @@ mod tests {
                 "module `{name}` must have usage example",
             );
         }
+    }
+
+    #[test]
+    fn list_stdlib_modules_filters_by_domain_query_and_limit() {
+        let response = filtered_stdlib_modules_json(&ListStdlibModulesParams {
+            domain: Some("chrome".to_owned()),
+            query: Some("jank".to_owned()),
+            limit: Some(2),
+        })
+        .expect("filters should serialize");
+        let modules: Vec<serde_json::Value> = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(modules.len(), 1);
+        assert_eq!(
+            modules[0]["module"].as_str(),
+            Some("chrome.scroll_jank.scroll_jank_v3")
+        );
+    }
+
+    #[test]
+    fn list_stdlib_modules_rejects_invalid_filter_values() {
+        let err = filtered_stdlib_modules_json(&ListStdlibModulesParams {
+            domain: Some("ios".to_owned()),
+            query: None,
+            limit: None,
+        })
+        .expect_err("unknown domains must be rejected");
+        assert!(err.contains("domain"), "got: {err}");
+
+        let err = filtered_stdlib_modules_json(&ListStdlibModulesParams {
+            domain: None,
+            query: None,
+            limit: Some(0),
+        })
+        .expect_err("zero limit must be rejected");
+        assert!(err.contains("limit"), "got: {err}");
     }
 
     /// Integration test exercising the full wrapper path of EVERY chrome_*
@@ -3135,11 +3432,9 @@ mod tests {
     /// The advertised inputSchema reflects the closed contract too: schemars
     /// emits `additionalProperties: false` when `deny_unknown_fields` is set.
     /// LLMs reading `tools/list` see a closed schema and (in theory) are less
-    /// prone to hallucinate fields. The 9 advertised tools all carry params
-    /// with `deny_unknown_fields` (`ListStdlibModulesParams` is empty but
-    /// still closed — that closure is the whole reason the empty type
-    /// exists; rmcp's parameterless `async fn foo(&self)` shape, by contrast,
-    /// emits an *open* schema and silently ignores hallucinated fields).
+    /// prone to hallucinate fields. The advertised tools all carry params with
+    /// `deny_unknown_fields`; rmcp's parameterless `async fn foo(&self)` shape,
+    /// by contrast, emits an *open* schema and silently ignores hallucinated fields.
     /// If anyone drops the attribute, this test fails on the affected
     /// tool's schema.
     #[test]
