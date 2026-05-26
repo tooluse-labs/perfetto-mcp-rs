@@ -44,10 +44,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "28.x"
-          repo-token: ${{ github.token }}
+      - name: Install protoc (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install protobuf
+          else
+            sudo apt-get update
+            sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc --yes --no-progress
 
       - name: Install musl-tools (musl targets only)
         if: contains(matrix.target, 'musl')
@@ -262,10 +273,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "28.x"
-          repo-token: ${{ github.token }}
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - uses: dtolnay/rust-toolchain@stable
 
