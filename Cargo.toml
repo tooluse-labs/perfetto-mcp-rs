@@ -1,6 +1,6 @@
 [package]
 name = "perfetto-mcp-rs"
-version = "0.15.7"
+version = "0.15.8"
 edition = "2021"
 description = "MCP server for Perfetto trace analysis"
 authors = ["The perfetto-mcp-rs Authors"]
