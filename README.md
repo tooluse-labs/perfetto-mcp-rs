@@ -184,6 +184,7 @@ it in place.
 | `execute_sql` | Run a PerfettoSQL query (max 5000 rows); optional output shaping supports `head`/`limit`, `summary`, `columns_only`, `include_row_count`, and `max_string_len`; server-side privacy redaction masks sensitive URL/header/cookie/path values by default |
 | `list_processes` | List processes in the trace (pid, name, start/end timestamps) |
 | `list_threads_in_process` | List threads under a process name (up to 2000) |
+| `slice_descendants_breakdown` | Summarize child slices under long slice ids without hand-writing recursive CTEs |
 | `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame; metadata flags row/string truncation (Chrome trace) |
 | `chrome_page_load_summary` | Page loads: URL, FCP, LCP, DCL, load timings in ms; metadata flags row/string truncation (Chrome trace) |
 | `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts and cpu_pct; metadata flags row/string truncation (Chrome trace) |
@@ -215,7 +216,8 @@ Typical flow depends on trace type:
   (`chrome_scroll_jank_summary`, `chrome_page_load_summary`,
   `chrome_main_thread_hotspots`, `chrome_startup_summary`,
   `chrome_web_content_interactions`) → `execute_sql` for deeper analysis
-  on the returned rows.
+  on the returned rows. Use `slice_descendants_breakdown` on a long task `id`
+  when you need its child-slice breakdown.
 - **Other traces**: `load_trace` → `list_tables` / `list_table_structure`
   for schema discovery → `execute_sql` for queries. Call
   `list_stdlib_modules` or read `resource://perfetto-mcp/stdlib-quickref`

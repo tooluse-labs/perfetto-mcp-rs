@@ -86,6 +86,41 @@ where
     }
 }
 
+/// Deserialize a vector of i64 values while accepting common LLM variants:
+/// a singleton number/string, or an array mixing numbers and numeric strings.
+pub(crate) fn lenient_i64_vec<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    fn parse_value<E>(value: serde_json::Value) -> Result<i64, E>
+    where
+        E: serde::de::Error,
+    {
+        match value {
+            serde_json::Value::Number(n) => n
+                .as_i64()
+                .ok_or_else(|| E::custom(format!("integer out of i64 range or non-integral: {n}"))),
+            serde_json::Value::String(s) => s.parse::<i64>().map_err(|e| {
+                E::custom(format!(
+                    "expected integer or numeric string, got string {s:?}: {e}"
+                ))
+            }),
+            other => Err(E::custom(format!(
+                "expected integer or numeric string, got {other}"
+            ))),
+        }
+    }
+
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(parse_value::<D::Error>)
+            .collect::<Result<Vec<_>, _>>(),
+        other => parse_value::<D::Error>(other).map(|value| vec![value]),
+    }
+}
+
 pub(crate) fn default_redact_strings() -> bool {
     let value = std::env::var(REDACT_STRINGS_DEFAULT_ENV).ok();
     redact_strings_default_from_env_value(value.as_deref())
@@ -174,6 +209,36 @@ pub struct ListThreadsInProcessParams {
     /// "/system/bin/init"). Either this or `upid` must be provided.
     #[serde(default)]
     pub process_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SliceDescendantsBreakdownParams {
+    /// Root slice ids to expand. The root slices themselves are omitted from
+    /// the summary; returned rows aggregate matching descendants under each
+    /// root. Accepts numbers or numeric strings.
+    #[serde(deserialize_with = "lenient_i64_vec")]
+    pub slice_ids: Vec<i64>,
+    /// Optional descendant minimum duration in milliseconds. Defaults to 1 ms.
+    /// Must be finite and non-negative; accepts both numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_f64")]
+    pub min_dur_ms: Option<f64>,
+    /// Optional maximum descendant depth. Defaults to 8. Must be > 0 when set;
+    /// accepts both numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub max_depth: Option<u32>,
+    /// Include an example args summary for one representative slice per group.
+    #[serde(default)]
+    pub include_args: bool,
+    /// Optional max rows to return. Defaults to 100 and is capped at 5000.
+    /// Accepts both numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+    /// Optional per-string-cell character cap applied to returned rows only.
+    /// Unset preserves full strings for precision; accepts both numbers and
+    /// numeric strings. Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub max_string_len: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -293,6 +358,20 @@ pub struct ChromeMainThreadHotspotsFilters<'a> {
     pub limit: Option<u32>,
 }
 
+/// Tunable filters for `slice_descendants_breakdown_sql`. `slice_ids` is the
+/// raw caller input (validated and deduped inside the SQL builder).
+/// `row_limit` is the *already-resolved* effective limit — the handler runs
+/// `slice_descendants_effective_limit` once before building the SQL so the
+/// limit cannot drift between the LIMIT clause and the response envelope.
+#[derive(Debug, Clone, Copy)]
+pub struct SliceDescendantsBreakdownFilters<'a> {
+    pub slice_ids: &'a [i64],
+    pub min_dur_ms: Option<f64>,
+    pub max_depth: Option<u32>,
+    pub include_args: bool,
+    pub row_limit: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
@@ -374,6 +453,24 @@ mod tests {
     }
 
     #[test]
+    fn lenient_i64_vec_accepts_arrays_and_singletons() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default, deserialize_with = "lenient_i64_vec")]
+            val: Vec<i64>,
+        }
+
+        let from_array: Wrapper = serde_json::from_str(r#"{"val": [1, "2"]}"#).unwrap();
+        assert_eq!(from_array.val, vec![1, 2]);
+
+        let from_single: Wrapper = serde_json::from_str(r#"{"val": "3"}"#).unwrap();
+        assert_eq!(from_single.val, vec![3]);
+
+        let invalid = serde_json::from_str::<Wrapper>(r#"{"val": ["nope"]}"#);
+        assert!(invalid.is_err());
+    }
+
+    #[test]
     fn redact_strings_default_is_privacy_first_and_env_can_disable() {
         assert!(redact_strings_default_from_env_value(None));
         assert!(redact_strings_default_from_env_value(Some("")));
@@ -403,5 +500,29 @@ mod tests {
         assert_eq!(params.domain.as_deref(), Some("chrome"));
         assert_eq!(params.query.as_deref(), Some("jank"));
         assert_eq!(params.limit, Some(2));
+    }
+
+    #[test]
+    fn slice_descendants_breakdown_params_accept_llm_numeric_variants() {
+        let params: SliceDescendantsBreakdownParams = serde_json::from_str(
+            r#"{"slice_ids": ["42", 43], "min_dur_ms": "0.5", "max_depth": "4", "limit": "20", "max_string_len": "240"}"#,
+        )
+        .expect("stringified numeric fields must deserialize");
+
+        assert_eq!(params.slice_ids, vec![42, 43]);
+        assert_eq!(params.min_dur_ms, Some(0.5));
+        assert_eq!(params.max_depth, Some(4));
+        assert_eq!(params.limit, Some(20));
+        assert_eq!(params.max_string_len, Some(240));
+    }
+
+    #[test]
+    fn slice_descendants_breakdown_params_require_slice_ids() {
+        let err = serde_json::from_str::<SliceDescendantsBreakdownParams>(r#"{}"#)
+            .expect_err("slice_ids must be required in the advertised schema");
+        assert!(
+            err.to_string().contains("slice_ids"),
+            "error must name the missing field, got: {err}",
+        );
     }
 }

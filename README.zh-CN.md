@@ -181,6 +181,7 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 | `execute_sql` | 执行 PerfettoSQL 查询（最多 5000 行）；可选输出塑形支持 `head`/`limit`、`summary`、`columns_only`、`include_row_count`、`max_string_len`；服务端默认会对 URL/header/cookie/路径中的敏感值做隐私遮蔽 |
 | `list_processes` | 列出 trace 里的进程（pid、名称、起止时间戳） |
 | `list_threads_in_process` | 列出指定进程名下的线程（最多 2000 条） |
+| `slice_descendants_breakdown` | 汇总长 slice id 下面的子 slice，避免手写 recursive CTE |
 | `chrome_scroll_jank_summary` | 按原因汇总最严重的 Chrome 滚动卡顿帧；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_page_load_summary` | 页面加载的 URL / FCP / LCP / DCL / load 耗时；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_main_thread_hotspots` | 主线程任务按耗时排序，带 ts 和 cpu_pct；元信息标记行/字符串是否截断（仅 Chrome trace） |
@@ -204,7 +205,8 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
   （`chrome_scroll_jank_summary`、`chrome_page_load_summary`、
   `chrome_main_thread_hotspots`、`chrome_startup_summary`、
   `chrome_web_content_interactions`），要深入分析时再用 `execute_sql`
-  对返回的行做下一步查询。
+  对返回的行做下一步查询。遇到长任务 `id` 时，可以用
+  `slice_descendants_breakdown` 展开它下面的子 slice。
 - **其他 trace**：`load_trace` → 用 `list_tables` / `list_table_structure`
   探索 schema → `execute_sql` 查询。如果分析涉及到 stdlib 模块（Android、
   `slices.with_context` 这类通用模块），可以调 `list_stdlib_modules` 或读取

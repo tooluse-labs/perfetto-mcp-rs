@@ -557,7 +557,8 @@ impl PerfettoMcpServer {
                        (thread_dur/dur), thread_dur_ms. Uses `chrome.tasks`, \
                        `thread.is_main_thread = 1` when available, and Chrome's \
                        `Cr*Main` thread-name convention as a fallback for traces \
-                       where thread metadata is incomplete or incorrect.\n\
+                       where thread metadata is incomplete or incorrect. Pass a returned \
+                       `id` to `slice_descendants_breakdown` for child-slice breakdowns.\n\
                        \n\
                        Use when: investigating main-thread responsiveness, finding hot \
                        tasks during scroll/load, comparing CPU vs wall time, scoping \
@@ -620,6 +621,81 @@ impl PerfettoMcpServer {
             table,
             chrome_hotspots_effective_limit(params.limit),
             params.max_string_len,
+        )
+    }
+
+    #[tool(
+        name = "slice_descendants_breakdown",
+        description = "Recursive child-slice expansion under known `slice.id` roots, \
+                       aggregated as a bounded breakdown (slice_count / total_ms / \
+                       max_ms per (depth, name) group). Use to drill into a long task \
+                       — after `chrome_main_thread_hotspots` or `execute_sql` returns \
+                       a slice id — without hand-writing `WITH RECURSIVE` CTEs over \
+                       `slice.parent_id`. Required: `slice_ids`. Optional bounds: \
+                       `min_dur_ms`, `max_depth`, `limit`, `include_args`, \
+                       `max_string_len`. The response echoes `summary_scope`, \
+                       `applied_filters`, and `missing_root_ids` (root slice ids \
+                       not present in the loaded trace — usually stale ids). \
+                       Returned columns: `root_id`, `depth`, `name`, `slice_count`, \
+                       `total_ms`, `max_ms`, `first_ts_ns` (raw nanoseconds, not ms), \
+                       `example_slice_id` (longest-duration descendant per group), \
+                       and optionally `example_args`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn slice_descendants_breakdown(
+        &self,
+        Parameters(params): Parameters<SliceDescendantsBreakdownParams>,
+    ) -> Result<String, String> {
+        let max_string_len = tool_max_string_len(params.max_string_len)?;
+        let effective_limit =
+            slice_descendants_effective_limit(params.limit).map_err(|e| e.to_string())?;
+        let applied_filters = slice_descendants_applied_filters(&params, effective_limit);
+
+        let client = self.client_for_current().await?;
+        let deduped_root_ids = dedupe_slice_ids_preserving_order(&params.slice_ids);
+        let missing_root_ids = if deduped_root_ids.is_empty() {
+            Vec::new()
+        } else {
+            fetch_missing_slice_ids(&client, &deduped_root_ids)
+                .await
+                .map_err(format_slice_descendants_tool_error)?
+        };
+        if !deduped_root_ids.is_empty() && missing_root_ids.len() == deduped_root_ids.len() {
+            return Err(format!(
+                "Failed to run slice_descendants_breakdown: none of the requested \
+                 slice_ids exist in the loaded trace ({} missing). The ids are likely \
+                 stale, came from a different trace, or refer to thread/process \
+                 tracks rather than `slice` rows. Re-run `chrome_main_thread_hotspots` \
+                 or `execute_sql` against the current trace to get fresh ids.",
+                missing_root_ids.len()
+            ));
+        }
+
+        let sql = slice_descendants_breakdown_sql(SliceDescendantsBreakdownFilters {
+            slice_ids: &params.slice_ids,
+            min_dur_ms: params.min_dur_ms,
+            max_depth: params.max_depth,
+            include_args: params.include_args,
+            row_limit: effective_limit,
+        })
+        .map_err(|e| e.to_string())?;
+
+        let table = client
+            .query(&sql)
+            .await
+            .map_err(format_slice_descendants_tool_error)?;
+        format_slice_descendants_tool_response_with_redaction(
+            table,
+            effective_limit as usize,
+            applied_filters,
+            missing_root_ids,
+            max_string_len,
+            default_redact_strings(),
         )
     }
 
@@ -834,12 +910,12 @@ fn filtered_stdlib_modules_json(params: &ListStdlibModulesParams) -> Result<Stri
     let modules: Vec<serde_json::Value> = serde_json::from_str(STDLIB_MODULE_LIST)
         .map_err(|e| format!("Failed to parse stdlib module catalog: {e}"))?;
     let iter = modules.into_iter().filter(|entry| {
-        let domain_matches = domain.as_deref().map_or(true, |domain| {
-            entry.get("domain").and_then(|v| v.as_str()) == Some(domain)
-        });
+        let domain_matches = domain
+            .as_deref()
+            .is_none_or(|domain| entry.get("domain").and_then(|v| v.as_str()) == Some(domain));
         let query_matches = query
             .as_deref()
-            .map_or(true, |query| stdlib_module_entry_matches(entry, query));
+            .is_none_or(|query| stdlib_module_entry_matches(entry, query));
         domain_matches && query_matches
     });
     let filtered: Vec<_> = match limit {
@@ -855,7 +931,7 @@ fn stdlib_module_entry_matches(entry: &serde_json::Value, query: &str) -> bool {
         if entry
             .get(key)
             .and_then(|v| v.as_str())
-            .map_or(false, |s| s.to_ascii_lowercase().contains(query))
+            .is_some_and(|s| s.to_ascii_lowercase().contains(query))
         {
             return true;
         }
@@ -863,10 +939,10 @@ fn stdlib_module_entry_matches(entry: &serde_json::Value, query: &str) -> bool {
     entry
         .get("views")
         .and_then(|v| v.as_array())
-        .map_or(false, |views| {
+        .is_some_and(|views| {
             views.iter().any(|view| {
                 view.as_str()
-                    .map_or(false, |s| s.to_ascii_lowercase().contains(query))
+                    .is_some_and(|s| s.to_ascii_lowercase().contains(query))
             })
         })
 }
@@ -908,12 +984,19 @@ fn format_execute_sql_error(err: PerfettoError) -> String {
 }
 
 const DEFAULT_CHROME_TOOL_ROWS: usize = 100;
-const DEFAULT_CHROME_TOOL_MAX_STRING_LEN: Option<usize> = None;
+const DEFAULT_TOOL_MAX_STRING_LEN: Option<usize> = None;
 const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 const EXECUTE_SQL_SHAPING_NOTE: &str =
     "row_count is post-SQL decoded rows; head/limit only trims returned tool rows.";
 const CHROME_TOOL_SHAPING_NOTE: &str =
     "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened.";
+const SLICE_DESCENDANTS_BREAKDOWN_SCOPE: &str = "descendants only; root slices excluded";
+const SLICE_DESCENDANTS_SHAPING_NOTE: &str =
+    "slice_count and total_ms include only descendants matching min_dur_ms within max_depth; \
+     limit caps returned groups; example_slice_id is the longest-duration descendant per group \
+     (ties broken by smallest id); first_ts_ns is raw nanoseconds; missing_root_ids lists \
+     requested slice_ids that do not exist in the loaded trace; example_args, when present, \
+     comes only from example_slice_id.";
 const REDACTION_POLICY_NOTE: &str =
     "execute_sql and Chrome dedicated-tool string cells may contain <redacted>; this is server-side policy, not a tool parameter.";
 
@@ -1021,6 +1104,33 @@ struct ChromeToolRowsResponse {
     rows: Vec<Vec<serde_json::Value>>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct SliceDescendantsAppliedFilters {
+    min_dur_ms: f64,
+    max_depth: u32,
+    limit: u32,
+    include_args: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SliceDescendantsRowsResponse {
+    columns: Vec<String>,
+    row_count: Option<usize>,
+    returned_rows: usize,
+    truncated: bool,
+    row_count_known: bool,
+    string_truncated: bool,
+    redacted: bool,
+    summary_scope: &'static str,
+    applied_filters: SliceDescendantsAppliedFilters,
+    /// Requested `slice_ids` that do not exist in the loaded trace's `slice`
+    /// table. Always present in the response (empty when all roots existed)
+    /// so LLM callers can tell "no descendants" apart from "stale id".
+    missing_root_ids: Vec<i64>,
+    note: &'static str,
+    rows: Vec<Vec<serde_json::Value>>,
+}
+
 fn chrome_hotspots_effective_limit(limit: Option<u32>) -> usize {
     match limit {
         Some(n) if (n as usize) > MAX_ROWS => MAX_ROWS,
@@ -1029,11 +1139,11 @@ fn chrome_hotspots_effective_limit(limit: Option<u32>) -> usize {
     }
 }
 
-fn chrome_tool_max_string_len(max_string_len: Option<u32>) -> Result<Option<usize>, String> {
+fn tool_max_string_len(max_string_len: Option<u32>) -> Result<Option<usize>, String> {
     match max_string_len {
         Some(0) => Err("`max_string_len` must be > 0 when set.".to_owned()),
         Some(n) => Ok(Some(n as usize)),
-        None => Ok(DEFAULT_CHROME_TOOL_MAX_STRING_LEN),
+        None => Ok(DEFAULT_TOOL_MAX_STRING_LEN),
     }
 }
 
@@ -1045,7 +1155,7 @@ fn format_chrome_tool_response(
     format_chrome_tool_response_with_redaction(
         table,
         effective_limit,
-        chrome_tool_max_string_len(max_string_len)?,
+        tool_max_string_len(max_string_len)?,
         default_redact_strings(),
     )
 }
@@ -1076,6 +1186,99 @@ fn format_chrome_tool_response_with_redaction(
         rows,
     })
     .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+fn slice_descendants_applied_filters(
+    params: &SliceDescendantsBreakdownParams,
+    effective_limit: u32,
+) -> SliceDescendantsAppliedFilters {
+    SliceDescendantsAppliedFilters {
+        min_dur_ms: params
+            .min_dur_ms
+            .unwrap_or(DEFAULT_SLICE_DESCENDANTS_MIN_DUR_MS),
+        max_depth: params
+            .max_depth
+            .unwrap_or(DEFAULT_SLICE_DESCENDANTS_MAX_DEPTH),
+        limit: effective_limit,
+        include_args: params.include_args,
+    }
+}
+
+fn format_slice_descendants_tool_response_with_redaction(
+    table: DecodedTable,
+    effective_limit: usize,
+    applied_filters: SliceDescendantsAppliedFilters,
+    missing_root_ids: Vec<i64>,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+) -> Result<String, String> {
+    let shape = ExecuteSqlOutputShape {
+        mode: ExecuteSqlOutputMode::FullRows,
+        active: true,
+        max_string_len,
+        redact_strings,
+    };
+    let returned_rows = table.rows.len();
+    let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+    serde_json::to_string(&SliceDescendantsRowsResponse {
+        columns: table.columns,
+        row_count: None,
+        returned_rows,
+        truncated: effective_limit > 0 && returned_rows >= effective_limit,
+        row_count_known: false,
+        string_truncated,
+        redacted,
+        summary_scope: SLICE_DESCENDANTS_BREAKDOWN_SCOPE,
+        applied_filters,
+        missing_root_ids,
+        note: SLICE_DESCENDANTS_SHAPING_NOTE,
+        rows,
+    })
+    .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+/// Wrapper that re-exports the SQL builder's dedupe under the
+/// handler-local name. Keeping the indirection means we always pay for the
+/// extra `Vec` copy in one place, and the call site reads naturally.
+fn dedupe_slice_ids_preserving_order(ids: &[i64]) -> Vec<i64> {
+    dedupe_preserving_order(ids)
+}
+
+/// Look up which of the requested root slice ids actually exist in the
+/// loaded trace's `slice` table. Returns the list of ids that are NOT
+/// present (preserving the caller's order). Empty input → empty output.
+///
+/// This is intentionally a separate small query rather than baked into the
+/// recursive CTE because mixing schemas across a UNION ALL would force
+/// every row to carry sentinel NULLs. The per-call cost is a single
+/// `id IN (...)` lookup against the indexed `slice.id` column; cheap
+/// relative to the recursive expansion that follows.
+async fn fetch_missing_slice_ids(
+    client: &crate::tp_client::TraceProcessorClient,
+    deduped_root_ids: &[i64],
+) -> Result<Vec<i64>, PerfettoError> {
+    if deduped_root_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let id_list = deduped_root_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT id FROM slice WHERE id IN ({id_list})");
+    let table = client.query(&sql).await?;
+    let mut found: std::collections::HashSet<i64> =
+        std::collections::HashSet::with_capacity(table.len());
+    for row_idx in 0..table.len() {
+        if let Some(id) = table.cell(row_idx, "id").and_then(|v| v.as_i64()) {
+            found.insert(id);
+        }
+    }
+    Ok(deduped_root_ids
+        .iter()
+        .copied()
+        .filter(|id| !found.contains(id))
+        .collect())
 }
 
 fn format_execute_sql_response(
@@ -1543,6 +1746,33 @@ fn format_chrome_tool_error(tool_label: &str, err: PerfettoError) -> String {
             format!("Failed to run {tool_label}: {message}")
         }
         other => format!("Failed: {other}"),
+    }
+}
+
+fn format_slice_descendants_tool_error(err: PerfettoError) -> String {
+    match err {
+        PerfettoError::QueryError {
+            kind: QueryErrorKind::MissingTable,
+            message,
+        } => format!(
+            "Failed to run slice_descendants_breakdown: {message}\n\nHint: this tool \
+             requires the base `slice` table, and `include_args=true` also requires \
+             `args`. Call `list_tables` to verify the trace schema, or use \
+             `execute_sql` for a custom fallback query."
+        ),
+        PerfettoError::QueryError {
+            kind: QueryErrorKind::MissingColumn,
+            message,
+        } => format!(
+            "Failed to run slice_descendants_breakdown: {message}\n\nHint: this tool \
+             expects modern `slice.id`, `slice.parent_id`, `slice.name`, `slice.dur`, \
+             and `slice.ts` columns. Call `list_table_structure('slice')` to inspect \
+             the actual schema before retrying with custom SQL."
+        ),
+        PerfettoError::QueryError { message, .. } => {
+            format!("Failed to run slice_descendants_breakdown: {message}")
+        }
+        other => format!("Failed to run slice_descendants_breakdown: {other}"),
     }
 }
 
@@ -2311,7 +2541,7 @@ mod tests {
         let response = format_chrome_tool_response_with_redaction(
             table,
             2,
-            DEFAULT_CHROME_TOOL_MAX_STRING_LEN,
+            DEFAULT_TOOL_MAX_STRING_LEN,
             false,
         )
         .expect("serialize");
@@ -2349,7 +2579,7 @@ mod tests {
         let response = format_chrome_tool_response_with_redaction(
             table,
             DEFAULT_CHROME_TOOL_ROWS,
-            DEFAULT_CHROME_TOOL_MAX_STRING_LEN,
+            DEFAULT_TOOL_MAX_STRING_LEN,
             true,
         )
         .expect("serialize");
@@ -2409,6 +2639,160 @@ mod tests {
             .expect_err("zero max_string_len must reject");
 
         assert!(err.contains("max_string_len"), "got: {err}");
+    }
+
+    #[test]
+    fn slice_descendants_response_echoes_summary_bounds_before_rows() {
+        let table = decoded_table(
+            &["root_id", "depth", "name", "slice_count", "total_ms"],
+            vec![vec![
+                json!(10),
+                json!(1),
+                json!("child"),
+                json!(2),
+                json!(3.5),
+            ]],
+        );
+        let applied_filters = SliceDescendantsAppliedFilters {
+            min_dur_ms: DEFAULT_SLICE_DESCENDANTS_MIN_DUR_MS,
+            max_depth: DEFAULT_SLICE_DESCENDANTS_MAX_DEPTH,
+            limit: DEFAULT_SLICE_DESCENDANTS_LIMIT,
+            include_args: false,
+        };
+
+        let response = format_slice_descendants_tool_response_with_redaction(
+            table,
+            DEFAULT_SLICE_DESCENDANTS_LIMIT as usize,
+            applied_filters,
+            Vec::new(),
+            None,
+            false,
+        )
+        .expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_json_key_order(&response, "\"applied_filters\":", "\"rows\":");
+        assert_eq!(
+            parsed["summary_scope"],
+            json!(SLICE_DESCENDANTS_BREAKDOWN_SCOPE)
+        );
+        assert_eq!(
+            parsed["applied_filters"],
+            json!({
+                "min_dur_ms": DEFAULT_SLICE_DESCENDANTS_MIN_DUR_MS,
+                "max_depth": DEFAULT_SLICE_DESCENDANTS_MAX_DEPTH,
+                "limit": DEFAULT_SLICE_DESCENDANTS_LIMIT,
+                "include_args": false,
+            })
+        );
+        assert_eq!(
+            parsed["missing_root_ids"],
+            json!([] as [i64; 0]),
+            "missing_root_ids must be present and empty when all roots existed: {parsed}",
+        );
+        assert!(
+            parsed["note"]
+                .as_str()
+                .expect("note string")
+                .contains("matching min_dur_ms within max_depth"),
+            "note must explain bounded summary semantics: {parsed}",
+        );
+    }
+
+    #[test]
+    fn slice_descendants_response_includes_missing_root_ids() {
+        let table = decoded_table(&["root_id", "depth", "name", "slice_count"], vec![]);
+        let applied_filters = SliceDescendantsAppliedFilters {
+            min_dur_ms: DEFAULT_SLICE_DESCENDANTS_MIN_DUR_MS,
+            max_depth: DEFAULT_SLICE_DESCENDANTS_MAX_DEPTH,
+            limit: DEFAULT_SLICE_DESCENDANTS_LIMIT,
+            include_args: false,
+        };
+
+        let response = format_slice_descendants_tool_response_with_redaction(
+            table,
+            DEFAULT_SLICE_DESCENDANTS_LIMIT as usize,
+            applied_filters,
+            vec![42, 99],
+            None,
+            false,
+        )
+        .expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_eq!(
+            parsed["missing_root_ids"],
+            json!([42, 99]),
+            "missing_root_ids must echo back the stale ids in caller order: {parsed}",
+        );
+        assert_eq!(
+            parsed["returned_rows"],
+            json!(0),
+            "empty descendants must still emit the envelope: {parsed}",
+        );
+        assert!(
+            parsed["note"]
+                .as_str()
+                .expect("note string")
+                .contains("missing_root_ids"),
+            "shaping note must explain missing_root_ids semantics: {parsed}",
+        );
+    }
+
+    #[test]
+    fn slice_descendants_applied_filters_use_effective_defaults() {
+        let params = SliceDescendantsBreakdownParams {
+            slice_ids: vec![10],
+            min_dur_ms: None,
+            max_depth: None,
+            include_args: true,
+            limit: None,
+            max_string_len: None,
+        };
+
+        let filters = slice_descendants_applied_filters(&params, DEFAULT_SLICE_DESCENDANTS_LIMIT);
+
+        assert_eq!(
+            filters,
+            SliceDescendantsAppliedFilters {
+                min_dur_ms: DEFAULT_SLICE_DESCENDANTS_MIN_DUR_MS,
+                max_depth: DEFAULT_SLICE_DESCENDANTS_MAX_DEPTH,
+                limit: DEFAULT_SLICE_DESCENDANTS_LIMIT,
+                include_args: true,
+            }
+        );
+    }
+
+    #[test]
+    fn slice_descendants_error_hint_recommends_table_or_column_inspection() {
+        let table_err = format_slice_descendants_tool_error(PerfettoError::QueryError {
+            kind: QueryErrorKind::MissingTable,
+            message: "no such table: slice".to_owned(),
+        });
+        assert!(
+            table_err.contains("requires the base `slice` table")
+                && table_err.contains("list_tables"),
+            "missing-table hint must point at the schema check: {table_err}",
+        );
+
+        let column_err = format_slice_descendants_tool_error(PerfettoError::QueryError {
+            kind: QueryErrorKind::MissingColumn,
+            message: "no such column: slice.parent_id".to_owned(),
+        });
+        assert!(
+            column_err.contains("list_table_structure") && column_err.contains("slice.id"),
+            "missing-column hint must point at column inspection: {column_err}",
+        );
+
+        let other_err = format_slice_descendants_tool_error(PerfettoError::QueryError {
+            kind: QueryErrorKind::Other,
+            message: "syntax error near 'WITH'".to_owned(),
+        });
+        assert!(
+            other_err.starts_with("Failed to run slice_descendants_breakdown:")
+                && other_err.contains("syntax error"),
+            "other errors must pass through with the tool prefix: {other_err}",
+        );
     }
 
     #[test]
@@ -2790,6 +3174,7 @@ mod tests {
                 "list_tables",
                 "list_threads_in_process",
                 "load_trace",
+                "slice_descendants_breakdown",
             ],
         );
     }

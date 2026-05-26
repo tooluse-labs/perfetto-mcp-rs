@@ -106,20 +106,23 @@
   - 失败信息指出具体超预算项。
   - 调整预算必须显式修改测试，避免无意识膨胀。
 
-### T0.4 实现 `slice_descendants_summary`
+### T0.4 实现 `slice_descendants_breakdown`（已落地 v0.15.6-dev）
 
 - **动机：** 真实会话中 agent 多次手写 `WITH RECURSIVE descendants...` 展开
   slice 子树，并出现 `ambiguous column name: depth`。这是高频、稳定、易错的
   Perfetto 分析子任务。
-- **输入：**
+- **输入（已落地）：**
   - `slice_ids`: 根 slice id 列表。
   - `min_dur_ms`: 子 slice 最小时长，默认 1ms。
   - `max_depth`: 最大递归深度，防止异常 trace 或 query 失控。
   - `include_args`: 是否返回匹配子树中的 args 摘要，默认 false。
   - `limit`: 返回行数上限。
-- **输出：**
+- **输出（已落地）：**
   - 按 `root_id`、`depth`、`slice.name` 聚合的 `count`、`total_ms`、`max_ms`。
-  - 可选 args 摘要使用字符串截断 / 脱敏策略。
+  - 可选 args 摘要使用字符串截断 / 脱敏策略，返回代表性 slice 的
+    `example_args`。
+  - 响应回显 `summary_scope` 和 `applied_filters`，避免 LLM 把 bounded
+    summary 误读成完整子树事实。
 - **验收：**
   - 对真实日志中的长任务 slice id 可复现手写 SQL 的核心结果。
   - 不要求调用方理解 recursive CTE。
@@ -232,7 +235,7 @@
 
 1. T0.2 增强 `execute_sql` 输出塑形，先解决真实会话中结果被 `...` 截断的问题。
 2. T0.1 实现 `inspect_trace` / `trace_overview`。
-3. T0.4 实现 `slice_descendants_summary`。
+3. T0.4 实现 `slice_descendants_breakdown`。（已落地 v0.15.6-dev）
 4. T0.3 建立上下文预算测试。
 5. T1.4 实现 Chrome page-load 二级分析工具。
 6. T1.1 实现 `stdlib-quickref` Resource。
