@@ -2,6 +2,12 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### [0.15.7](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.7) (May 26, 2026)
+
+- **`chrome_main_thread_hotspots` now carries process identity in every row.** Results include `upid` and OS `pid` alongside `process_name`, so agents can distinguish same-named Renderer processes in multi-renderer Chrome traces instead of merging unrelated long tasks into one culprit.
+- **Page-load and raw timestamp windows are first-class hotspot filters.** The tool accepts `page_load_id` (matching `chrome_page_loads.id`), `navigation_id` (matching `chrome_page_loads.navigation_id`), `phase` (`navigation_to_fcp`, `navigation_to_load`, `dcl_to_fcp`, `fcp_to_load`), and raw `start_ts_ns` / `end_ts_ns` bounds. This replaces common hand-written `chrome.page_loads` + `chrome.tasks` JOINs for FCP-window analysis while keeping `page_load_id` and `navigation_id` mutually exclusive to avoid cross-domain id collisions.
+- **Trace5 session lessons recorded in the MCP surface docs.** The context-efficiency and implementation task docs now mark hotspot window filtering as handled and keep resource-request wall-time attribution as the remaining page-load-detail gap.
+
 ### [0.15.6](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.6) (May 26, 2026)
 
 - **New `slice_descendants_breakdown` tool for bounded child-slice analysis.** Wraps a recursive CTE over `slice.parent_id` with qualified column references and bounded `max_depth` / `row_limit`, so LLM agents stop hand-writing `WITH RECURSIVE descendants...` and hitting `ambiguous column name: depth` (the `slice` table itself has a `depth` column). Use after `chrome_main_thread_hotspots` or `execute_sql` returns a long slice id to drill into; the response aggregates by `(root_id, depth, name)` with `slice_count` / `total_ms` / `max_ms`, plus `first_ts_ns` (raw nanoseconds, kept distinct from the ms-denominated sibling columns) and `example_slice_id` (the longest-duration descendant per group, so `include_args=true` surfaces the most diagnostically interesting sample instead of the lowest-id row). Bounds default to `min_dur_ms=1`, `max_depth=8`, `limit=100`. Tool naming follows Perfetto stdlib vocabulary (`DESCENDANT_SLICE(...)`, `ANCESTOR_SLICE(...)`) so agents familiar with raw PerfettoSQL pattern-match the tool the same way they reach for the stdlib function.

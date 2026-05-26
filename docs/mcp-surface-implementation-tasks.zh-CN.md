@@ -20,7 +20,9 @@
   `chrome_scroll_jank_summary` 和 `chrome_web_content_interactions` 的空结果帮助排除
   滚动 / 交互卡顿；`chrome_main_thread_hotspots` 暴露 Renderer 主线程长任务。
 - 主要缺口：后续定位“哪个资源或加载阶段卡住”依赖大量手写 SQL，尤其是
-  `slice` / `args` join、递归展开 descendants、按 navigation/FCP 时间窗口过滤。
+  `slice` / `args` join、递归展开 descendants、资源请求 wall time 与导航阶段归因。
+  `chrome_main_thread_hotspots` 已补 `page_load_id` / `phase` / raw ts 窗口过滤，
+  但 page-load 二级资源摘要仍待工具化。
 - 输出问题：多处结果在客户端 UI 中被 `...` 截断，`list_table_structure` 和长
   `args.display_value` 噪声较高；输出里还包含本地路径、headers、User-Agent 等
   可能敏感的字符串。
@@ -172,7 +174,8 @@
 - **输出：**
   - navigation 关键时间点：DCL、FCP、load、LCP（如有）。
   - Browser 主线程导航阻塞摘要。
-  - Renderer 主线程长任务摘要。
+  - Renderer 主线程长任务摘要（可复用 `chrome_main_thread_hotspots` 的
+    `page_load_id` / `phase` 窗口过滤能力）。
   - 资源请求摘要：URL / 文件名、first_ms、last_end_ms、max_ms、total_ms、
     关键 slice 名称。
   - 输出应保留行级证据，不直接写死自然语言根因结论。

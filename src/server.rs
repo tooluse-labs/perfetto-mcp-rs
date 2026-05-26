@@ -553,8 +553,8 @@ impl PerfettoMcpServer {
     #[tool(
         name = "chrome_main_thread_hotspots",
         description = "Top Chrome main-thread tasks by wall duration: id, ts, \
-                       name, task_type, thread_name, process_name, dur_ms, cpu_pct \
-                       (thread_dur/dur), thread_dur_ms. Uses `chrome.tasks`, \
+                       name, task_type, thread_name, process_name, upid, pid, \
+                       dur_ms, cpu_pct (thread_dur/dur), thread_dur_ms. Uses `chrome.tasks`, \
                        `thread.is_main_thread = 1` when available, and Chrome's \
                        `Cr*Main` thread-name convention as a fallback for traces \
                        where thread metadata is incomplete or incorrect. Pass a returned \
@@ -570,13 +570,18 @@ impl PerfettoMcpServer {
                        \n\
                        Parameters (all optional):\n\
                        - `process_name` / `pid` / `upid`: scope to one process or \
-                         process type. `process_name='Renderer'` shows all renderers \
-                         together; `pid` is the OS pid (visible in Task Manager but \
-                         can be recycled mid-trace); `upid` is the trace-internal \
-                         unique pid (always precise — prefer over `pid` for \
-                         multi-renderer traces). Look up both via `list_processes`. \
-                         All AND when set; redundant pairings (e.g. matching \
-                         upid + pid) are harmless.\n\
+                         type. Prefer `upid` for multi-renderer traces; all filters \
+                         AND together.\n\
+                       - `page_load_id` / `navigation_id` / `phase`: scope to a \
+                         page-load window. IDs match `chrome_page_loads.id` and \
+                         `.navigation_id` respectively and are mutually exclusive. \
+                         `phase`: `navigation_to_fcp`, `navigation_to_load`, \
+                         `dcl_to_fcp`, `fcp_to_load`. If an id is set without \
+                         `phase`, defaults to `navigation_to_fcp`; phase-only uses \
+                         the latest page load.\n\
+                       - `start_ts_ns` / `end_ts_ns`: raw trace timestamp bounds \
+                         in nanoseconds (`end_ts_ns` exclusive); aliases `start_ts` \
+                         / `end_ts` are accepted. These AND with any page-load window.\n\
                        - `min_dur_ms`: minimum task duration. Defaults to 16 (one \
                          60 Hz frame). Pass 0 for ALL tasks; raise to 33 (30 Hz) or \
                          100 to focus on bigger stutters.\n\
@@ -609,6 +614,11 @@ impl PerfettoMcpServer {
             process_name: params.process_name.as_deref(),
             pid: params.pid,
             upid: params.upid,
+            page_load_id: params.page_load_id,
+            navigation_id: params.navigation_id,
+            phase: params.phase,
+            start_ts_ns: params.start_ts_ns,
+            end_ts_ns: params.end_ts_ns,
             min_dur_ms: params.min_dur_ms,
             limit: params.limit,
         })
@@ -3453,6 +3463,11 @@ mod tests {
                     process_name: None,
                     pid: None,
                     upid: None,
+                    page_load_id: None,
+                    navigation_id: None,
+                    phase: None,
+                    start_ts_ns: None,
+                    end_ts_ns: None,
                     min_dur_ms: None,
                     limit: None,
                     max_string_len: None,
@@ -3591,13 +3606,26 @@ mod tests {
     #[test]
     fn chrome_main_thread_hotspots_params_accepts_stringified_numerics() {
         let p: ChromeMainThreadHotspotsParams = serde_json::from_str(
-            r#"{"pid": "12800", "min_dur_ms": "50", "limit": "30", "max_string_len": "260"}"#,
+            r#"{"pid": "12800", "page_load_id": "1", "start_ts_ns": "100", "end_ts_ns": "200", "min_dur_ms": "50", "limit": "30", "max_string_len": "260"}"#,
         )
         .expect("stringified numerics must deserialize after v0.11.3");
         assert_eq!(p.pid, Some(12800));
+        assert_eq!(p.page_load_id, Some(1));
+        assert_eq!(p.start_ts_ns, Some(100));
+        assert_eq!(p.end_ts_ns, Some(200));
         assert_eq!(p.min_dur_ms, Some(50.0));
         assert_eq!(p.limit, Some(30));
         assert_eq!(p.max_string_len, Some(260));
+    }
+
+    #[test]
+    fn chrome_main_thread_hotspots_params_accept_navigation_id() {
+        let p: ChromeMainThreadHotspotsParams =
+            serde_json::from_str(r#"{"navigation_id": "7", "phase": "dcl_to_fcp"}"#)
+                .expect("navigation_id and phase must deserialize");
+        assert_eq!(p.page_load_id, None);
+        assert_eq!(p.navigation_id, Some(7));
+        assert_eq!(p.phase, Some(ChromeMainThreadHotspotsPhase::DclToFcp));
     }
 
     #[test]
@@ -3633,6 +3661,10 @@ mod tests {
         let strict_pairs: &[(&str, &str)] = &[
             ("pid", "integer"),
             ("upid", "integer"),
+            ("page_load_id", "integer"),
+            ("navigation_id", "integer"),
+            ("start_ts_ns", "integer"),
+            ("end_ts_ns", "integer"),
             ("min_dur_ms", "number"),
             ("limit", "integer"),
             ("max_string_len", "integer"),
@@ -3866,11 +3898,17 @@ mod tests {
         let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters::default())
             .expect("builder must succeed");
         assert!(sql.contains("ct.ts"));
+        assert!(sql.contains("ct.upid"));
+        assert!(sql.contains("p.pid"));
         assert!(sql.contains("LEFT JOIN thread t ON ct.utid = t.utid"));
         assert!(sql.contains("LEFT JOIN process p ON ct.upid = p.upid"));
         assert!(sql.contains("WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main')"));
         assert!(sql.contains("AND ct.dur > 16000000"));
         assert!(sql.contains("ORDER BY ct.dur DESC LIMIT 100"));
+        assert!(
+            !sql.contains("chrome.page_loads"),
+            "no-filter SQL must not include page-load window CTE, got: {sql}",
+        );
         assert!(
             !sql.contains("ct.process_name ="),
             "no-filter SQL must not emit process_name filter, got: {sql}",
@@ -3974,6 +4012,125 @@ mod tests {
         .expect("upid+pid combined builder must succeed");
         assert!(sql.contains("AND p.pid = 12800"), "got: {sql}");
         assert!(sql.contains("AND p.upid = 3"), "got: {sql}");
+    }
+
+    #[test]
+    fn chrome_main_thread_hotspots_sql_with_raw_window_emits_ts_filters() {
+        let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            start_ts_ns: Some(1000),
+            end_ts_ns: Some(2000),
+            ..Default::default()
+        })
+        .expect("raw-window builder must succeed");
+        assert!(sql.contains("AND ct.ts >= 1000"), "got: {sql}");
+        assert!(sql.contains("AND ct.ts < 2000"), "got: {sql}");
+        assert!(
+            !sql.contains("hotspot_window"),
+            "raw timestamp filters alone must not require page_loads, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_main_thread_hotspots_sql_with_page_load_defaults_to_nav_to_fcp() {
+        let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            page_load_id: Some(7),
+            ..Default::default()
+        })
+        .expect("page-load-window builder must succeed");
+        assert!(
+            sql.contains("INCLUDE PERFETTO MODULE chrome.page_loads;"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT navigation_start_ts AS start_ts, fcp_ts AS end_ts"),
+            "page_load_id without phase must default to navigation_to_fcp, got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE id = 7 "),
+            "page_load_id must match only chrome_page_loads.id, got: {sql}",
+        );
+        assert!(
+            !sql.contains("navigation_id = 7"),
+            "page_load_id must not also match navigation_id, got: {sql}",
+        );
+        assert!(sql.contains("CROSS JOIN hotspot_window hw"), "got: {sql}");
+        assert!(sql.contains("AND ct.ts >= hw.start_ts"), "got: {sql}");
+        assert!(sql.contains("AND ct.ts < hw.end_ts"), "got: {sql}");
+    }
+
+    #[test]
+    fn chrome_main_thread_hotspots_sql_with_navigation_id_matches_navigation_only() {
+        let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            navigation_id: Some(7),
+            ..Default::default()
+        })
+        .expect("navigation-window builder must succeed");
+        assert!(
+            sql.contains("SELECT navigation_start_ts AS start_ts, fcp_ts AS end_ts"),
+            "navigation_id without phase must default to navigation_to_fcp, got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE navigation_id = 7 "),
+            "navigation_id must match only chrome_page_loads.navigation_id, got: {sql}",
+        );
+        assert!(
+            !sql.contains("WHERE id = 7"),
+            "navigation_id must not also match page_loads.id, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_main_thread_hotspots_sql_with_phase_without_id_uses_latest_page_load() {
+        let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            phase: Some(ChromeMainThreadHotspotsPhase::DclToFcp),
+            ..Default::default()
+        })
+        .expect("phase-only builder must succeed");
+        assert!(
+            sql.contains("SELECT dom_content_loaded_event_ts AS start_ts, fcp_ts AS end_ts"),
+            "dcl_to_fcp phase must select DCL→FCP window, got: {sql}",
+        );
+        assert!(
+            !sql.contains("WHERE id ="),
+            "phase without page_load_id should use latest page load, got: {sql}",
+        );
+        assert!(
+            sql.contains("ORDER BY navigation_start_ts DESC LIMIT 1"),
+            "phase-only SQL must use latest page load deterministically, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_main_thread_hotspots_sql_rejects_invalid_windows() {
+        let err = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            page_load_id: Some(-1),
+            ..Default::default()
+        })
+        .expect_err("negative page_load_id must error");
+        assert!(err.to_string().contains("page_load_id"), "got: {err}");
+
+        let err = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            navigation_id: Some(-1),
+            ..Default::default()
+        })
+        .expect_err("negative navigation_id must error");
+        assert!(err.to_string().contains("navigation_id"), "got: {err}");
+
+        let err = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            page_load_id: Some(1),
+            navigation_id: Some(7),
+            ..Default::default()
+        })
+        .expect_err("page_load_id plus navigation_id must error");
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+
+        let err = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            start_ts_ns: Some(2000),
+            end_ts_ns: Some(1000),
+            ..Default::default()
+        })
+        .expect_err("end before start must error");
+        assert!(err.to_string().contains("end_ts_ns"), "got: {err}");
     }
 
     /// `min_dur_ms = 33.0` translates to `ct.dur > 33000000` ns. Default

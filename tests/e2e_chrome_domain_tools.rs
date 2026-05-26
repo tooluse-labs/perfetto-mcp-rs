@@ -125,6 +125,8 @@ fn e2e_chrome_main_thread_hotspots_against_fixture() {
         for i in 0..table.len() {
             assert!(table.cell(i, "id").is_some(), "row {i} missing id");
             assert!(table.cell(i, "ts").is_some(), "row {i} missing ts");
+            assert!(table.cell(i, "upid").is_some(), "row {i} missing upid");
+            assert!(table.cell(i, "pid").is_some(), "row {i} missing pid");
             assert!(table.cell(i, "name").is_some(), "row {i} missing name");
             assert!(
                 table.cell(i, "thread_name").is_some(),
@@ -132,6 +134,33 @@ fn e2e_chrome_main_thread_hotspots_against_fixture() {
             );
             assert!(table.cell(i, "dur_ms").is_some(), "row {i} missing dur_ms",);
         }
+
+        let windowed_sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+            page_load_id: Some(1),
+            phase: Some(perfetto_mcp_rs::params::ChromeMainThreadHotspotsPhase::NavigationToFcp),
+            min_dur_ms: Some(0.0),
+            ..Default::default()
+        })
+        .expect("windowed hotspots SQL builder must succeed");
+        client
+            .query(&windowed_sql)
+            .await
+            .expect("windowed chrome main-thread hotspots query must succeed");
+
+        let navigation_windowed_sql =
+            chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+                navigation_id: Some(7),
+                phase: Some(
+                    perfetto_mcp_rs::params::ChromeMainThreadHotspotsPhase::NavigationToFcp,
+                ),
+                min_dur_ms: Some(0.0),
+                ..Default::default()
+            })
+            .expect("navigation-windowed hotspots SQL builder must succeed");
+        client
+            .query(&navigation_windowed_sql)
+            .await
+            .expect("navigation-windowed chrome main-thread hotspots query must succeed");
     });
 }
 

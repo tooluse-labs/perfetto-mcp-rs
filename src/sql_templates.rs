@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::{PerfettoError, MAX_ROWS};
-use crate::params::{ChromeMainThreadHotspotsFilters, SliceDescendantsBreakdownFilters};
+use crate::params::{
+    ChromeMainThreadHotspotsFilters, ChromeMainThreadHotspotsPhase,
+    SliceDescendantsBreakdownFilters,
+};
 
 /// Trace-level metadata used by `load_trace` to avoid leaving callers in a
 /// routing vacuum after a successful load. Kept intentionally small: selected
@@ -98,9 +101,54 @@ pub fn chrome_main_thread_hotspots_sql(
         process_name,
         pid,
         upid,
+        page_load_id,
+        navigation_id,
+        phase,
+        start_ts_ns,
+        end_ts_ns,
         min_dur_ms,
         limit,
     } = filters;
+    if let Some(id) = page_load_id {
+        if id < 0 {
+            return Err(PerfettoError::InvalidParam(format!(
+                "page_load_id must be non-negative, got {id}"
+            )));
+        }
+    }
+    if let Some(id) = navigation_id {
+        if id < 0 {
+            return Err(PerfettoError::InvalidParam(format!(
+                "navigation_id must be non-negative, got {id}"
+            )));
+        }
+    }
+    if page_load_id.is_some() && navigation_id.is_some() {
+        return Err(PerfettoError::InvalidParam(
+            "page_load_id and navigation_id are mutually exclusive".to_owned(),
+        ));
+    }
+    if let Some(ts) = start_ts_ns {
+        if ts < 0 {
+            return Err(PerfettoError::InvalidParam(format!(
+                "start_ts_ns must be non-negative, got {ts}"
+            )));
+        }
+    }
+    if let Some(ts) = end_ts_ns {
+        if ts < 0 {
+            return Err(PerfettoError::InvalidParam(format!(
+                "end_ts_ns must be non-negative, got {ts}"
+            )));
+        }
+    }
+    if let (Some(start), Some(end)) = (start_ts_ns, end_ts_ns) {
+        if end <= start {
+            return Err(PerfettoError::InvalidParam(format!(
+                "end_ts_ns must be greater than start_ts_ns, got start={start}, end={end}"
+            )));
+        }
+    }
     let min_dur_ns: i64 = match min_dur_ms {
         None => 16_000_000,
         Some(ms) => {
@@ -121,15 +169,44 @@ pub fn chrome_main_thread_hotspots_sql(
         Some(n) if (n as usize) > MAX_ROWS => MAX_ROWS as u32,
         Some(n) => n,
     };
-    let mut sql = format!(
-        "INCLUDE PERFETTO MODULE chrome.tasks; \
-         SELECT \
+    let effective_phase = phase.or_else(|| {
+        (page_load_id.is_some() || navigation_id.is_some())
+            .then_some(ChromeMainThreadHotspotsPhase::NavigationToFcp)
+    });
+    let mut sql = String::from("INCLUDE PERFETTO MODULE chrome.tasks; ");
+    if let Some(phase) = effective_phase {
+        let (start_expr, end_expr) = match phase {
+            ChromeMainThreadHotspotsPhase::NavigationToFcp => ("navigation_start_ts", "fcp_ts"),
+            ChromeMainThreadHotspotsPhase::NavigationToLoad => {
+                ("navigation_start_ts", "load_event_ts")
+            }
+            ChromeMainThreadHotspotsPhase::DclToFcp => ("dom_content_loaded_event_ts", "fcp_ts"),
+            ChromeMainThreadHotspotsPhase::FcpToLoad => ("fcp_ts", "load_event_ts"),
+        };
+        sql.push_str("INCLUDE PERFETTO MODULE chrome.page_loads; ");
+        sql.push_str(&format!(
+            "WITH hotspot_window AS ( \
+             SELECT {start_expr} AS start_ts, {end_expr} AS end_ts \
+             FROM chrome_page_loads "
+        ));
+        if let Some(id) = page_load_id {
+            sql.push_str(&format!("WHERE id = {id} "));
+        }
+        if let Some(id) = navigation_id {
+            sql.push_str(&format!("WHERE navigation_id = {id} "));
+        }
+        sql.push_str("ORDER BY navigation_start_ts DESC LIMIT 1) ");
+    }
+    sql.push_str(
+        "SELECT \
            ct.id, \
            ct.ts, \
            ct.name, \
            ct.task_type, \
            ct.thread_name, \
            ct.process_name, \
+           ct.upid, \
+           p.pid, \
            ct.dur / 1e6 AS dur_ms, \
            CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
                 THEN ROUND(ct.thread_dur * 100.0 / ct.dur, 1) \
@@ -137,10 +214,29 @@ pub fn chrome_main_thread_hotspots_sql(
            ct.thread_dur / 1e6 AS thread_dur_ms \
          FROM chrome_tasks ct \
          LEFT JOIN thread t ON ct.utid = t.utid \
-         LEFT JOIN process p ON ct.upid = p.upid \
-         WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main') \
-           AND ct.dur > {min_dur_ns}",
+         LEFT JOIN process p ON ct.upid = p.upid ",
     );
+    if effective_phase.is_some() {
+        sql.push_str("CROSS JOIN hotspot_window hw ");
+    }
+    sql.push_str(&format!(
+        "WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main') \
+           AND ct.dur > {min_dur_ns}"
+    ));
+    if effective_phase.is_some() {
+        sql.push_str(
+            " AND hw.start_ts IS NOT NULL \
+              AND hw.end_ts IS NOT NULL \
+              AND ct.ts >= hw.start_ts \
+              AND ct.ts < hw.end_ts",
+        );
+    }
+    if let Some(start) = start_ts_ns {
+        sql.push_str(&format!(" AND ct.ts >= {start}"));
+    }
+    if let Some(end) = end_ts_ns {
+        sql.push_str(&format!(" AND ct.ts < {end}"));
+    }
     if let Some(name) = process_name {
         let lit = sql_string_literal(name)?;
         sql.push_str(&format!(" AND ct.process_name = {lit}"));

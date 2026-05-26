@@ -1,6 +1,6 @@
 # perfetto-mcp-rs 上下文与 Token 效率优化方案
 
-Last updated: 2026-05-23
+Last updated: 2026-05-26
 
 ## 背景
 
@@ -67,9 +67,10 @@ Last updated: 2026-05-23
   的重复模式。
 - 从 `chrome_page_load_summary` 到“哪个资源或导航阶段卡住”仍需要大量手写
   SQL。现有 Chrome 工具能发现 FCP 慢，但缺少 page-load 二级细分入口。
-- `chrome_main_thread_hotspots` 缺少时间窗口参数。日志里反复手写
-  `ts >= navigation_start`、`ts >= fcp_ts`、`ms_from_nav`，说明 LLM 需要按
-  navigation / FCP / 交互窗口过滤热点。
+- `chrome_main_thread_hotspots` 在 v0.15.6 后续补强中增加了 `upid` / `pid`
+  输出和 `page_load_id` / `phase` / `start_ts_ns` / `end_ts_ns` 窗口过滤。该项
+  缓解了日志里反复手写 `ts >= navigation_start`、`ts >= fcp_ts`、`ms_from_nav`
+  的问题；Chrome page-load 二级工具仍需覆盖资源请求与导航阶段归因。
 - 输出中包含本地用户目录、请求 headers、User-Agent、URL 参数等敏感或高噪声
   字符串。当前工具没有统一的截断 / 脱敏策略。
 

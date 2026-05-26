@@ -251,6 +251,19 @@ pub struct ChromeTraceParams {
     pub max_string_len: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromeMainThreadHotspotsPhase {
+    /// Window from navigation_start_ts to fcp_ts.
+    NavigationToFcp,
+    /// Window from navigation_start_ts to load_event_ts.
+    NavigationToLoad,
+    /// Window from dom_content_loaded_event_ts to fcp_ts.
+    DclToFcp,
+    /// Window from fcp_ts to load_event_ts.
+    FcpToLoad,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChromeMainThreadHotspotsParams {
@@ -271,6 +284,30 @@ pub struct ChromeMainThreadHotspotsParams {
     /// other filters when set. Accepts both numbers and numeric strings.
     #[serde(default, deserialize_with = "lenient_i64")]
     pub upid: Option<i64>,
+    /// Optional page-load id used to scope tasks to one navigation phase.
+    /// Matches `chrome_page_loads.id`. Mutually exclusive with `navigation_id`.
+    /// If set without `phase`, defaults to `navigation_to_fcp`.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub page_load_id: Option<i64>,
+    /// Optional Chrome navigation id used to scope tasks to one navigation phase.
+    /// Matches `chrome_page_loads.navigation_id`. Mutually exclusive with
+    /// `page_load_id`. If set without `phase`, defaults to `navigation_to_fcp`.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub navigation_id: Option<i64>,
+    /// Optional page-load phase window. If set without `page_load_id` or
+    /// `navigation_id`, uses the latest page load in the trace. Values:
+    /// navigation_to_fcp, navigation_to_load, dcl_to_fcp, fcp_to_load.
+    #[serde(default)]
+    pub phase: Option<ChromeMainThreadHotspotsPhase>,
+    /// Optional raw trace timestamp lower bound in nanoseconds. This uses the
+    /// same unit as the returned `ts` column. ANDs with any page-load window.
+    #[serde(default, alias = "start_ts", deserialize_with = "lenient_i64")]
+    pub start_ts_ns: Option<i64>,
+    /// Optional raw trace timestamp upper bound in nanoseconds, exclusive. This
+    /// uses the same unit as the returned `ts` column. ANDs with any page-load
+    /// window.
+    #[serde(default, alias = "end_ts", deserialize_with = "lenient_i64")]
+    pub end_ts_ns: Option<i64>,
     /// Optional minimum task duration in milliseconds. Defaults to 16 ms (one
     /// 60 Hz frame budget). Pass 0 to see ALL main-thread tasks; raise to e.g.
     /// 33 (30 Hz) or 100 to focus on the worst stutters. Must be a finite
@@ -350,6 +387,18 @@ pub struct ChromeMainThreadHotspotsFilters<'a> {
     pub pid: Option<i64>,
     /// Optional trace-internal upid filter — precise even when pid recycles.
     pub upid: Option<i64>,
+    /// Optional page-load id/window scoping. Matches either `chrome_page_loads.id`
+    /// or, when `navigation_id` is set, `chrome_page_loads.navigation_id`.
+    pub page_load_id: Option<i64>,
+    /// Optional Chrome navigation id/window scoping.
+    pub navigation_id: Option<i64>,
+    /// Optional page-load phase; defaults to navigation_to_fcp when a page-load
+    /// or navigation id is set.
+    pub phase: Option<ChromeMainThreadHotspotsPhase>,
+    /// Optional raw trace timestamp lower bound in ns.
+    pub start_ts_ns: Option<i64>,
+    /// Optional raw trace timestamp upper bound in ns, exclusive.
+    pub end_ts_ns: Option<i64>,
     /// Optional override of the default 16 ms threshold (ms; must be
     /// finite non-negative, finite when multiplied to ns).
     pub min_dur_ms: Option<f64>,

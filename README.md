@@ -187,7 +187,7 @@ it in place.
 | `slice_descendants_breakdown` | Summarize child slices under long slice ids without hand-writing recursive CTEs |
 | `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame; metadata flags row/string truncation (Chrome trace) |
 | `chrome_page_load_summary` | Page loads: URL, FCP, LCP, DCL, load timings in ms; metadata flags row/string truncation (Chrome trace) |
-| `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts and cpu_pct; metadata flags row/string truncation (Chrome trace) |
+| `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts, upid/pid, cpu_pct, and optional page-load/time-window filters; metadata flags row/string truncation (Chrome trace) |
 | `chrome_startup_summary` | Browser startup events and time-to-first-visible-content; metadata flags row/string truncation (Chrome trace) |
 | `chrome_web_content_interactions` | Web content interactions (clicks, taps, INP) ranked by duration; metadata flags row/string truncation (Chrome trace) |
 | `list_stdlib_modules` | List available PerfettoSQL stdlib modules with optional `domain`, `query`, and `limit` filters (no trace needed) |
