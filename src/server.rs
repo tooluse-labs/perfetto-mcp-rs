@@ -620,6 +620,57 @@ impl PerfettoMcpServer {
     }
 
     #[tool(
+        name = "chrome_page_load_script_hotspots",
+        description = "Rank renderer main-thread script groups in a Chrome \
+                       page-load/raw window: URL/name/process/thread, wall/CPU totals, \
+                       style/layout ms, example_slice_id. Read-only.\n\
+                       \n\
+                       Use when: slow FCP/load needs post-resource JS attribution; expand \
+                       `example_slice_id` with `slice_descendants_breakdown`.\n\
+                       \n\
+                       Parameters: optional process filters, page-load/window filters shared \
+                       with `chrome_main_thread_hotspots`, `min_total_ms` (default 20), \
+                       `limit`, `max_string_len`. Empty result: no matching script groups.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn chrome_page_load_script_hotspots(
+        &self,
+        Parameters(params): Parameters<ChromePageLoadScriptHotspotsParams>,
+    ) -> Result<String, String> {
+        let client = self.client_for_current().await?;
+        ensure_chrome_trace(&client, "Chrome page-load script hotspots").await?;
+        let sql = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
+            process_name: params.process_name.as_deref(),
+            pid: params.pid,
+            upid: params.upid,
+            window: ChromePageLoadWindowFilters {
+                page_load_id: params.page_load_id,
+                navigation_id: params.navigation_id,
+                phase: params.phase,
+                start_ts_ns: params.start_ts_ns,
+                end_ts_ns: params.end_ts_ns,
+            },
+            min_total_ms: params.min_total_ms,
+            limit: params.limit,
+        })
+        .map_err(|e| e.to_string())?;
+        let table = client
+            .query(&sql)
+            .await
+            .map_err(|e| format_chrome_tool_error("Chrome page-load script hotspots", e))?;
+        format_chrome_tool_response(
+            table,
+            chrome_hotspots_effective_limit(params.limit),
+            params.max_string_len,
+        )
+    }
+
+    #[tool(
         name = "chrome_main_thread_hotspots",
         description = "Top Chrome main-thread tasks by wall duration: id, ts, \
                        name, task_type, thread_name, process_name, upid, pid, \
@@ -2157,6 +2208,7 @@ fn recommended_tools(trace_profile: &str) -> Vec<String> {
         "chrome" => [
             "chrome_page_load_summary",
             "chrome_page_load_resource_hotspots",
+            "chrome_page_load_script_hotspots",
             "chrome_scroll_jank_summary",
             "chrome_main_thread_hotspots",
             "chrome_web_content_interactions",
@@ -3244,6 +3296,7 @@ mod tests {
             vec![
                 "chrome_main_thread_hotspots",
                 "chrome_page_load_resource_hotspots",
+                "chrome_page_load_script_hotspots",
                 "chrome_page_load_summary",
                 "chrome_scroll_jank_summary",
                 "chrome_startup_summary",
@@ -3482,7 +3535,7 @@ mod tests {
     /// Integration test exercising the full wrapper path of EVERY chrome_*
     /// handler: client_for → ensure_chrome_trace → error-on-non-chrome.
     /// Guards against regressions where any future handler forgets to call
-    /// the preflight (SQL-level e2e wouldn't catch that). Five calls share
+    /// the preflight (SQL-level e2e wouldn't catch that). The calls share
     /// one tp_shell spawn because the manager caches clients by path.
     #[test]
     fn all_chrome_handlers_reject_non_chrome_via_preflight() {
@@ -3548,6 +3601,31 @@ mod tests {
                 .expect_err("chrome_page_load_resource_hotspots: preflight must reject");
             assert!(
                 err.contains("Chrome page-load resource hotspots"),
+                "got: {err}"
+            );
+            assert!(err.contains("Chrome-family trace"), "got: {err}");
+            assert!(err.contains("list_stdlib_modules"), "got: {err}");
+
+            let r = server
+                .chrome_page_load_script_hotspots(Parameters(ChromePageLoadScriptHotspotsParams {
+                    process_name: None,
+                    pid: None,
+                    upid: None,
+                    page_load_id: None,
+                    navigation_id: None,
+                    phase: None,
+                    start_ts_ns: None,
+                    end_ts_ns: None,
+                    min_total_ms: None,
+                    limit: None,
+                    max_string_len: None,
+                }))
+                .await;
+            let err = r
+                .map(|_| ())
+                .expect_err("chrome_page_load_script_hotspots: preflight must reject");
+            assert!(
+                err.contains("Chrome page-load script hotspots"),
                 "got: {err}"
             );
             assert!(err.contains("Chrome-family trace"), "got: {err}");
@@ -3775,6 +3853,21 @@ mod tests {
     }
 
     #[test]
+    fn chrome_page_load_script_hotspots_params_accepts_stringified_numerics() {
+        let p: ChromePageLoadScriptHotspotsParams = serde_json::from_str(
+            r#"{"upid": "14", "navigation_id": "7", "start_ts_ns": "100", "end_ts_ns": "200", "min_total_ms": "20", "limit": "30", "max_string_len": "260"}"#,
+        )
+        .expect("stringified numerics must deserialize");
+        assert_eq!(p.upid, Some(14));
+        assert_eq!(p.navigation_id, Some(7));
+        assert_eq!(p.start_ts_ns, Some(100));
+        assert_eq!(p.end_ts_ns, Some(200));
+        assert_eq!(p.min_total_ms, Some(20.0));
+        assert_eq!(p.limit, Some(30));
+        assert_eq!(p.max_string_len, Some(260));
+    }
+
+    #[test]
     fn chrome_main_thread_hotspots_params_accept_navigation_id() {
         let p: ChromeMainThreadHotspotsParams =
             serde_json::from_str(r#"{"navigation_id": "7", "phase": "dcl_to_fcp"}"#)
@@ -3822,6 +3915,20 @@ mod tests {
                     ("start_ts_ns", "integer"),
                     ("end_ts_ns", "integer"),
                     ("min_dur_ms", "number"),
+                    ("limit", "integer"),
+                    ("max_string_len", "integer"),
+                ],
+            ),
+            (
+                "chrome_page_load_script_hotspots",
+                vec![
+                    ("pid", "integer"),
+                    ("upid", "integer"),
+                    ("page_load_id", "integer"),
+                    ("navigation_id", "integer"),
+                    ("start_ts_ns", "integer"),
+                    ("end_ts_ns", "integer"),
+                    ("min_total_ms", "number"),
                     ("limit", "integer"),
                     ("max_string_len", "integer"),
                 ],
@@ -4632,6 +4739,172 @@ mod tests {
         })
         .expect_err("end before start must error");
         assert!(err.to_string().contains("end_ts_ns"), "got: {err}");
+    }
+
+    #[test]
+    fn chrome_page_load_script_hotspots_sql_defaults_to_grouped_script_scan() {
+        let sql =
+            chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters::default())
+                .expect("script builder must succeed");
+        assert!(
+            sql.contains("WITH RECURSIVE script_slices AS"),
+            "script SQL must use recursive CTEs for descendant rollups, got: {sql}",
+        );
+        assert!(
+            !sql.contains("chrome.page_loads"),
+            "no-window script SQL must not include page-loads, got: {sql}",
+        );
+        assert!(
+            sql.contains("AND (t.is_main_thread = 1 OR t.name GLOB 'Cr*Main')"),
+            "script SQL must scope to renderer main-thread-style work, got: {sql}",
+        );
+        assert!(
+            sql.contains("'EvaluateScript', 'v8.run', 'FunctionCall'"),
+            "script SQL must match canonical JS execution slices, got: {sql}",
+        );
+        assert!(
+            sql.contains("descendant_rollup AS"),
+            "script SQL must aggregate descendant style/layout work, got: {sql}",
+        );
+        for column in [
+            "forced_style_layout_ms",
+            "style_recalc_ms",
+            "layout_ms",
+            "example_slice_id",
+        ] {
+            assert!(
+                sql.contains(column),
+                "script SQL must expose {column}, got: {sql}",
+            );
+        }
+        assert!(
+            sql.contains("AS overlap_dur"),
+            "script SQL must compute per-slice window overlap duration, got: {sql}",
+        );
+        assert!(
+            sql.contains("ROUND(SUM(ss.overlap_dur) / 1e6, 3) AS total_wall_ms"),
+            "script total wall time must aggregate clipped overlap duration, got: {sql}",
+        );
+        assert!(
+            sql.contains("ROUND(MAX(ss.overlap_dur) / 1e6, 3) AS max_wall_ms"),
+            "script max wall time must use clipped overlap duration, got: {sql}",
+        );
+        assert!(
+            sql.contains("* 1.0 / s.dur"),
+            "clipped CPU estimate must avoid integer division, got: {sql}",
+        );
+        assert!(
+            sql.contains("ORDER BY s2.overlap_dur DESC, s2.dur DESC, s2.id ASC"),
+            "example_slice_id must rank by clipped overlap duration, got: {sql}",
+        );
+        assert!(
+            sql.contains("JOIN script_slices root ON root.id = sd.root_id"),
+            "descendant rollups must see the root clipped window, got: {sql}",
+        );
+        assert!(
+            sql.contains("root.overlap_start_ts"),
+            "descendant style/layout duration must be clipped to root overlap start, got: {sql}",
+        );
+        assert!(
+            sql.contains("root.overlap_end_ts"),
+            "descendant style/layout duration must be clipped to root overlap end, got: {sql}",
+        );
+        assert!(
+            sql.contains("HAVING SUM(ss.overlap_dur) >= 20000000"),
+            "default grouped script threshold must be 20 ms, got: {sql}",
+        );
+        assert!(
+            sql.contains("ORDER BY total_wall_ms DESC, max_wall_ms DESC, first_start_ms ASC"),
+            "script SQL must order by aggregate wall time, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_script_hotspots_sql_with_window_and_process_filters() {
+        let sql = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
+            process_name: Some("Renderer"),
+            upid: Some(14),
+            window: ChromePageLoadWindowFilters {
+                navigation_id: Some(7),
+                phase: Some(ChromePageLoadPhase::NavigationToFcp),
+                start_ts_ns: Some(1000),
+                end_ts_ns: Some(2000),
+                ..Default::default()
+            },
+            min_total_ms: Some(0.0),
+            limit: Some(25),
+            ..Default::default()
+        })
+        .expect("script window builder must succeed");
+        assert!(
+            sql.contains("INCLUDE PERFETTO MODULE chrome.page_loads; WITH RECURSIVE"),
+            "windowed script SQL must include page-loads before recursive CTEs, got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE navigation_id = 7 "),
+            "navigation_id must match only chrome_page_loads.navigation_id, got: {sql}",
+        );
+        assert!(
+            !sql.contains("WHERE id = 7 "),
+            "navigation_id must not also match chrome_page_loads.id, got: {sql}",
+        );
+        assert!(
+            sql.contains("s.ts + s.dur > MAX(sw.start_ts, 1000)"),
+            "script overlap lower predicate must use effective start, got: {sql}",
+        );
+        assert!(
+            sql.contains("s.ts < MIN(sw.end_ts, 2000)"),
+            "script overlap upper predicate must use effective end, got: {sql}",
+        );
+        assert!(
+            sql.contains("AND MIN(sw.end_ts, 2000) > MAX(sw.start_ts, 1000)"),
+            "script SQL must reject empty/reversed effective windows, got: {sql}",
+        );
+        assert!(
+            sql.contains("MAX(s.ts, MAX(sw.start_ts, 1000)) AS overlap_start_ts"),
+            "script SQL must clip slice starts to effective window start, got: {sql}",
+        );
+        assert!(
+            sql.contains("MIN(s.ts + s.dur, MIN(sw.end_ts, 2000)) AS overlap_end_ts"),
+            "script SQL must clip slice ends to effective window end, got: {sql}",
+        );
+        assert!(
+            sql.contains("AND p.name = 'Renderer'"),
+            "process_name filter must be emitted, got: {sql}",
+        );
+        assert!(
+            sql.contains("AND p.upid = 14"),
+            "upid filter must be emitted, got: {sql}",
+        );
+        assert!(
+            sql.contains("HAVING SUM(ss.overlap_dur) >= 0"),
+            "min_total_ms=0 must use clipped overlap duration, got: {sql}",
+        );
+        assert!(
+            sql.contains("LIMIT 25"),
+            "limit must be honored, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_script_hotspots_sql_validates_inputs() {
+        let err = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(1),
+                navigation_id: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect_err("page_load_id plus navigation_id must error");
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+
+        let err = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
+            min_total_ms: Some(f64::NAN),
+            ..Default::default()
+        })
+        .expect_err("NaN min_total_ms must error");
+        assert!(err.to_string().contains("min_total_ms"), "got: {err}");
     }
 
     /// list_threads_in_process now accepts upid OR process_name. With neither

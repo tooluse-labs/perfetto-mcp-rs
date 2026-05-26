@@ -185,6 +185,7 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 | `chrome_scroll_jank_summary` | 按原因汇总最严重的 Chrome 滚动卡顿帧；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_page_load_summary` | 页面加载的 URL / 原始边界时间戳 / FCP / LCP / DCL / load 耗时；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_page_load_resource_hotspots` | thread/process/async track 上带 URL 的资源/请求类 slice 按页面加载/时间窗口 overlap 排序，并尽量带进程/线程归属；元信息标记行/字符串是否截断（仅 Chrome trace） |
+| `chrome_page_load_script_hotspots` | Renderer 主线程脚本执行按 URL/slice/进程聚合，并带 style/layout 子树信号；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_main_thread_hotspots` | 主线程任务按耗时排序，带 ts、upid/pid、cpu_pct，并支持页面加载/时间窗口过滤；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_startup_summary` | 浏览器启动事件与首次可见内容时间；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_web_content_interactions` | Web 内容交互（点击、触摸、INP）按耗时排序；元信息标记行/字符串是否截断（仅 Chrome trace） |
@@ -204,12 +205,12 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 
 - **Chrome trace**：`load_trace` → 直接用专用的 `chrome_*` 工具
   （`chrome_scroll_jank_summary`、`chrome_page_load_summary`、
-  `chrome_page_load_resource_hotspots`、`chrome_main_thread_hotspots`、
-  `chrome_startup_summary`、`chrome_web_content_interactions`），要深入分析时
-  再用 `execute_sql` 对返回的行做下一步查询。分析慢 FCP/load 时，先看
-  resource hotspots，再判断主线程上的 `ResourceLoad*` 是否只是局部执行片段。
-  遇到长任务 `id` 时，可以用 `slice_descendants_breakdown` 展开它下面的子
-  slice。
+  `chrome_page_load_resource_hotspots`、`chrome_page_load_script_hotspots`、
+  `chrome_main_thread_hotspots`、`chrome_startup_summary`、
+  `chrome_web_content_interactions`），要深入分析时再用 `execute_sql` 对返回的行
+  做下一步查询。分析慢 FCP/load 时，先看 resource hotspots，再看 script
+  hotspots 判断资源回来后的 JS / style / layout 开销。遇到长任务 `id` 时，可以
+  用 `slice_descendants_breakdown` 展开它下面的子 slice。
 - **其他 trace**：`load_trace` → 用 `list_tables` / `list_table_structure`
   探索 schema → `execute_sql` 查询。如果分析涉及到 stdlib 模块（Android、
   `slices.with_context` 这类通用模块），可以调 `list_stdlib_modules` 或读取

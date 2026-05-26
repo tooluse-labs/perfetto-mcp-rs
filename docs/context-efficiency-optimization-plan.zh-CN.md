@@ -69,7 +69,10 @@ Last updated: 2026-05-26
   SQL。已新增 `chrome_page_load_resource_hotspots` 将 URL-bearing
   resource-like slice 按 page-load/raw timestamp 窗口 overlap 排序，覆盖
   trace5 中 `EnhanceConfigManager::GetResource` / URL request 这类关键路径。
-  后续更细的 frame/script 归属仍可作为 P1/P2 工具补强。
+  已新增 `chrome_page_load_script_hotspots` 聚合 renderer main-thread script /
+  callback / microtask 执行，并带 descendant style/layout 信号，覆盖 trace5 中
+  关键 JS 文件和 forced layout 后续 SQL 路径。后续更细的 frame/renderer 归属仍可
+  作为 P1/P2 工具补强。
 - `chrome_main_thread_hotspots` 在 v0.15.6 后续补强中增加了 `upid` / `pid`
   输出和 `page_load_id` / `phase` / `start_ts_ns` / `end_ts_ns` 窗口过滤。该项
   缓解了日志里反复手写 `ts >= navigation_start`、`ts >= fcp_ts`、`ms_from_nav`

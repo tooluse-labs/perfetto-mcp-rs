@@ -316,6 +316,59 @@ pub struct ChromePageLoadResourceHotspotsParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ChromePageLoadScriptHotspotsParams {
+    /// Optional process-name filter (e.g. "Renderer"). Useful to scope one
+    /// process type without picking a specific instance.
+    #[serde(default)]
+    pub process_name: Option<String>,
+    /// Optional OS pid filter. Accepts both numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub pid: Option<i64>,
+    /// Optional trace-internal upid filter. Prefer this when distinguishing
+    /// same-named Renderer processes. Accepts numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub upid: Option<i64>,
+    /// Optional page-load id used to scope scripts to one navigation phase.
+    /// Matches `chrome_page_loads.id`. Mutually exclusive with `navigation_id`.
+    /// If set without `phase`, defaults to `navigation_to_fcp`.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub page_load_id: Option<i64>,
+    /// Optional Chrome navigation id used to scope scripts to one navigation
+    /// phase. Matches `chrome_page_loads.navigation_id`. Mutually exclusive
+    /// with `page_load_id`. If set without `phase`, defaults to
+    /// `navigation_to_fcp`.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub navigation_id: Option<i64>,
+    /// Optional page-load phase window. If set without `page_load_id` or
+    /// `navigation_id`, uses the latest page load in the trace. Values:
+    /// navigation_to_fcp, navigation_to_load, dcl_to_fcp, fcp_to_load.
+    #[serde(default)]
+    pub phase: Option<ChromePageLoadPhase>,
+    /// Optional raw trace timestamp lower bound in nanoseconds. This uses the
+    /// same unit as trace `slice.ts`. ANDs with any page-load window.
+    #[serde(default, alias = "start_ts", deserialize_with = "lenient_i64")]
+    pub start_ts_ns: Option<i64>,
+    /// Optional raw trace timestamp upper bound in nanoseconds, exclusive. This
+    /// uses the same unit as trace `slice.ts`. ANDs with any page-load window.
+    #[serde(default, alias = "end_ts", deserialize_with = "lenient_i64")]
+    pub end_ts_ns: Option<i64>,
+    /// Optional minimum aggregated wall time per grouped script hotspot.
+    /// Defaults to 20 ms. Pass 0 to see every matching group.
+    #[serde(default, deserialize_with = "lenient_f64")]
+    pub min_total_ms: Option<f64>,
+    /// Optional max rows to return. Defaults to 100 and is capped at 5000.
+    /// Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+    /// Optional per-string-cell character cap applied to returned rows only.
+    /// Unset preserves full strings for precision; accepts both numbers and
+    /// numeric strings. Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub max_string_len: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChromeMainThreadHotspotsParams {
     /// Optional process-name filter (e.g. "Renderer", "Browser", "GPU Process").
     /// Useful to scope to one process type without picking a specific instance.
@@ -481,6 +534,23 @@ pub struct ChromePageLoadResourceHotspotsFilters {
     /// Optional override of the default 50 ms threshold (ms; must be finite
     /// non-negative, finite when multiplied to ns).
     pub min_dur_ms: Option<f64>,
+    /// Optional override of the default `LIMIT 100`. Capped at `MAX_ROWS`.
+    /// Must be `> 0` if set.
+    pub limit: Option<u32>,
+}
+
+/// Tunable filters for `chrome_page_load_script_hotspots_sql`.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ChromePageLoadScriptHotspotsFilters<'a> {
+    /// Optional process-name filter (e.g. "Renderer", "Browser").
+    pub process_name: Option<&'a str>,
+    /// Optional OS pid filter.
+    pub pid: Option<i64>,
+    /// Optional trace-internal upid filter.
+    pub upid: Option<i64>,
+    pub window: ChromePageLoadWindowFilters,
+    /// Optional override of the default 20 ms grouped wall-time threshold.
+    pub min_total_ms: Option<f64>,
     /// Optional override of the default `LIMIT 100`. Capped at `MAX_ROWS`.
     /// Must be `> 0` if set.
     pub limit: Option<u32>,

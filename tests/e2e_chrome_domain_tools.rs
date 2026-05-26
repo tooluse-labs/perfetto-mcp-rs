@@ -1,7 +1,7 @@
 // Copyright 2025 The perfetto-mcp-rs Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! e2e coverage for the five Chrome domain tools. Each test drives the
+//! e2e coverage for the Chrome domain tools. Each test drives the
 //! exact SQL the tool ships against a real fixture, so a future edit to the
 //! stdlib view schema or the SQL constant surfaces as a test failure.
 //!
@@ -21,12 +21,13 @@ use std::path::Path;
 
 use perfetto_mcp_rs::params::{
     ChromeMainThreadHotspotsFilters, ChromePageLoadResourceHotspotsFilters,
-    ChromePageLoadWindowFilters,
+    ChromePageLoadScriptHotspotsFilters, ChromePageLoadWindowFilters,
 };
 use perfetto_mcp_rs::sql_templates::{
     chrome_main_thread_hotspots_sql, chrome_page_load_resource_hotspots_sql,
-    CHROME_PAGE_LOAD_SUMMARY_SQL, CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_SQL,
-    CHROME_TRACE_PREFLIGHT_SQL, CHROME_WEB_CONTENT_INTERACTIONS_SQL,
+    chrome_page_load_script_hotspots_sql, CHROME_PAGE_LOAD_SUMMARY_SQL,
+    CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_SQL, CHROME_TRACE_PREFLIGHT_SQL,
+    CHROME_WEB_CONTENT_INTERACTIONS_SQL,
 };
 use perfetto_mcp_rs::tp_manager::TraceProcessorManager;
 
@@ -154,6 +155,50 @@ fn e2e_chrome_page_load_resource_hotspots_sql_runs_cleanly() {
                 "row {i} missing overlap_ms",
             );
             assert!(table.cell(i, "url").is_some(), "row {i} missing url");
+        }
+    });
+}
+
+#[test]
+fn e2e_chrome_page_load_script_hotspots_sql_runs_cleanly() {
+    // Weak assertion: the fixture primarily protects SQL compatibility and
+    // response shape. It may not contain large page-load script hotspots.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = TraceProcessorManager::new_with_starting_port(1, 19_261);
+        let trace = Path::new("tests/fixtures/page_loads.pftrace");
+
+        let client = manager.get_client(trace).await.expect("spawn tp_shell");
+        let sql = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(1),
+                phase: Some(perfetto_mcp_rs::params::ChromePageLoadPhase::NavigationToFcp),
+                ..Default::default()
+            },
+            min_total_ms: Some(0.0),
+            ..Default::default()
+        })
+        .expect("script hotspots SQL builder must succeed");
+        let table = client
+            .query(&sql)
+            .await
+            .expect("chrome page-load script hotspots query must succeed");
+
+        for i in 0..table.len() {
+            assert!(table.cell(i, "url").is_some(), "row {i} missing url");
+            assert!(table.cell(i, "name").is_some(), "row {i} missing name");
+            assert!(
+                table.cell(i, "total_wall_ms").is_some(),
+                "row {i} missing total_wall_ms",
+            );
+            assert!(
+                table.cell(i, "example_slice_id").is_some(),
+                "row {i} missing example_slice_id",
+            );
         }
     });
 }
