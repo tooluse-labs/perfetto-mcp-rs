@@ -3,8 +3,8 @@
 
 use crate::error::{PerfettoError, MAX_ROWS};
 use crate::params::{
-    ChromeMainThreadHotspotsFilters, ChromeMainThreadHotspotsPhase,
-    SliceDescendantsBreakdownFilters,
+    ChromeMainThreadHotspotsFilters, ChromePageLoadPhase, ChromePageLoadResourceHotspotsFilters,
+    ChromePageLoadWindowFilters, SliceDescendantsBreakdownFilters,
 };
 
 /// Trace-level metadata used by `load_trace` to avoid leaving callers in a
@@ -68,8 +68,12 @@ pub const CHROME_SCROLL_JANK_SUMMARY_SQL: &str =
 pub const CHROME_PAGE_LOAD_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.page_loads; \
      SELECT \
        id, \
+       navigation_id, \
        url, \
        navigation_start_ts, \
+       fcp_ts, \
+       dom_content_loaded_event_ts, \
+       load_event_ts, \
        fcp / 1e6 AS fcp_ms, \
        lcp / 1e6 AS lcp_ms, \
        CASE WHEN dom_content_loaded_event_ts IS NOT NULL \
@@ -82,33 +86,24 @@ pub const CHROME_PAGE_LOAD_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.p
      ORDER BY navigation_start_ts DESC \
      LIMIT 100";
 
-/// SQL builder for `chrome_main_thread_hotspots`. Exported for integration tests.
-///
-/// Uses `thread.is_main_thread = 1` when trace_processor populated it, plus
-/// Chrome's `Cr*Main` thread-name convention as a fallback for Chromium-family
-/// traces that carry main-thread names but do not set the flag correctly.
-///
-/// All set filter clauses AND together — the redundancy is harmless (e.g.
-/// `upid=3 AND pid=12800` still hits when the pair refers to one process).
-/// The base SQL picks up a `LEFT JOIN process p ON ct.upid = p.upid` so `p.pid`
-/// and `p.upid` are referenceable; the join is harmless when no process
-/// filter is present. `ChromeMainThreadHotspotsFilters::default()` is
-/// equivalent to the default tool behavior.
-pub fn chrome_main_thread_hotspots_sql(
-    filters: ChromeMainThreadHotspotsFilters<'_>,
-) -> Result<String, PerfettoError> {
-    let ChromeMainThreadHotspotsFilters {
-        process_name,
-        pid,
-        upid,
+#[derive(Debug, Clone, Copy)]
+struct ChromePageLoadWindowSql {
+    phase: Option<ChromePageLoadPhase>,
+    start_ts_ns: Option<i64>,
+    end_ts_ns: Option<i64>,
+}
+
+fn validate_chrome_page_load_window(
+    filters: ChromePageLoadWindowFilters,
+) -> Result<ChromePageLoadWindowSql, PerfettoError> {
+    let ChromePageLoadWindowFilters {
         page_load_id,
         navigation_id,
         phase,
         start_ts_ns,
         end_ts_ns,
-        min_dur_ms,
-        limit,
     } = filters;
+
     if let Some(id) = page_load_id {
         if id < 0 {
             return Err(PerfettoError::InvalidParam(format!(
@@ -149,54 +144,129 @@ pub fn chrome_main_thread_hotspots_sql(
             )));
         }
     }
-    let min_dur_ns: i64 = match min_dur_ms {
-        None => 16_000_000,
-        Some(ms) => {
-            let ns = ms * 1_000_000.0;
-            if !(ns.is_finite() && ns >= 0.0 && ns <= i64::MAX as f64) {
-                return Err(PerfettoError::InvalidParam(format!(
-                    "min_dur_ms must be finite, non-negative, and ≤ ~9.2e12 ms, got {ms}"
-                )));
-            }
-            ns as i64
-        }
-    };
-    let row_limit: u32 = match limit {
-        None => 100,
-        Some(0) => {
-            return Err(PerfettoError::InvalidParam("limit must be > 0".to_owned()));
-        }
-        Some(n) if (n as usize) > MAX_ROWS => MAX_ROWS as u32,
-        Some(n) => n,
-    };
-    let effective_phase = phase.or_else(|| {
+
+    let phase = phase.or_else(|| {
         (page_load_id.is_some() || navigation_id.is_some())
-            .then_some(ChromeMainThreadHotspotsPhase::NavigationToFcp)
+            .then_some(ChromePageLoadPhase::NavigationToFcp)
     });
-    let mut sql = String::from("INCLUDE PERFETTO MODULE chrome.tasks; ");
-    if let Some(phase) = effective_phase {
-        let (start_expr, end_expr) = match phase {
-            ChromeMainThreadHotspotsPhase::NavigationToFcp => ("navigation_start_ts", "fcp_ts"),
-            ChromeMainThreadHotspotsPhase::NavigationToLoad => {
-                ("navigation_start_ts", "load_event_ts")
-            }
-            ChromeMainThreadHotspotsPhase::DclToFcp => ("dom_content_loaded_event_ts", "fcp_ts"),
-            ChromeMainThreadHotspotsPhase::FcpToLoad => ("fcp_ts", "load_event_ts"),
-        };
+
+    Ok(ChromePageLoadWindowSql {
+        phase,
+        start_ts_ns,
+        end_ts_ns,
+    })
+}
+
+fn chrome_page_load_phase_columns(phase: ChromePageLoadPhase) -> (&'static str, &'static str) {
+    match phase {
+        ChromePageLoadPhase::NavigationToFcp => ("navigation_start_ts", "fcp_ts"),
+        ChromePageLoadPhase::NavigationToLoad => ("navigation_start_ts", "load_event_ts"),
+        ChromePageLoadPhase::DclToFcp => ("dom_content_loaded_event_ts", "fcp_ts"),
+        ChromePageLoadPhase::FcpToLoad => ("fcp_ts", "load_event_ts"),
+    }
+}
+
+fn append_chrome_page_load_window_cte(
+    sql: &mut String,
+    cte_name: &str,
+    filters: ChromePageLoadWindowFilters,
+    window: ChromePageLoadWindowSql,
+) {
+    if let Some(phase) = window.phase {
+        let (start_expr, end_expr) = chrome_page_load_phase_columns(phase);
         sql.push_str("INCLUDE PERFETTO MODULE chrome.page_loads; ");
         sql.push_str(&format!(
-            "WITH hotspot_window AS ( \
-             SELECT {start_expr} AS start_ts, {end_expr} AS end_ts \
+            "WITH {cte_name} AS ( \
+             SELECT \
+               navigation_start_ts AS navigation_start_ts, \
+               {start_expr} AS start_ts, \
+               {end_expr} AS end_ts, \
+               ({end_expr} - {start_expr}) AS phase_dur_ns \
              FROM chrome_page_loads "
         ));
-        if let Some(id) = page_load_id {
+        if let Some(id) = filters.page_load_id {
             sql.push_str(&format!("WHERE id = {id} "));
         }
-        if let Some(id) = navigation_id {
+        if let Some(id) = filters.navigation_id {
             sql.push_str(&format!("WHERE navigation_id = {id} "));
         }
         sql.push_str("ORDER BY navigation_start_ts DESC LIMIT 1) ");
     }
+}
+
+fn duration_ms_to_ns(
+    field_name: &str,
+    value_ms: Option<f64>,
+    default_ns: i64,
+) -> Result<i64, PerfettoError> {
+    match value_ms {
+        None => Ok(default_ns),
+        Some(ms) => {
+            let ns = ms * 1_000_000.0;
+            if !(ns.is_finite() && ns >= 0.0 && ns <= i64::MAX as f64) {
+                return Err(PerfettoError::InvalidParam(format!(
+                    "{field_name} must be finite, non-negative, and ≤ ~9.2e12 ms, got {ms}"
+                )));
+            }
+            Ok(ns as i64)
+        }
+    }
+}
+
+fn chrome_tool_row_limit(limit: Option<u32>) -> Result<u32, PerfettoError> {
+    match limit {
+        None => Ok(100),
+        Some(0) => Err(PerfettoError::InvalidParam("limit must be > 0".to_owned())),
+        Some(n) if (n as usize) > MAX_ROWS => Ok(MAX_ROWS as u32),
+        Some(n) => Ok(n),
+    }
+}
+
+/// SQL builder for `chrome_main_thread_hotspots`. Exported for integration tests.
+///
+/// Uses `thread.is_main_thread = 1` when trace_processor populated it, plus
+/// Chrome's `Cr*Main` thread-name convention as a fallback for Chromium-family
+/// traces that carry main-thread names but do not set the flag correctly.
+///
+/// All set filter clauses AND together — the redundancy is harmless (e.g.
+/// `upid=3 AND pid=12800` still hits when the pair refers to one process).
+/// The base SQL picks up a `LEFT JOIN process p ON ct.upid = p.upid` so `p.pid`
+/// and `p.upid` are referenceable; the join is harmless when no process
+/// filter is present. `ChromeMainThreadHotspotsFilters::default()` is
+/// equivalent to the default tool behavior.
+pub fn chrome_main_thread_hotspots_sql(
+    filters: ChromeMainThreadHotspotsFilters<'_>,
+) -> Result<String, PerfettoError> {
+    let ChromeMainThreadHotspotsFilters {
+        process_name,
+        pid,
+        upid,
+        page_load_id,
+        navigation_id,
+        phase,
+        start_ts_ns,
+        end_ts_ns,
+        min_dur_ms,
+        limit,
+    } = filters;
+    let page_window_filters = ChromePageLoadWindowFilters {
+        page_load_id,
+        navigation_id,
+        phase,
+        start_ts_ns,
+        end_ts_ns,
+    };
+    let page_window = validate_chrome_page_load_window(page_window_filters)?;
+    let min_dur_ns = duration_ms_to_ns("min_dur_ms", min_dur_ms, 16_000_000)?;
+    let row_limit = chrome_tool_row_limit(limit)?;
+    let effective_phase = page_window.phase;
+    let mut sql = String::from("INCLUDE PERFETTO MODULE chrome.tasks; ");
+    append_chrome_page_load_window_cte(
+        &mut sql,
+        "hotspot_window",
+        page_window_filters,
+        page_window,
+    );
     sql.push_str(
         "SELECT \
            ct.id, \
@@ -231,10 +301,10 @@ pub fn chrome_main_thread_hotspots_sql(
               AND ct.ts < hw.end_ts",
         );
     }
-    if let Some(start) = start_ts_ns {
+    if let Some(start) = page_window.start_ts_ns {
         sql.push_str(&format!(" AND ct.ts >= {start}"));
     }
-    if let Some(end) = end_ts_ns {
+    if let Some(end) = page_window.end_ts_ns {
         sql.push_str(&format!(" AND ct.ts < {end}"));
     }
     if let Some(name) = process_name {
@@ -248,6 +318,181 @@ pub fn chrome_main_thread_hotspots_sql(
         sql.push_str(&format!(" AND p.upid = {upid}"));
     }
     sql.push_str(&format!(" ORDER BY ct.dur DESC LIMIT {row_limit}"));
+    Ok(sql)
+}
+
+/// SQL builder for `chrome_page_load_resource_hotspots`.
+///
+/// This is intentionally slice-based rather than a HAR clone: Chrome traces do
+/// not always expose a stable resource timing stdlib view, but resource-shaped
+/// slices with URL args are enough to surface page-load blockers like long
+/// NetworkService `GetResource`/`URLLoader` work. Window overlap is used so a
+/// resource that starts before a phase and finishes inside it is still counted.
+pub fn chrome_page_load_resource_hotspots_sql(
+    filters: ChromePageLoadResourceHotspotsFilters,
+) -> Result<String, PerfettoError> {
+    let ChromePageLoadResourceHotspotsFilters {
+        window,
+        min_dur_ms,
+        limit,
+    } = filters;
+    let page_window = validate_chrome_page_load_window(window)?;
+    let min_dur_ns = duration_ms_to_ns("min_dur_ms", min_dur_ms, 50_000_000)?;
+    let row_limit = chrome_tool_row_limit(limit)?;
+
+    let mut sql = String::new();
+    append_chrome_page_load_window_cte(&mut sql, "resource_window", window, page_window);
+    if sql.is_empty() {
+        sql.push_str("WITH ");
+    } else {
+        sql.push_str(", ");
+    }
+
+    let start_bound = match (page_window.phase.is_some(), page_window.start_ts_ns) {
+        (true, Some(ts)) => Some(format!("MAX(rw.start_ts, {ts})")),
+        (true, None) => Some("rw.start_ts".to_owned()),
+        (false, Some(ts)) => Some(ts.to_string()),
+        (false, None) => None,
+    };
+    let end_bound = match (page_window.phase.is_some(), page_window.end_ts_ns) {
+        (true, Some(ts)) => Some(format!("MIN(rw.end_ts, {ts})")),
+        (true, None) => Some("rw.end_ts".to_owned()),
+        (false, Some(ts)) => Some(ts.to_string()),
+        (false, None) => None,
+    };
+    let anchor_expr = if page_window.phase.is_some() {
+        "rw.navigation_start_ts".to_owned()
+    } else if let Some(start) = page_window.start_ts_ns {
+        start.to_string()
+    } else {
+        "trace_start()".to_owned()
+    };
+    let overlap_start_expr = match &start_bound {
+        Some(bound) => format!("MAX(s.ts, {bound})"),
+        None => "s.ts".to_owned(),
+    };
+    let overlap_end_expr = match &end_bound {
+        Some(bound) => format!("MIN(s.ts + s.dur, {bound})"),
+        None => "s.ts + s.dur".to_owned(),
+    };
+    let window_dur_expr = match (&start_bound, &end_bound) {
+        (Some(start), Some(end)) => Some(format!("({end} - {start})")),
+        _ => None,
+    };
+    let pct_expr = match &window_dur_expr {
+        Some(expr) => format!(
+            "CASE WHEN {expr} > 0 \
+                  THEN ROUND(({overlap_end_expr} - {overlap_start_expr}) * 100.0 / {expr}, 2) \
+             END AS pct_of_window"
+        ),
+        None => "NULL AS pct_of_window".to_owned(),
+    };
+
+    sql.push_str(&format!(
+        "resource_candidates AS ( \
+           SELECT \
+             s.id, \
+             s.ts, \
+             s.dur, \
+             ROUND((s.ts - {anchor_expr}) / 1e6, 3) AS start_ms, \
+             ROUND((s.ts + s.dur - {anchor_expr}) / 1e6, 3) AS end_ms, \
+             ROUND(s.dur / 1e6, 3) AS dur_ms, \
+             ROUND(({overlap_end_expr} - {overlap_start_expr}) / 1e6, 3) AS overlap_ms, \
+             {pct_expr}, \
+             s.name, \
+              COALESCE(p_thread.name, p_process.name, p_parent_thread.name, p_parent_process.name) \
+                AS process_name, \
+              COALESCE(p_thread.upid, p_process.upid, p_parent_thread.upid, p_parent_process.upid) \
+                AS upid, \
+              COALESCE(p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid) \
+                AS pid, \
+              COALESCE(t.name, parent_t.name) AS thread_name, \
+             COALESCE( \
+               MAX(CASE WHEN a.flat_key IN ( \
+                 'debug.url', 'debug.data.url', 'debug.data.request_url', \
+                 'debug.fileName', 'url', 'request_url' \
+               ) THEN a.display_value END), \
+               MAX(CASE WHEN a.key IN ('url', 'request_url', 'fileName') \
+                    THEN a.display_value END), \
+               MAX(CASE WHEN lower(a.flat_key) LIKE '%url%' \
+                    THEN a.display_value END) \
+             ) AS url \
+           FROM slice s \
+           LEFT JOIN track tr ON s.track_id = tr.id \
+           LEFT JOIN thread_track tt ON s.track_id = tt.id \
+           LEFT JOIN thread t ON tt.utid = t.utid \
+           LEFT JOIN process p_thread ON t.upid = p_thread.upid \
+           LEFT JOIN process_track pt ON s.track_id = pt.id \
+           LEFT JOIN process p_process ON pt.upid = p_process.upid \
+           LEFT JOIN thread_track parent_tt ON tr.parent_id = parent_tt.id \
+           LEFT JOIN thread parent_t ON parent_tt.utid = parent_t.utid \
+           LEFT JOIN process p_parent_thread ON parent_t.upid = p_parent_thread.upid \
+           LEFT JOIN process_track parent_pt ON tr.parent_id = parent_pt.id \
+           LEFT JOIN process p_parent_process ON parent_pt.upid = p_parent_process.upid \
+           LEFT JOIN args a ON s.arg_set_id = a.arg_set_id "
+    ));
+    if page_window.phase.is_some() {
+        sql.push_str("CROSS JOIN resource_window rw ");
+    }
+    sql.push_str(&format!(
+        "WHERE s.dur >= {min_dur_ns} \
+           AND ( \
+             s.name GLOB '*Resource*' OR \
+              s.name GLOB '*URLLoader*' OR \
+              s.name GLOB '*URLRequest*' OR \
+              s.name GLOB '*Network*' OR \
+              s.name GLOB '*Request*' OR \
+              s.name GLOB '*Fetch*' OR \
+              s.name GLOB '*XHR*' \
+            ) \
+           AND NOT ( \
+             s.name GLOB '*PageLoadMetrics*' OR \
+             s.name GLOB '*DidCommitProvisionalLoad*' OR \
+             s.name GLOB '*DidStartProvisionalLoad*' OR \
+             s.name GLOB '*DidStopLoading*' OR \
+             s.name GLOB '*DidFinishLoad*' \
+           )"
+    ));
+    if let Some(bound) = &start_bound {
+        sql.push_str(&format!(" AND s.ts + s.dur > {bound}"));
+    }
+    if let Some(bound) = &end_bound {
+        sql.push_str(&format!(" AND s.ts < {bound}"));
+    }
+    if page_window.phase.is_some() {
+        sql.push_str(" AND rw.start_ts IS NOT NULL AND rw.end_ts IS NOT NULL");
+    }
+    if let (Some(start), Some(end)) = (&start_bound, &end_bound) {
+        sql.push_str(&format!(" AND {end} > {start}"));
+    }
+    sql.push_str(
+        " GROUP BY \
+             s.id, s.ts, s.dur, s.name, \
+             p_thread.name, p_process.name, p_parent_thread.name, p_parent_process.name, \
+             p_thread.upid, p_process.upid, p_parent_thread.upid, p_parent_process.upid, \
+             p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid, \
+             t.name, parent_t.name \
+           HAVING url IS NOT NULL \
+         ) \
+         SELECT \
+           id, \
+           ts, \
+           start_ms, \
+           end_ms, \
+           dur_ms, \
+           overlap_ms, \
+           pct_of_window, \
+           name, \
+           process_name, \
+           upid, \
+           pid, \
+           thread_name, \
+           url \
+         FROM resource_candidates ",
+    );
+    sql.push_str(&format!(
+        "ORDER BY overlap_ms DESC, dur_ms DESC, start_ms ASC LIMIT {row_limit}"
+    ));
     Ok(sql)
 }
 

@@ -510,7 +510,8 @@ impl PerfettoMcpServer {
     #[tool(
         name = "chrome_page_load_summary",
         description = "Summarize each page navigation in a Chrome trace: navigation id, \
-                       URL, FCP / LCP / DCL / load timings in ms. Read-only.\n\
+                       URL, raw boundary timestamps, FCP / LCP / DCL / load timings \
+                       in ms. Read-only.\n\
                        \n\
                        Use when: comparing page-load timings across navigations, finding \
                        slow loads, baselining web-vitals before/after a change. Prefer \
@@ -548,6 +549,74 @@ impl PerfettoMcpServer {
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page load summary", e))?;
         format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
+    }
+
+    #[tool(
+        name = "chrome_page_load_resource_hotspots",
+        description = "Rank resource/request Chrome slices with URL attribution inside a \
+                       page-load or raw timestamp window: id, ts, start_ms, end_ms, \
+                       dur_ms, overlap_ms, pct_of_window, name, process_name, upid, \
+                       pid, thread_name, url. Read-only.\n\
+                       \n\
+                       Use when: FCP/load is slow and you need to distinguish resource \
+                       request wall time from renderer main-thread `ResourceLoad*` \
+                       slices. Typical flow: `chrome_page_load_summary` → this tool → \
+                       `chrome_main_thread_hotspots` for post-resource script work.\n\
+                       \n\
+                       Don't use for: non-Chrome traces (will error) or a complete HAR; \
+                       this is a trace-slice hotspot view over URL-bearing resource/request \
+                       work such as NetworkService `GetResource` / `URLLoader` spans. It \
+                       retains thread, process, and async-track spans where Perfetto exposes \
+                       enough context, while excluding page-load lifecycle/metrics slices.\n\
+                       \n\
+                       Parameters (all optional): `page_load_id` / `navigation_id` / \
+                       `phase` use the same semantics as `chrome_main_thread_hotspots`; \
+                       id without phase defaults to `navigation_to_fcp`, and phase-only \
+                       uses the latest page load. `start_ts_ns` / `end_ts_ns` are raw ns \
+                       bounds and AND with the page-load window. `min_dur_ms` defaults \
+                       to 50; `limit` defaults to 100 and caps at 5000; \
+                       `max_string_len` caps string cells.\n\
+                       \n\
+                       Output: metadata-first JSON preserving `columns` / `rows`; \
+                       `truncated=true` means the row cap was reached; \
+                       `string_truncated=true` means cell text was shortened.\n\
+                       \n\
+                       Empty result: no URL-bearing resource/request slices matched the \
+                       selected window or the trace lacks that instrumentation.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn chrome_page_load_resource_hotspots(
+        &self,
+        Parameters(params): Parameters<ChromePageLoadResourceHotspotsParams>,
+    ) -> Result<String, String> {
+        let client = self.client_for_current().await?;
+        ensure_chrome_trace(&client, "Chrome page-load resource hotspots").await?;
+        let sql = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: params.page_load_id,
+                navigation_id: params.navigation_id,
+                phase: params.phase,
+                start_ts_ns: params.start_ts_ns,
+                end_ts_ns: params.end_ts_ns,
+            },
+            min_dur_ms: params.min_dur_ms,
+            limit: params.limit,
+        })
+        .map_err(|e| e.to_string())?;
+        let table = client
+            .query(&sql)
+            .await
+            .map_err(|e| format_chrome_tool_error("Chrome page-load resource hotspots", e))?;
+        format_chrome_tool_response(
+            table,
+            chrome_hotspots_effective_limit(params.limit),
+            params.max_string_len,
+        )
     }
 
     #[tool(
@@ -2087,6 +2156,7 @@ fn recommended_tools(trace_profile: &str) -> Vec<String> {
     let tools = match trace_profile {
         "chrome" => [
             "chrome_page_load_summary",
+            "chrome_page_load_resource_hotspots",
             "chrome_scroll_jank_summary",
             "chrome_main_thread_hotspots",
             "chrome_web_content_interactions",
@@ -3173,6 +3243,7 @@ mod tests {
             names,
             vec![
                 "chrome_main_thread_hotspots",
+                "chrome_page_load_resource_hotspots",
                 "chrome_page_load_summary",
                 "chrome_scroll_jank_summary",
                 "chrome_startup_summary",
@@ -3459,6 +3530,30 @@ mod tests {
             assert!(err.contains("list_stdlib_modules"), "got: {err}");
 
             let r = server
+                .chrome_page_load_resource_hotspots(Parameters(
+                    ChromePageLoadResourceHotspotsParams {
+                        page_load_id: None,
+                        navigation_id: None,
+                        phase: None,
+                        start_ts_ns: None,
+                        end_ts_ns: None,
+                        min_dur_ms: None,
+                        limit: None,
+                        max_string_len: None,
+                    },
+                ))
+                .await;
+            let err = r
+                .map(|_| ())
+                .expect_err("chrome_page_load_resource_hotspots: preflight must reject");
+            assert!(
+                err.contains("Chrome page-load resource hotspots"),
+                "got: {err}"
+            );
+            assert!(err.contains("Chrome-family trace"), "got: {err}");
+            assert!(err.contains("list_stdlib_modules"), "got: {err}");
+
+            let r = server
                 .chrome_main_thread_hotspots(Parameters(ChromeMainThreadHotspotsParams {
                     process_name: None,
                     pid: None,
@@ -3506,6 +3601,53 @@ mod tests {
             );
             assert!(err.contains("Chrome-family trace"), "got: {err}");
             assert!(err.contains("list_stdlib_modules"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn list_tables_response_is_not_contaminated_by_previous_tool_call() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        runtime.block_on(async {
+            let manager = Arc::new(TraceProcessorManager::new_with_starting_port(1, 19_031));
+            let server = PerfettoMcpServer::new(manager);
+            server
+                .load_trace(Parameters(LoadTraceParams {
+                    path: "tests/fixtures/page_loads.pftrace".to_owned(),
+                }))
+                .await
+                .expect("load_trace must succeed");
+
+            let page_load_response = server
+                .chrome_page_load_summary(Parameters(ChromeTraceParams {
+                    max_string_len: None,
+                }))
+                .await
+                .expect("page-load summary must succeed");
+            assert!(
+                page_load_response.contains("\"columns\""),
+                "sanity-check prior chrome tool response shape: {page_load_response}",
+            );
+
+            let list_tables_response = server
+                .list_tables(Parameters(ListTablesParams {
+                    pattern: Some("chrome*".to_owned()),
+                }))
+                .await
+                .expect("list_tables must succeed after a chrome tool call");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&list_tables_response).expect("valid JSON");
+            assert!(
+                parsed.get("names").and_then(|v| v.as_array()).is_some(),
+                "list_tables must return its own names shape, got: {list_tables_response}",
+            );
+            assert!(
+                parsed.get("columns").is_none(),
+                "list_tables must not return a previous table-shaped response: {list_tables_response}",
+            );
         });
     }
 
@@ -3619,6 +3761,20 @@ mod tests {
     }
 
     #[test]
+    fn chrome_page_load_resource_hotspots_params_accepts_stringified_numerics() {
+        let p: ChromePageLoadResourceHotspotsParams = serde_json::from_str(
+            r#"{"navigation_id": "7", "start_ts_ns": "100", "end_ts_ns": "200", "min_dur_ms": "50", "limit": "30", "max_string_len": "260"}"#,
+        )
+        .expect("stringified numerics must deserialize");
+        assert_eq!(p.navigation_id, Some(7));
+        assert_eq!(p.start_ts_ns, Some(100));
+        assert_eq!(p.end_ts_ns, Some(200));
+        assert_eq!(p.min_dur_ms, Some(50.0));
+        assert_eq!(p.limit, Some(30));
+        assert_eq!(p.max_string_len, Some(260));
+    }
+
+    #[test]
     fn chrome_main_thread_hotspots_params_accept_navigation_id() {
         let p: ChromeMainThreadHotspotsParams =
             serde_json::from_str(r#"{"navigation_id": "7", "phase": "dcl_to_fcp"}"#)
@@ -3643,69 +3799,89 @@ mod tests {
     #[test]
     fn schema_for_chrome_hotspots_advertises_strict_numeric_types() {
         let server = test_server();
-        let tool = server
-            .tool_router
-            .list_all()
-            .into_iter()
-            .find(|t| t.name == "chrome_main_thread_hotspots")
-            .expect("tool must exist");
-        let schema = serde_json::to_value(&tool.input_schema).unwrap();
-        let props = schema
-            .get("properties")
-            .and_then(|v| v.as_object())
-            .expect("input schema must have a `properties` object");
-        // Each numeric field must advertise its simple type — never a union
-        // with "string", never an `anyOf`. The lenient deserializer accepts
-        // strings server-side; the schema is for advertising strict types
-        // to well-behaved LLMs.
-        let strict_pairs: &[(&str, &str)] = &[
-            ("pid", "integer"),
-            ("upid", "integer"),
-            ("page_load_id", "integer"),
-            ("navigation_id", "integer"),
-            ("start_ts_ns", "integer"),
-            ("end_ts_ns", "integer"),
-            ("min_dur_ms", "number"),
-            ("limit", "integer"),
-            ("max_string_len", "integer"),
-        ];
-        for (field, expected_type) in strict_pairs {
-            let prop = props
-                .get(*field)
-                .unwrap_or_else(|| panic!("`{field}` field missing from schema"));
-            // The field is `Option<T>`, so the schema is either
-            // `{"type": ["<expected_type>", "null"], ...}` (with null
-            // explicit) or carries the type via a single string. Both shapes
-            // must NOT include "string", and must NOT use anyOf.
-            assert!(
-                prop.get("anyOf").is_none(),
-                "`{field}` schema must not use anyOf: {prop}",
-            );
-            let ty = prop
-                .get("type")
-                .unwrap_or_else(|| panic!("`{field}` schema missing `type`: {prop}"));
-            let advertises_string = match ty {
-                serde_json::Value::String(s) => s == "string",
-                serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some("string")),
-                _ => false,
-            };
-            assert!(
-                !advertises_string,
-                "`{field}` schema must not advertise string variant: {prop}",
-            );
-            // Sanity-check that the strict type IS present (not just
-            // missing string).
-            let advertises_expected = match ty {
-                serde_json::Value::String(s) => s == *expected_type,
-                serde_json::Value::Array(arr) => {
-                    arr.iter().any(|v| v.as_str() == Some(*expected_type))
-                }
-                _ => false,
-            };
-            assert!(
-                advertises_expected,
-                "`{field}` schema must advertise `{expected_type}`: {prop}",
-            );
+        for (tool_name, strict_pairs) in [
+            (
+                "chrome_main_thread_hotspots",
+                vec![
+                    ("pid", "integer"),
+                    ("upid", "integer"),
+                    ("page_load_id", "integer"),
+                    ("navigation_id", "integer"),
+                    ("start_ts_ns", "integer"),
+                    ("end_ts_ns", "integer"),
+                    ("min_dur_ms", "number"),
+                    ("limit", "integer"),
+                    ("max_string_len", "integer"),
+                ],
+            ),
+            (
+                "chrome_page_load_resource_hotspots",
+                vec![
+                    ("page_load_id", "integer"),
+                    ("navigation_id", "integer"),
+                    ("start_ts_ns", "integer"),
+                    ("end_ts_ns", "integer"),
+                    ("min_dur_ms", "number"),
+                    ("limit", "integer"),
+                    ("max_string_len", "integer"),
+                ],
+            ),
+        ] {
+            let tool = server
+                .tool_router
+                .list_all()
+                .into_iter()
+                .find(|t| t.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} tool must exist"));
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            let props = schema
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .expect("input schema must have a `properties` object");
+            // Each numeric field must advertise its simple type — never a union
+            // with "string", never an `anyOf`. The lenient deserializer accepts
+            // strings server-side; the schema is for advertising strict types
+            // to well-behaved LLMs.
+            for (field, expected_type) in strict_pairs {
+                let prop = props
+                    .get(field)
+                    .unwrap_or_else(|| panic!("`{field}` field missing from schema"));
+                // The field is `Option<T>`, so the schema is either
+                // `{"type": ["<expected_type>", "null"], ...}` (with null
+                // explicit) or carries the type via a single string. Both shapes
+                // must NOT include "string", and must NOT use anyOf.
+                assert!(
+                    prop.get("anyOf").is_none(),
+                    "`{field}` schema must not use anyOf: {prop}",
+                );
+                let ty = prop
+                    .get("type")
+                    .unwrap_or_else(|| panic!("`{field}` schema missing `type`: {prop}"));
+                let advertises_string = match ty {
+                    serde_json::Value::String(s) => s == "string",
+                    serde_json::Value::Array(arr) => {
+                        arr.iter().any(|v| v.as_str() == Some("string"))
+                    }
+                    _ => false,
+                };
+                assert!(
+                    !advertises_string,
+                    "`{field}` schema must not advertise string variant: {prop}",
+                );
+                // Sanity-check that the strict type IS present (not just
+                // missing string).
+                let advertises_expected = match ty {
+                    serde_json::Value::String(s) => s == expected_type,
+                    serde_json::Value::Array(arr) => {
+                        arr.iter().any(|v| v.as_str() == Some(expected_type))
+                    }
+                    _ => false,
+                };
+                assert!(
+                    advertises_expected,
+                    "`{field}` schema must advertise `{expected_type}`: {prop}",
+                );
+            }
         }
     }
 
@@ -4042,7 +4218,7 @@ mod tests {
             "got: {sql}"
         );
         assert!(
-            sql.contains("SELECT navigation_start_ts AS start_ts, fcp_ts AS end_ts"),
+            sql.contains("navigation_start_ts AS start_ts") && sql.contains("fcp_ts AS end_ts"),
             "page_load_id without phase must default to navigation_to_fcp, got: {sql}",
         );
         assert!(
@@ -4066,7 +4242,7 @@ mod tests {
         })
         .expect("navigation-window builder must succeed");
         assert!(
-            sql.contains("SELECT navigation_start_ts AS start_ts, fcp_ts AS end_ts"),
+            sql.contains("navigation_start_ts AS start_ts") && sql.contains("fcp_ts AS end_ts"),
             "navigation_id without phase must default to navigation_to_fcp, got: {sql}",
         );
         assert!(
@@ -4087,7 +4263,8 @@ mod tests {
         })
         .expect("phase-only builder must succeed");
         assert!(
-            sql.contains("SELECT dom_content_loaded_event_ts AS start_ts, fcp_ts AS end_ts"),
+            sql.contains("dom_content_loaded_event_ts AS start_ts")
+                && sql.contains("fcp_ts AS end_ts"),
             "dcl_to_fcp phase must select DCL→FCP window, got: {sql}",
         );
         assert!(
@@ -4269,6 +4446,192 @@ mod tests {
             err.to_string().contains("limit"),
             "error must mention limit, got: {err}",
         );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_hotspots_sql_defaults_to_resource_slice_scan() {
+        let sql = chrome_page_load_resource_hotspots_sql(
+            ChromePageLoadResourceHotspotsFilters::default(),
+        )
+        .expect("resource builder must succeed");
+        assert!(
+            sql.contains("WITH resource_candidates AS"),
+            "default SQL must still use a CTE for result shaping, got: {sql}",
+        );
+        assert!(
+            !sql.contains("chrome.page_loads"),
+            "no-window resource SQL must not include page-loads, got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE s.dur >= 50000000"),
+            "default resource threshold must be 50 ms, got: {sql}",
+        );
+        assert!(
+            sql.contains("FROM slice s LEFT JOIN track tr ON s.track_id = tr.id"),
+            "resource SQL must retain non-thread-track slices before adding context, got: {sql}",
+        );
+        assert!(
+            sql.contains("LEFT JOIN process_track pt ON s.track_id = pt.id"),
+            "resource SQL must include process-track slices, got: {sql}",
+        );
+        assert!(
+            sql.contains("LEFT JOIN process_track parent_pt ON tr.parent_id = parent_pt.id"),
+            "resource SQL must include async tracks parented by process tracks, got: {sql}",
+        );
+        assert!(
+            sql.contains("COALESCE(t.name, parent_t.name) AS thread_name"),
+            "resource SQL must expose nullable thread context for async/process tracks, got: {sql}",
+        );
+        assert!(
+            sql.contains("HAVING url IS NOT NULL"),
+            "resource tool must suppress URL-less wrapper rows, got: {sql}",
+        );
+        assert!(
+            sql.contains("ORDER BY overlap_ms DESC, dur_ms DESC, start_ms ASC LIMIT 100"),
+            "default resource limit/order must be stable, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_hotspots_sql_excludes_lifecycle_load_slices() {
+        let sql = chrome_page_load_resource_hotspots_sql(
+            ChromePageLoadResourceHotspotsFilters::default(),
+        )
+        .expect("resource builder must succeed");
+        assert!(
+            !sql.contains("s.name GLOB '*Load*'"),
+            "resource matching must not admit every Load-named lifecycle slice, got: {sql}",
+        );
+        assert!(
+            sql.contains("s.name GLOB '*URLLoader*'"),
+            "resource matching must keep concrete URLLoader spans, got: {sql}",
+        );
+        for excluded in [
+            "*PageLoadMetrics*",
+            "*DidCommitProvisionalLoad*",
+            "*DidStartProvisionalLoad*",
+            "*DidStopLoading*",
+            "*DidFinishLoad*",
+        ] {
+            assert!(
+                sql.contains(excluded),
+                "resource SQL must explicitly exclude lifecycle pattern {excluded}, got: {sql}",
+            );
+        }
+    }
+
+    #[test]
+    fn chrome_page_load_resource_hotspots_sql_with_page_load_window_uses_overlap() {
+        let sql = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(7),
+                phase: Some(ChromePageLoadPhase::DclToFcp),
+                ..Default::default()
+            },
+            min_dur_ms: Some(0.0),
+            limit: Some(25),
+        })
+        .expect("resource window builder must succeed");
+        assert!(
+            sql.contains("INCLUDE PERFETTO MODULE chrome.page_loads;"),
+            "windowed SQL must include page-loads, got: {sql}",
+        );
+        assert!(
+            sql.contains("dom_content_loaded_event_ts AS start_ts, fcp_ts AS end_ts"),
+            "dcl_to_fcp phase must select DCL→FCP, got: {sql}",
+        );
+        assert!(
+            sql.contains("WHERE id = 7 "),
+            "page_load_id must match only chrome_page_loads.id, got: {sql}",
+        );
+        assert!(
+            !sql.contains("navigation_id = 7"),
+            "page_load_id must not also match navigation_id, got: {sql}",
+        );
+        assert!(
+            sql.contains("s.ts + s.dur > rw.start_ts"),
+            "resource windows must include overlapping slices, got: {sql}",
+        );
+        assert!(
+            sql.contains("s.ts < rw.end_ts"),
+            "resource windows must bound overlap by end_ts, got: {sql}",
+        );
+        assert!(
+            sql.contains("AND rw.end_ts > rw.start_ts"),
+            "resource windows must reject reversed page-load phases before overlap math, got: {sql}",
+        );
+        assert!(
+            sql.contains("pct_of_window"),
+            "resource rows must expose window percentage, got: {sql}",
+        );
+        assert!(
+            sql.contains("LIMIT 25"),
+            "explicit limit must be honored, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_hotspots_sql_ands_raw_bounds_with_phase_window() {
+        let sql = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(7),
+                phase: Some(ChromePageLoadPhase::NavigationToFcp),
+                start_ts_ns: Some(1000),
+                end_ts_ns: Some(2000),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("resource window builder must succeed");
+        assert!(
+            sql.contains("MAX(rw.start_ts, 1000)"),
+            "raw start_ts_ns must be intersected with phase start, got: {sql}",
+        );
+        assert!(
+            sql.contains("MIN(rw.end_ts, 2000)"),
+            "raw end_ts_ns must be intersected with phase end, got: {sql}",
+        );
+        assert!(
+            sql.contains("s.ts + s.dur > MAX(rw.start_ts, 1000)"),
+            "overlap lower predicate must use effective start, got: {sql}",
+        );
+        assert!(
+            sql.contains("s.ts < MIN(rw.end_ts, 2000)"),
+            "overlap upper predicate must use effective end, got: {sql}",
+        );
+        assert!(
+            sql.contains("AND MIN(rw.end_ts, 2000) > MAX(rw.start_ts, 1000)"),
+            "effective window must reject empty/reversed intersections, got: {sql}",
+        );
+        assert!(
+            sql.contains("/ (MIN(rw.end_ts, 2000) - MAX(rw.start_ts, 1000))"),
+            "pct_of_window denominator must use effective window duration, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_hotspots_sql_validates_shared_window_params() {
+        let err = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(1),
+                navigation_id: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect_err("page_load_id plus navigation_id must error");
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+
+        let err = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
+            window: ChromePageLoadWindowFilters {
+                start_ts_ns: Some(2000),
+                end_ts_ns: Some(1000),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect_err("end before start must error");
+        assert!(err.to_string().contains("end_ts_ns"), "got: {err}");
     }
 
     /// list_threads_in_process now accepts upid OR process_name. With neither

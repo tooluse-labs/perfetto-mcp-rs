@@ -186,7 +186,8 @@ it in place.
 | `list_threads_in_process` | List threads under a process name (up to 2000) |
 | `slice_descendants_breakdown` | Summarize child slices under long slice ids without hand-writing recursive CTEs |
 | `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame; metadata flags row/string truncation (Chrome trace) |
-| `chrome_page_load_summary` | Page loads: URL, FCP, LCP, DCL, load timings in ms; metadata flags row/string truncation (Chrome trace) |
+| `chrome_page_load_summary` | Page loads: URL, raw boundary timestamps, FCP, LCP, DCL, load timings in ms; metadata flags row/string truncation (Chrome trace) |
+| `chrome_page_load_resource_hotspots` | URL-bearing resource/request slices on thread, process, and async tracks ranked by page-load/window overlap, with process/thread identity where available; metadata flags row/string truncation (Chrome trace) |
 | `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts, upid/pid, cpu_pct, and optional page-load/time-window filters; metadata flags row/string truncation (Chrome trace) |
 | `chrome_startup_summary` | Browser startup events and time-to-first-visible-content; metadata flags row/string truncation (Chrome trace) |
 | `chrome_web_content_interactions` | Web content interactions (clicks, taps, INP) ranked by duration; metadata flags row/string truncation (Chrome trace) |
@@ -214,10 +215,12 @@ Typical flow depends on trace type:
 
 - **Chrome traces**: `load_trace` → dedicated `chrome_*` tools
   (`chrome_scroll_jank_summary`, `chrome_page_load_summary`,
-  `chrome_main_thread_hotspots`, `chrome_startup_summary`,
-  `chrome_web_content_interactions`) → `execute_sql` for deeper analysis
-  on the returned rows. Use `slice_descendants_breakdown` on a long task `id`
-  when you need its child-slice breakdown.
+  `chrome_page_load_resource_hotspots`, `chrome_main_thread_hotspots`,
+  `chrome_startup_summary`, `chrome_web_content_interactions`) →
+  `execute_sql` for deeper analysis on the returned rows. For slow FCP/load,
+  check resource hotspots before interpreting main-thread `ResourceLoad*`
+  slices as full request time. Use `slice_descendants_breakdown` on a long task
+  `id` when you need its child-slice breakdown.
 - **Other traces**: `load_trace` → `list_tables` / `list_table_structure`
   for schema discovery → `execute_sql` for queries. Call
   `list_stdlib_modules` or read `resource://perfetto-mcp/stdlib-quickref`

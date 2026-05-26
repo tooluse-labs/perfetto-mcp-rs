@@ -66,7 +66,10 @@ Last updated: 2026-05-26
   一次 `ambiguous column name: depth`。错误被自动修复，但这是稳定、可工具化
   的重复模式。
 - 从 `chrome_page_load_summary` 到“哪个资源或导航阶段卡住”仍需要大量手写
-  SQL。现有 Chrome 工具能发现 FCP 慢，但缺少 page-load 二级细分入口。
+  SQL。已新增 `chrome_page_load_resource_hotspots` 将 URL-bearing
+  resource-like slice 按 page-load/raw timestamp 窗口 overlap 排序，覆盖
+  trace5 中 `EnhanceConfigManager::GetResource` / URL request 这类关键路径。
+  后续更细的 frame/script 归属仍可作为 P1/P2 工具补强。
 - `chrome_main_thread_hotspots` 在 v0.15.6 后续补强中增加了 `upid` / `pid`
   输出和 `page_load_id` / `phase` / `start_ts_ns` / `end_ts_ns` 窗口过滤。该项
   缓解了日志里反复手写 `ts >= navigation_start`、`ts >= fcp_ts`、`ms_from_nav`
@@ -78,7 +81,7 @@ Last updated: 2026-05-26
 
 - `execute_sql` 输出塑形应排在上下文优化的第一梯队。它不仅节省 token，也能
   让 agent 明确知道结果是否被截断，而不是依赖客户端 UI 的 `...`。
-- 需要新增一个小而强的 slice 子树分析工具，避免递归 SQL 重写和 alias 错误。
+- 已新增一个小而强的 slice 子树分析工具，避免递归 SQL 重写和 alias 错误。
 - Chrome page-load 场景需要二级工具：页面加载慢时，直接汇总导航阻塞、资源
   请求、Renderer 长任务和关键 URL，而不是让 agent 从原始 `slice` / `args`
   反复试探。

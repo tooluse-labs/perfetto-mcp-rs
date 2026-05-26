@@ -2,6 +2,11 @@
 
 ## perfetto-mcp-rs 0.x Changes
 
+### Unreleased
+
+- **New `chrome_page_load_resource_hotspots` tool for slow FCP/load analysis.** It ranks URL-bearing resource/request slices by overlap with a page-load phase or raw timestamp window, carrying start/end/duration/overlap ms, `pct_of_window`, process/thread identity where available, and URL. The query retains thread, process, and async-track spans while excluding page-load lifecycle/metrics slices, turning the successful trace5 SQL path (`GetResource` / `URLLoader`-style wall-time blockers before script execution) into a first-class tool so agents do not have to infer resource latency from renderer main-thread `ResourceLoad*` slices.
+- **`chrome_page_load_summary` now exposes raw boundary timestamps.** Rows include `navigation_id`, `fcp_ts`, `dom_content_loaded_event_ts`, and `load_event_ts` in addition to existing ms timing fields, reducing follow-up schema discovery and wrong-column guesses when agents need to write custom phase queries.
+
 ### [0.15.7](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.7) (May 26, 2026)
 
 - **`chrome_main_thread_hotspots` now carries process identity in every row.** Results include `upid` and OS `pid` alongside `process_name`, so agents can distinguish same-named Renderer processes in multi-renderer Chrome traces instead of merging unrelated long tasks into one culprit.

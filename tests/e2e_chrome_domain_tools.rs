@@ -19,10 +19,14 @@
 
 use std::path::Path;
 
-use perfetto_mcp_rs::params::ChromeMainThreadHotspotsFilters;
+use perfetto_mcp_rs::params::{
+    ChromeMainThreadHotspotsFilters, ChromePageLoadResourceHotspotsFilters,
+    ChromePageLoadWindowFilters,
+};
 use perfetto_mcp_rs::sql_templates::{
-    chrome_main_thread_hotspots_sql, CHROME_PAGE_LOAD_SUMMARY_SQL, CHROME_SCROLL_JANK_SUMMARY_SQL,
-    CHROME_STARTUP_SUMMARY_SQL, CHROME_TRACE_PREFLIGHT_SQL, CHROME_WEB_CONTENT_INTERACTIONS_SQL,
+    chrome_main_thread_hotspots_sql, chrome_page_load_resource_hotspots_sql,
+    CHROME_PAGE_LOAD_SUMMARY_SQL, CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_SQL,
+    CHROME_TRACE_PREFLIGHT_SQL, CHROME_WEB_CONTENT_INTERACTIONS_SQL,
 };
 use perfetto_mcp_rs::tp_manager::TraceProcessorManager;
 
@@ -87,11 +91,69 @@ fn e2e_chrome_page_load_summary_against_fixture() {
         );
         for i in 0..table.len() {
             assert!(table.cell(i, "id").is_some(), "row {i} missing id column",);
+            assert!(
+                table.cell(i, "navigation_id").is_some(),
+                "row {i} missing navigation_id column",
+            );
             assert!(table.cell(i, "url").is_some(), "row {i} missing url column",);
             assert!(
                 table.cell(i, "navigation_start_ts").is_some(),
                 "row {i} missing navigation_start_ts column",
             );
+            assert!(
+                table.cell(i, "fcp_ts").is_some(),
+                "row {i} missing fcp_ts column",
+            );
+            assert!(
+                table.cell(i, "dom_content_loaded_event_ts").is_some(),
+                "row {i} missing dom_content_loaded_event_ts column",
+            );
+            assert!(
+                table.cell(i, "load_event_ts").is_some(),
+                "row {i} missing load_event_ts column",
+            );
+        }
+    });
+}
+
+#[test]
+fn e2e_chrome_page_load_resource_hotspots_sql_runs_cleanly() {
+    // Weak assertion: SQL executes and preserves the advertised shape when
+    // resource-like URL-bearing slices exist. The bundled fixture is primarily
+    // a page-load boundary fixture, so row count is not asserted.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = TraceProcessorManager::new_with_starting_port(1, 19_251);
+        let trace = Path::new("tests/fixtures/page_loads.pftrace");
+
+        let client = manager.get_client(trace).await.expect("spawn tp_shell");
+        let sql = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(1),
+                phase: Some(perfetto_mcp_rs::params::ChromePageLoadPhase::NavigationToFcp),
+                ..Default::default()
+            },
+            min_dur_ms: Some(0.0),
+            ..Default::default()
+        })
+        .expect("resource hotspots SQL builder must succeed");
+        let table = client
+            .query(&sql)
+            .await
+            .expect("chrome page-load resource hotspots query must succeed");
+
+        for i in 0..table.len() {
+            assert!(table.cell(i, "id").is_some(), "row {i} missing id");
+            assert!(table.cell(i, "ts").is_some(), "row {i} missing ts");
+            assert!(
+                table.cell(i, "overlap_ms").is_some(),
+                "row {i} missing overlap_ms",
+            );
+            assert!(table.cell(i, "url").is_some(), "row {i} missing url");
         }
     });
 }

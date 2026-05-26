@@ -159,28 +159,30 @@
   - 无参数调用保持兼容。
   - LLM 可用 `query: "binder"` 或 `domain: "android"` 减少无关返回。
 
-### T1.4 实现 Chrome page-load 二级分析工具
+### T1.4 实现 Chrome page-load 二级分析工具（部分落地）
 
-- **候选名称：** `chrome_page_load_detail` 或
-  `chrome_resource_loading_summary`。
+- **已落地名称：** `chrome_page_load_resource_hotspots`。
+- **后续候选名称：** `chrome_page_load_detail` 或
+  `chrome_script_execution_hotspots`。
 - **动机：** `chrome_page_load_summary` 能发现 FCP / load 慢，但真实会话中 agent
   仍需大量手写 SQL 才定位到 `EnhanceConfigManager::GetResource` / URL request
   链路和关键 JS 文件。
 - **输入：**
-  - `navigation_id` 或 `page_load_id`。
-  - 可选 `url_substring`，用于聚焦特定站点或资源族。
-  - `start_ms` / `end_ms` 或 `phase`，支持导航开始、DCL、FCP、load 后窗口。
-  - `limit`。
+  - 已支持 `navigation_id` 或 `page_load_id`，且两者互斥。
+  - 已支持 `phase`：`navigation_to_fcp`、`navigation_to_load`、`dcl_to_fcp`、
+    `fcp_to_load`。
+  - 已支持 raw `start_ts_ns` / `end_ts_ns` 和 `limit`。
+  - 未支持 `url_substring`；需要时可后续补。
 - **输出：**
-  - navigation 关键时间点：DCL、FCP、load、LCP（如有）。
-  - Browser 主线程导航阻塞摘要。
-  - Renderer 主线程长任务摘要（可复用 `chrome_main_thread_hotspots` 的
-    `page_load_id` / `phase` 窗口过滤能力）。
-  - 资源请求摘要：URL / 文件名、first_ms、last_end_ms、max_ms、total_ms、
-    关键 slice 名称。
+  - `chrome_page_load_summary` 已补 raw boundary timestamps：
+    `navigation_id`、`fcp_ts`、`dom_content_loaded_event_ts`、`load_event_ts`。
+  - 资源请求热点：`id`、`ts`、`start_ms`、`end_ms`、`dur_ms`、
+    `overlap_ms`、`pct_of_window`、slice 名称、进程/线程归属、URL。
+  - Renderer 主线程长任务摘要继续复用 `chrome_main_thread_hotspots` 的
+    `page_load_id` / `phase` 窗口过滤能力。
   - 输出应保留行级证据，不直接写死自然语言根因结论。
 - **验收：**
-  - 能把“FCP 10.7s”后续分析压缩为一次或少数几次工具调用。
+  - 能把“FCP 10.7s”后续资源分析压缩为一次工具调用。
   - 对无资源 URL 的 trace 返回空资源段并保留 navigation / long task 段。
   - URL 和 headers 默认保留诊断可用的完整结构；敏感值默认脱敏，截断只作为显式 opt-in。
 
@@ -240,7 +242,7 @@
 2. T0.1 实现 `inspect_trace` / `trace_overview`。
 3. T0.4 实现 `slice_descendants_breakdown`。（已落地 v0.15.6-dev）
 4. T0.3 建立上下文预算测试。
-5. T1.4 实现 Chrome page-load 二级分析工具。
+5. T1.4 实现 Chrome page-load 二级分析工具。（资源热点已部分落地）
 6. T1.1 实现 `stdlib-quickref` Resource。
 7. T1.2 压缩 instructions 和 descriptions。
 8. T1.3 增强 `list_stdlib_modules` 筛选。
