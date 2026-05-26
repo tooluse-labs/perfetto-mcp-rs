@@ -553,36 +553,12 @@ impl PerfettoMcpServer {
 
     #[tool(
         name = "chrome_page_load_resource_hotspots",
-        description = "Rank resource/request Chrome slices with URL attribution inside a \
-                       page-load or raw timestamp window: id, ts, start_ms, end_ms, \
-                       dur_ms, overlap_ms, pct_of_window, name, process_name, upid, \
-                       pid, thread_name, url. Read-only.\n\
-                       \n\
-                       Use when: FCP/load is slow and you need to distinguish resource \
-                       request wall time from renderer main-thread `ResourceLoad*` \
-                       slices. Typical flow: `chrome_page_load_summary` → this tool → \
-                       `chrome_main_thread_hotspots` for post-resource script work.\n\
-                       \n\
-                       Don't use for: non-Chrome traces (will error) or a complete HAR; \
-                       this is a trace-slice hotspot view over URL-bearing resource/request \
-                       work such as NetworkService `GetResource` / `URLLoader` spans. It \
-                       retains thread, process, and async-track spans where Perfetto exposes \
-                       enough context, while excluding page-load lifecycle/metrics slices.\n\
-                       \n\
-                       Parameters (all optional): `page_load_id` / `navigation_id` / \
-                       `phase` use the same semantics as `chrome_main_thread_hotspots`; \
-                       id without phase defaults to `navigation_to_fcp`, and phase-only \
-                       uses the latest page load. `start_ts_ns` / `end_ts_ns` are raw ns \
-                       bounds and AND with the page-load window. `min_dur_ms` defaults \
-                       to 50; `limit` defaults to 100 and caps at 5000; \
-                       `max_string_len` caps string cells.\n\
-                       \n\
-                       Output: metadata-first JSON preserving `columns` / `rows`; \
-                       `truncated=true` means the row cap was reached; \
-                       `string_truncated=true` means cell text was shortened.\n\
-                       \n\
-                       Empty result: no URL-bearing resource/request slices matched the \
-                       selected window or the trace lacks that instrumentation.",
+        description = "Rank URL-bearing Chrome resource/request slices in a page-load/raw \
+                       window. Returns slice timing, overlap_ms/pct_of_window, \
+                       process/thread, URL. Use after `chrome_page_load_resource_summary` \
+                       to drill into the concrete Renderer/NetworkService/async slice \
+                       behind a slow URL. Filters: page_load_id/navigation_id/phase, raw \
+                       start/end ns, min_dur_ms default 50, limit, max_string_len.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -616,6 +592,60 @@ impl PerfettoMcpServer {
             table,
             chrome_hotspots_effective_limit(params.limit),
             params.max_string_len,
+        )
+    }
+
+    #[tool(
+        name = "chrome_page_load_resource_summary",
+        description = "URL-level Chrome resource/request summary for a page-load/raw \
+                       window. Returns URL key, slice/process/priority sets, \
+                       first/last/span, max_overlap_ms, summed_overlap_ms, \
+                       pct_of_window, example_slice_id, and attribution evidence. \
+                       Use before `chrome_page_load_resource_hotspots` for slow \
+                       FCP/load; rank by max overlap because summed overlap can \
+                       double-count layered slices.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn chrome_page_load_resource_summary(
+        &self,
+        Parameters(params): Parameters<ChromePageLoadResourceSummaryParams>,
+    ) -> Result<String, String> {
+        let client = self.client_for_current().await?;
+        ensure_chrome_trace(&client, "Chrome page-load resource summary").await?;
+        let window = ChromePageLoadWindowFilters {
+            page_load_id: params.page_load_id,
+            navigation_id: params.navigation_id,
+            phase: params.phase,
+            start_ts_ns: params.start_ts_ns,
+            end_ts_ns: params.end_ts_ns,
+        };
+        let sql = chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
+            window,
+            min_overlap_ms: params.min_overlap_ms,
+            url_grouping: params.url_grouping,
+            limit: params.limit,
+        })
+        .map_err(|e| e.to_string())?;
+        let evidence_sql =
+            chrome_page_load_resource_timing_evidence_sql(window).map_err(|e| e.to_string())?;
+        let evidence_table = client.query(&evidence_sql).await.map_err(|e| {
+            format_chrome_tool_error("Chrome page-load resource summary evidence", e)
+        })?;
+        let evidence = chrome_resource_timing_evidence_from_probe(&evidence_table);
+        let table = client
+            .query(&sql)
+            .await
+            .map_err(|e| format_chrome_tool_error("Chrome page-load resource summary", e))?;
+        format_chrome_resource_summary_response(
+            table,
+            chrome_hotspots_effective_limit(params.limit),
+            params.max_string_len,
+            evidence,
         )
     }
 
@@ -1235,6 +1265,33 @@ struct ChromeToolRowsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+struct ChromeResourceTimingEvidence {
+    attribution_scope: &'static str,
+    phase_breakdown: &'static str,
+    phase_breakdown_available: bool,
+    safe_conclusion: &'static str,
+    unsafe_inferences: Vec<&'static str>,
+    network_phase_slice_count: i64,
+    network_phase_arg_count: i64,
+    incomplete_resource_slice_count: i64,
+    incomplete_slices_excluded: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ChromeResourceSummaryRowsResponse {
+    columns: Vec<String>,
+    row_count: Option<usize>,
+    returned_rows: usize,
+    truncated: bool,
+    row_count_known: bool,
+    string_truncated: bool,
+    redacted: bool,
+    resource_timing_evidence: ChromeResourceTimingEvidence,
+    note: &'static str,
+    rows: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 struct SliceDescendantsAppliedFilters {
     min_dur_ms: f64,
     max_depth: u32,
@@ -1316,6 +1373,114 @@ fn format_chrome_tool_response_with_redaction(
         rows,
     })
     .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+fn format_chrome_resource_summary_response(
+    table: DecodedTable,
+    effective_limit: usize,
+    max_string_len: Option<u32>,
+    evidence: ChromeResourceTimingEvidence,
+) -> Result<String, String> {
+    format_chrome_resource_summary_response_with_redaction(
+        table,
+        effective_limit,
+        tool_max_string_len(max_string_len)?,
+        default_redact_strings(),
+        evidence,
+    )
+}
+
+fn format_chrome_resource_summary_response_with_redaction(
+    table: DecodedTable,
+    effective_limit: usize,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+    evidence: ChromeResourceTimingEvidence,
+) -> Result<String, String> {
+    let shape = ExecuteSqlOutputShape {
+        mode: ExecuteSqlOutputMode::FullRows,
+        active: true,
+        max_string_len,
+        redact_strings,
+    };
+    let returned_rows = table.rows.len();
+    let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+    serde_json::to_string(&ChromeResourceSummaryRowsResponse {
+        columns: table.columns,
+        row_count: None,
+        returned_rows,
+        truncated: effective_limit > 0 && returned_rows >= effective_limit,
+        row_count_known: false,
+        string_truncated,
+        redacted,
+        resource_timing_evidence: evidence,
+        note: CHROME_TOOL_SHAPING_NOTE,
+        rows,
+    })
+    .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+fn chrome_resource_timing_evidence_from_probe(
+    table: &DecodedTable,
+) -> ChromeResourceTimingEvidence {
+    let network_phase_slice_count =
+        decoded_table_i64_cell(table, "network_phase_slice_count").unwrap_or(0);
+    let network_phase_arg_count =
+        decoded_table_i64_cell(table, "network_phase_arg_count").unwrap_or(0);
+    let incomplete_resource_slice_count =
+        decoded_table_i64_cell(table, "incomplete_resource_slice_count").unwrap_or(0);
+    let phase_breakdown_available =
+        decoded_table_i64_cell(table, "phase_breakdown_available").unwrap_or(0) > 0;
+
+    if phase_breakdown_available {
+        ChromeResourceTimingEvidence {
+            attribution_scope: "url_lifecycle_span_with_phase_hints",
+            phase_breakdown: "phase_hints_present",
+            phase_breakdown_available: true,
+            safe_conclusion: "Summary rows rank URL lifecycle/request spans; phase-like trace signals exist, so inspect phase rows before assigning DNS/TLS/TTFB/download/cache cause.",
+            unsafe_inferences: vec![
+                "dns",
+                "tls",
+                "ttfb",
+                "download",
+                "cache",
+                "cdn",
+                "server_response",
+            ],
+            network_phase_slice_count,
+            network_phase_arg_count,
+            incomplete_resource_slice_count,
+            incomplete_slices_excluded: true,
+        }
+    } else {
+        ChromeResourceTimingEvidence {
+            attribution_scope: "url_lifecycle_span",
+            phase_breakdown: "absent",
+            phase_breakdown_available: false,
+            safe_conclusion: "These URLs have long resource/request lifecycle spans overlapping the selected window.",
+            unsafe_inferences: vec![
+                "dns",
+                "tls",
+                "ttfb",
+                "download",
+                "cache",
+                "cdn",
+                "server_response",
+            ],
+            network_phase_slice_count,
+            network_phase_arg_count,
+            incomplete_resource_slice_count,
+            incomplete_slices_excluded: true,
+        }
+    }
+}
+
+fn decoded_table_i64_cell(table: &DecodedTable, col: &str) -> Option<i64> {
+    table.cell(0, col).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+    })
 }
 
 fn slice_descendants_applied_filters(
@@ -2207,6 +2372,7 @@ fn recommended_tools(trace_profile: &str) -> Vec<String> {
     let tools = match trace_profile {
         "chrome" => [
             "chrome_page_load_summary",
+            "chrome_page_load_resource_summary",
             "chrome_page_load_resource_hotspots",
             "chrome_page_load_script_hotspots",
             "chrome_scroll_jank_summary",
@@ -2723,6 +2889,95 @@ mod tests {
         );
         assert_eq!(parsed["redacted"], json!(true));
         assert_eq!(parsed["string_truncated"], json!(false));
+    }
+
+    #[test]
+    fn resource_summary_response_carries_attribution_evidence_before_rows() {
+        let table = decoded_table(
+            &["url_key", "max_overlap_ms"],
+            vec![vec![json!("https://example.test/app.js"), json!(123.0)]],
+        );
+        let evidence = ChromeResourceTimingEvidence {
+            attribution_scope: "url_lifecycle_span",
+            phase_breakdown: "absent",
+            phase_breakdown_available: false,
+            safe_conclusion: "safe",
+            unsafe_inferences: vec!["dns", "ttfb"],
+            network_phase_slice_count: 0,
+            network_phase_arg_count: 0,
+            incomplete_resource_slice_count: 1,
+            incomplete_slices_excluded: true,
+        };
+
+        let response = format_chrome_resource_summary_response_with_redaction(
+            table,
+            DEFAULT_CHROME_TOOL_ROWS,
+            DEFAULT_TOOL_MAX_STRING_LEN,
+            false,
+            evidence,
+        )
+        .expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+        assert_json_key_order(&response, "\"resource_timing_evidence\":", "\"rows\":");
+        assert_eq!(
+            parsed["resource_timing_evidence"]["attribution_scope"],
+            json!("url_lifecycle_span")
+        );
+        assert_eq!(
+            parsed["resource_timing_evidence"]["phase_breakdown_available"],
+            json!(false)
+        );
+        assert_eq!(
+            parsed["resource_timing_evidence"]["unsafe_inferences"],
+            json!(["dns", "ttfb"])
+        );
+        assert_eq!(
+            parsed["resource_timing_evidence"]["incomplete_resource_slice_count"],
+            json!(1)
+        );
+        assert_eq!(
+            parsed["rows"],
+            json!([["https://example.test/app.js", 123.0]])
+        );
+    }
+
+    #[test]
+    fn resource_timing_evidence_probe_distinguishes_absent_and_present_phase_hints() {
+        let absent = decoded_table(
+            &[
+                "network_phase_slice_count",
+                "network_phase_arg_count",
+                "incomplete_resource_slice_count",
+                "phase_breakdown_available",
+            ],
+            vec![vec![json!(0), json!(0), json!(2), json!(0)]],
+        );
+        let absent_evidence = chrome_resource_timing_evidence_from_probe(&absent);
+        assert_eq!(absent_evidence.attribution_scope, "url_lifecycle_span");
+        assert_eq!(absent_evidence.phase_breakdown, "absent");
+        assert!(absent_evidence.unsafe_inferences.contains(&"download"));
+        assert_eq!(absent_evidence.incomplete_resource_slice_count, 2);
+
+        let present = decoded_table(
+            &[
+                "network_phase_slice_count",
+                "network_phase_arg_count",
+                "incomplete_resource_slice_count",
+                "phase_breakdown_available",
+            ],
+            vec![vec![json!(3), json!(1), json!(0), json!(1)]],
+        );
+        let present_evidence = chrome_resource_timing_evidence_from_probe(&present);
+        assert_eq!(
+            present_evidence.attribution_scope,
+            "url_lifecycle_span_with_phase_hints"
+        );
+        assert_eq!(present_evidence.phase_breakdown, "phase_hints_present");
+        assert!(present_evidence.phase_breakdown_available);
+        assert!(present_evidence.unsafe_inferences.contains(&"ttfb"));
+        assert_eq!(present_evidence.network_phase_slice_count, 3);
+        assert_eq!(present_evidence.network_phase_arg_count, 1);
     }
 
     #[test]
@@ -3296,6 +3551,7 @@ mod tests {
             vec![
                 "chrome_main_thread_hotspots",
                 "chrome_page_load_resource_hotspots",
+                "chrome_page_load_resource_summary",
                 "chrome_page_load_script_hotspots",
                 "chrome_page_load_summary",
                 "chrome_scroll_jank_summary",
@@ -3607,6 +3863,31 @@ mod tests {
             assert!(err.contains("list_stdlib_modules"), "got: {err}");
 
             let r = server
+                .chrome_page_load_resource_summary(Parameters(
+                    ChromePageLoadResourceSummaryParams {
+                        page_load_id: None,
+                        navigation_id: None,
+                        phase: None,
+                        start_ts_ns: None,
+                        end_ts_ns: None,
+                        min_overlap_ms: None,
+                        url_grouping: None,
+                        limit: None,
+                        max_string_len: None,
+                    },
+                ))
+                .await;
+            let err = r
+                .map(|_| ())
+                .expect_err("chrome_page_load_resource_summary: preflight must reject");
+            assert!(
+                err.contains("Chrome page-load resource summary"),
+                "got: {err}"
+            );
+            assert!(err.contains("Chrome-family trace"), "got: {err}");
+            assert!(err.contains("list_stdlib_modules"), "got: {err}");
+
+            let r = server
                 .chrome_page_load_script_hotspots(Parameters(ChromePageLoadScriptHotspotsParams {
                     process_name: None,
                     pid: None,
@@ -3853,6 +4134,24 @@ mod tests {
     }
 
     #[test]
+    fn chrome_page_load_resource_summary_params_accepts_stringified_numerics() {
+        let p: ChromePageLoadResourceSummaryParams = serde_json::from_str(
+            r#"{"navigation_id": "7", "start_ts_ns": "100", "end_ts_ns": "200", "min_overlap_ms": "50", "url_grouping": "without_query", "limit": "30", "max_string_len": "260"}"#,
+        )
+        .expect("stringified numerics must deserialize");
+        assert_eq!(p.navigation_id, Some(7));
+        assert_eq!(p.start_ts_ns, Some(100));
+        assert_eq!(p.end_ts_ns, Some(200));
+        assert_eq!(p.min_overlap_ms, Some(50.0));
+        assert_eq!(
+            p.url_grouping,
+            Some(ChromePageLoadResourceUrlGrouping::WithoutQuery)
+        );
+        assert_eq!(p.limit, Some(30));
+        assert_eq!(p.max_string_len, Some(260));
+    }
+
+    #[test]
     fn chrome_page_load_script_hotspots_params_accepts_stringified_numerics() {
         let p: ChromePageLoadScriptHotspotsParams = serde_json::from_str(
             r#"{"upid": "14", "navigation_id": "7", "start_ts_ns": "100", "end_ts_ns": "200", "min_total_ms": "20", "limit": "30", "max_string_len": "260"}"#,
@@ -3915,6 +4214,18 @@ mod tests {
                     ("start_ts_ns", "integer"),
                     ("end_ts_ns", "integer"),
                     ("min_dur_ms", "number"),
+                    ("limit", "integer"),
+                    ("max_string_len", "integer"),
+                ],
+            ),
+            (
+                "chrome_page_load_resource_summary",
+                vec![
+                    ("page_load_id", "integer"),
+                    ("navigation_id", "integer"),
+                    ("start_ts_ns", "integer"),
+                    ("end_ts_ns", "integer"),
+                    ("min_overlap_ms", "number"),
                     ("limit", "integer"),
                     ("max_string_len", "integer"),
                 ],
@@ -4739,6 +5050,127 @@ mod tests {
         })
         .expect_err("end before start must error");
         assert!(err.to_string().contains("end_ts_ns"), "got: {err}");
+    }
+
+    #[test]
+    fn chrome_page_load_resource_summary_sql_groups_by_url() {
+        let sql =
+            chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters::default())
+                .expect("resource summary builder must succeed");
+        assert!(
+            sql.contains("resource_rows AS"),
+            "summary SQL must add a URL-key shaping CTE, got: {sql}",
+        );
+        assert!(
+            sql.contains("url AS url_key"),
+            "default grouping must preserve full URL, got: {sql}",
+        );
+        assert!(
+            sql.contains("GROUP BY rr.url_key"),
+            "summary SQL must aggregate by URL key, got: {sql}",
+        );
+        assert!(
+            sql.contains("ROUND(MAX(rr.overlap_dur) / 1e6, 3) AS max_overlap_ms"),
+            "primary ranking metric must use per-URL max overlap, got: {sql}",
+        );
+        assert!(
+            sql.contains("ROUND(SUM(rr.overlap_dur) / 1e6, 3) AS summed_overlap_ms"),
+            "auxiliary summed metric must be explicit, got: {sql}",
+        );
+        assert!(
+            sql.contains("GROUP_CONCAT(DISTINCT rr.name) AS slice_names"),
+            "summary must preserve contributing slice names, got: {sql}",
+        );
+        assert!(
+            sql.contains("GROUP_CONCAT(DISTINCT rr.priority) AS priorities"),
+            "summary must expose resource priorities when present, got: {sql}",
+        );
+        assert!(
+            sql.contains("ORDER BY MAX(rr.overlap_dur) DESC"),
+            "summary must rank by max overlap instead of summed overlap, got: {sql}",
+        );
+        assert!(
+            sql.contains("HAVING MAX(rr.overlap_dur) >= 50000000"),
+            "default min_overlap_ms must be 50 ms, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_summary_sql_can_group_without_query() {
+        let sql = chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(7),
+                phase: Some(ChromePageLoadPhase::NavigationToFcp),
+                start_ts_ns: Some(1000),
+                end_ts_ns: Some(2000),
+                ..Default::default()
+            },
+            min_overlap_ms: Some(0.0),
+            url_grouping: Some(ChromePageLoadResourceUrlGrouping::WithoutQuery),
+            limit: Some(25),
+        })
+        .expect("resource summary window builder must succeed");
+        assert!(
+            sql.contains("CASE WHEN INSTR(url, '?') > 0"),
+            "without_query grouping must strip query strings, got: {sql}",
+        );
+        assert!(
+            sql.contains("MAX(rw.start_ts, 1000)"),
+            "raw start bound must AND with page-load window, got: {sql}",
+        );
+        assert!(
+            sql.contains("MIN(rw.end_ts, 2000)"),
+            "raw end bound must AND with page-load window, got: {sql}",
+        );
+        assert!(
+            sql.contains("HAVING MAX(rr.overlap_dur) >= 0"),
+            "zero min_overlap_ms should show all URL groups, got: {sql}",
+        );
+        assert!(
+            sql.contains("LIMIT 25"),
+            "explicit limit must be applied, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_timing_evidence_sql_probes_phase_and_incomplete_signals() {
+        let sql = chrome_page_load_resource_timing_evidence_sql(ChromePageLoadWindowFilters {
+            page_load_id: Some(7),
+            phase: Some(ChromePageLoadPhase::FcpToLoad),
+            start_ts_ns: Some(1000),
+            end_ts_ns: Some(2000),
+            ..Default::default()
+        })
+        .expect("resource timing evidence SQL builder must succeed");
+
+        assert!(
+            sql.contains("resource_timing_probe AS"),
+            "probe SQL must expose a named CTE, got: {sql}",
+        );
+        assert!(
+            sql.contains("lower(s.name) GLOB '*dns*'"),
+            "probe must look for network phase-like slice names, got: {sql}",
+        );
+        assert!(
+            sql.contains("network_phase_arg_count"),
+            "probe must count phase-like arg keys, got: {sql}",
+        );
+        assert!(
+            sql.contains("incomplete_resource_slice_count"),
+            "probe must count incomplete URL-bearing resource slices, got: {sql}",
+        );
+        assert!(
+            sql.contains("MAX(rw.start_ts, 1000)"),
+            "raw start bound must AND with page-load phase window, got: {sql}",
+        );
+        assert!(
+            sql.contains("MIN(rw.end_ts, 2000)"),
+            "raw end bound must AND with page-load phase window, got: {sql}",
+        );
+        assert!(
+            sql.contains("phase_breakdown_available"),
+            "probe must return the machine-readable capability flag, got: {sql}",
+        );
     }
 
     #[test]

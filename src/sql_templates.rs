@@ -4,6 +4,7 @@
 use crate::error::{PerfettoError, MAX_ROWS};
 use crate::params::{
     ChromeMainThreadHotspotsFilters, ChromePageLoadPhase, ChromePageLoadResourceHotspotsFilters,
+    ChromePageLoadResourceSummaryFilters, ChromePageLoadResourceUrlGrouping,
     ChromePageLoadScriptHotspotsFilters, ChromePageLoadWindowFilters,
     SliceDescendantsBreakdownFilters,
 };
@@ -233,6 +234,191 @@ fn chrome_tool_row_limit(limit: Option<u32>) -> Result<u32, PerfettoError> {
     }
 }
 
+#[derive(Debug)]
+struct ChromeResourceWindowExprs {
+    start_bound: Option<String>,
+    end_bound: Option<String>,
+    anchor_expr: String,
+    overlap_start_expr: String,
+    overlap_end_expr: String,
+    window_dur_expr: Option<String>,
+}
+
+fn chrome_resource_window_exprs(page_window: ChromePageLoadWindowSql) -> ChromeResourceWindowExprs {
+    let start_bound = match (page_window.phase.is_some(), page_window.start_ts_ns) {
+        (true, Some(ts)) => Some(format!("MAX(rw.start_ts, {ts})")),
+        (true, None) => Some("rw.start_ts".to_owned()),
+        (false, Some(ts)) => Some(ts.to_string()),
+        (false, None) => None,
+    };
+    let end_bound = match (page_window.phase.is_some(), page_window.end_ts_ns) {
+        (true, Some(ts)) => Some(format!("MIN(rw.end_ts, {ts})")),
+        (true, None) => Some("rw.end_ts".to_owned()),
+        (false, Some(ts)) => Some(ts.to_string()),
+        (false, None) => None,
+    };
+    let anchor_expr = if page_window.phase.is_some() {
+        "rw.navigation_start_ts".to_owned()
+    } else if let Some(start) = page_window.start_ts_ns {
+        start.to_string()
+    } else {
+        "trace_start()".to_owned()
+    };
+    let overlap_start_expr = match &start_bound {
+        Some(bound) => format!("MAX(s.ts, {bound})"),
+        None => "s.ts".to_owned(),
+    };
+    let overlap_end_expr = match &end_bound {
+        Some(bound) => format!("MIN(s.ts + s.dur, {bound})"),
+        None => "s.ts + s.dur".to_owned(),
+    };
+    let window_dur_expr = match (&start_bound, &end_bound) {
+        (Some(start), Some(end)) => Some(format!("({end} - {start})")),
+        _ => None,
+    };
+
+    ChromeResourceWindowExprs {
+        start_bound,
+        end_bound,
+        anchor_expr,
+        overlap_start_expr,
+        overlap_end_expr,
+        window_dur_expr,
+    }
+}
+
+fn append_chrome_resource_candidates_cte(
+    sql: &mut String,
+    page_window: ChromePageLoadWindowSql,
+    exprs: &ChromeResourceWindowExprs,
+    min_dur_ns: i64,
+) {
+    let pct_expr = match &exprs.window_dur_expr {
+        Some(expr) => format!(
+            "CASE WHEN {expr} > 0 \
+                  THEN ROUND(({} - {}) * 100.0 / {expr}, 2) \
+             END AS pct_of_window",
+            exprs.overlap_end_expr, exprs.overlap_start_expr
+        ),
+        None => "NULL AS pct_of_window".to_owned(),
+    };
+    let window_dur_expr = match &exprs.window_dur_expr {
+        Some(expr) => format!("CASE WHEN {expr} > 0 THEN {expr} END AS window_dur_ns"),
+        None => "NULL AS window_dur_ns".to_owned(),
+    };
+
+    sql.push_str(&format!(
+        "resource_candidates AS ( \
+           SELECT \
+             s.id, \
+             s.ts, \
+             s.dur, \
+             ROUND((s.ts - {}) / 1e6, 3) AS start_ms, \
+             ROUND((s.ts + s.dur - {}) / 1e6, 3) AS end_ms, \
+             ROUND(s.dur / 1e6, 3) AS dur_ms, \
+             {} AS overlap_start_ts, \
+             {} AS overlap_end_ts, \
+             ({} - {}) AS overlap_dur, \
+             ROUND(({} - {}) / 1e6, 3) AS overlap_ms, \
+             ROUND(({} - {}) / 1e6, 3) AS overlap_start_ms, \
+             ROUND(({} - {}) / 1e6, 3) AS overlap_end_ms, \
+             {pct_expr}, \
+             {window_dur_expr}, \
+             s.name, \
+              COALESCE(p_thread.name, p_process.name, p_parent_thread.name, p_parent_process.name) \
+                AS process_name, \
+              COALESCE(p_thread.upid, p_process.upid, p_parent_thread.upid, p_parent_process.upid) \
+                AS upid, \
+              COALESCE(p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid) \
+                AS pid, \
+              COALESCE(t.name, parent_t.name) AS thread_name, \
+             COALESCE( \
+               MAX(CASE WHEN a.flat_key IN ( \
+                 'debug.url', 'debug.data.url', 'debug.data.request_url', \
+                 'debug.fileName', 'url', 'request_url' \
+               ) THEN a.display_value END), \
+               MAX(CASE WHEN a.key IN ('url', 'request_url', 'fileName') \
+                    THEN a.display_value END), \
+               MAX(CASE WHEN lower(a.flat_key) LIKE '%url%' \
+                    THEN a.display_value END) \
+             ) AS url, \
+             COALESCE( \
+               MAX(CASE WHEN a.flat_key IN ('debug.priority', 'priority') \
+                    THEN a.display_value END), \
+               MAX(CASE WHEN a.key = 'priority' THEN a.display_value END) \
+             ) AS priority \
+           FROM slice s \
+           LEFT JOIN track tr ON s.track_id = tr.id \
+           LEFT JOIN thread_track tt ON s.track_id = tt.id \
+           LEFT JOIN thread t ON tt.utid = t.utid \
+           LEFT JOIN process p_thread ON t.upid = p_thread.upid \
+           LEFT JOIN process_track pt ON s.track_id = pt.id \
+           LEFT JOIN process p_process ON pt.upid = p_process.upid \
+           LEFT JOIN thread_track parent_tt ON tr.parent_id = parent_tt.id \
+           LEFT JOIN thread parent_t ON parent_tt.utid = parent_t.utid \
+           LEFT JOIN process p_parent_thread ON parent_t.upid = p_parent_thread.upid \
+           LEFT JOIN process_track parent_pt ON tr.parent_id = parent_pt.id \
+           LEFT JOIN process p_parent_process ON parent_pt.upid = p_parent_process.upid \
+           LEFT JOIN args a ON s.arg_set_id = a.arg_set_id ",
+        exprs.anchor_expr,
+        exprs.anchor_expr,
+        exprs.overlap_start_expr,
+        exprs.overlap_end_expr,
+        exprs.overlap_end_expr,
+        exprs.overlap_start_expr,
+        exprs.overlap_end_expr,
+        exprs.overlap_start_expr,
+        exprs.overlap_start_expr,
+        exprs.anchor_expr,
+        exprs.overlap_end_expr,
+        exprs.anchor_expr,
+    ));
+    if page_window.phase.is_some() {
+        sql.push_str("CROSS JOIN resource_window rw ");
+    }
+    sql.push_str(&format!(
+        "WHERE s.dur >= {min_dur_ns} \
+           AND ( \
+             s.name GLOB '*Resource*' OR \
+              s.name GLOB '*URLLoader*' OR \
+              s.name GLOB '*URLRequest*' OR \
+              s.name GLOB '*Network*' OR \
+              s.name GLOB '*Request*' OR \
+              s.name GLOB '*Fetch*' OR \
+              s.name GLOB '*XHR*' \
+            ) \
+           AND NOT ( \
+             s.name GLOB '*PageLoadMetrics*' OR \
+             s.name GLOB '*DidCommitProvisionalLoad*' OR \
+             s.name GLOB '*DidStartProvisionalLoad*' OR \
+             s.name GLOB '*DidStopLoading*' OR \
+             s.name GLOB '*DidFinishLoad*' \
+           )"
+    ));
+    if let Some(bound) = &exprs.start_bound {
+        sql.push_str(&format!(" AND s.ts + s.dur > {bound}"));
+    }
+    if let Some(bound) = &exprs.end_bound {
+        sql.push_str(&format!(" AND s.ts < {bound}"));
+    }
+    if page_window.phase.is_some() {
+        sql.push_str(" AND rw.start_ts IS NOT NULL AND rw.end_ts IS NOT NULL");
+    }
+    if let (Some(start), Some(end)) = (&exprs.start_bound, &exprs.end_bound) {
+        sql.push_str(&format!(" AND {end} > {start}"));
+    }
+    sql.push_str(
+        " GROUP BY \
+             s.id, s.ts, s.dur, s.name, \
+             p_thread.name, p_process.name, p_parent_thread.name, p_parent_process.name, \
+             p_thread.upid, p_process.upid, p_parent_thread.upid, p_parent_process.upid, \
+             p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid, \
+             t.name, parent_t.name \
+           HAVING url IS NOT NULL \
+         ) ",
+    );
+}
+
 /// SQL builder for `chrome_main_thread_hotspots`. Exported for integration tests.
 ///
 /// Uses `thread.is_main_thread = 1` when trace_processor populated it, plus
@@ -359,133 +545,10 @@ pub fn chrome_page_load_resource_hotspots_sql(
         sql.push_str(", ");
     }
 
-    let start_bound = match (page_window.phase.is_some(), page_window.start_ts_ns) {
-        (true, Some(ts)) => Some(format!("MAX(rw.start_ts, {ts})")),
-        (true, None) => Some("rw.start_ts".to_owned()),
-        (false, Some(ts)) => Some(ts.to_string()),
-        (false, None) => None,
-    };
-    let end_bound = match (page_window.phase.is_some(), page_window.end_ts_ns) {
-        (true, Some(ts)) => Some(format!("MIN(rw.end_ts, {ts})")),
-        (true, None) => Some("rw.end_ts".to_owned()),
-        (false, Some(ts)) => Some(ts.to_string()),
-        (false, None) => None,
-    };
-    let anchor_expr = if page_window.phase.is_some() {
-        "rw.navigation_start_ts".to_owned()
-    } else if let Some(start) = page_window.start_ts_ns {
-        start.to_string()
-    } else {
-        "trace_start()".to_owned()
-    };
-    let overlap_start_expr = match &start_bound {
-        Some(bound) => format!("MAX(s.ts, {bound})"),
-        None => "s.ts".to_owned(),
-    };
-    let overlap_end_expr = match &end_bound {
-        Some(bound) => format!("MIN(s.ts + s.dur, {bound})"),
-        None => "s.ts + s.dur".to_owned(),
-    };
-    let window_dur_expr = match (&start_bound, &end_bound) {
-        (Some(start), Some(end)) => Some(format!("({end} - {start})")),
-        _ => None,
-    };
-    let pct_expr = match &window_dur_expr {
-        Some(expr) => format!(
-            "CASE WHEN {expr} > 0 \
-                  THEN ROUND(({overlap_end_expr} - {overlap_start_expr}) * 100.0 / {expr}, 2) \
-             END AS pct_of_window"
-        ),
-        None => "NULL AS pct_of_window".to_owned(),
-    };
-
-    sql.push_str(&format!(
-        "resource_candidates AS ( \
-           SELECT \
-             s.id, \
-             s.ts, \
-             s.dur, \
-             ROUND((s.ts - {anchor_expr}) / 1e6, 3) AS start_ms, \
-             ROUND((s.ts + s.dur - {anchor_expr}) / 1e6, 3) AS end_ms, \
-             ROUND(s.dur / 1e6, 3) AS dur_ms, \
-             ROUND(({overlap_end_expr} - {overlap_start_expr}) / 1e6, 3) AS overlap_ms, \
-             {pct_expr}, \
-             s.name, \
-              COALESCE(p_thread.name, p_process.name, p_parent_thread.name, p_parent_process.name) \
-                AS process_name, \
-              COALESCE(p_thread.upid, p_process.upid, p_parent_thread.upid, p_parent_process.upid) \
-                AS upid, \
-              COALESCE(p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid) \
-                AS pid, \
-              COALESCE(t.name, parent_t.name) AS thread_name, \
-             COALESCE( \
-               MAX(CASE WHEN a.flat_key IN ( \
-                 'debug.url', 'debug.data.url', 'debug.data.request_url', \
-                 'debug.fileName', 'url', 'request_url' \
-               ) THEN a.display_value END), \
-               MAX(CASE WHEN a.key IN ('url', 'request_url', 'fileName') \
-                    THEN a.display_value END), \
-               MAX(CASE WHEN lower(a.flat_key) LIKE '%url%' \
-                    THEN a.display_value END) \
-             ) AS url \
-           FROM slice s \
-           LEFT JOIN track tr ON s.track_id = tr.id \
-           LEFT JOIN thread_track tt ON s.track_id = tt.id \
-           LEFT JOIN thread t ON tt.utid = t.utid \
-           LEFT JOIN process p_thread ON t.upid = p_thread.upid \
-           LEFT JOIN process_track pt ON s.track_id = pt.id \
-           LEFT JOIN process p_process ON pt.upid = p_process.upid \
-           LEFT JOIN thread_track parent_tt ON tr.parent_id = parent_tt.id \
-           LEFT JOIN thread parent_t ON parent_tt.utid = parent_t.utid \
-           LEFT JOIN process p_parent_thread ON parent_t.upid = p_parent_thread.upid \
-           LEFT JOIN process_track parent_pt ON tr.parent_id = parent_pt.id \
-           LEFT JOIN process p_parent_process ON parent_pt.upid = p_parent_process.upid \
-           LEFT JOIN args a ON s.arg_set_id = a.arg_set_id "
-    ));
-    if page_window.phase.is_some() {
-        sql.push_str("CROSS JOIN resource_window rw ");
-    }
-    sql.push_str(&format!(
-        "WHERE s.dur >= {min_dur_ns} \
-           AND ( \
-             s.name GLOB '*Resource*' OR \
-              s.name GLOB '*URLLoader*' OR \
-              s.name GLOB '*URLRequest*' OR \
-              s.name GLOB '*Network*' OR \
-              s.name GLOB '*Request*' OR \
-              s.name GLOB '*Fetch*' OR \
-              s.name GLOB '*XHR*' \
-            ) \
-           AND NOT ( \
-             s.name GLOB '*PageLoadMetrics*' OR \
-             s.name GLOB '*DidCommitProvisionalLoad*' OR \
-             s.name GLOB '*DidStartProvisionalLoad*' OR \
-             s.name GLOB '*DidStopLoading*' OR \
-             s.name GLOB '*DidFinishLoad*' \
-           )"
-    ));
-    if let Some(bound) = &start_bound {
-        sql.push_str(&format!(" AND s.ts + s.dur > {bound}"));
-    }
-    if let Some(bound) = &end_bound {
-        sql.push_str(&format!(" AND s.ts < {bound}"));
-    }
-    if page_window.phase.is_some() {
-        sql.push_str(" AND rw.start_ts IS NOT NULL AND rw.end_ts IS NOT NULL");
-    }
-    if let (Some(start), Some(end)) = (&start_bound, &end_bound) {
-        sql.push_str(&format!(" AND {end} > {start}"));
-    }
+    let exprs = chrome_resource_window_exprs(page_window);
+    append_chrome_resource_candidates_cte(&mut sql, page_window, &exprs, min_dur_ns);
     sql.push_str(
-        " GROUP BY \
-             s.id, s.ts, s.dur, s.name, \
-             p_thread.name, p_process.name, p_parent_thread.name, p_parent_process.name, \
-             p_thread.upid, p_process.upid, p_parent_thread.upid, p_parent_process.upid, \
-             p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid, \
-             t.name, parent_t.name \
-           HAVING url IS NOT NULL \
-         ) \
-         SELECT \
+        " SELECT \
            id, \
            ts, \
            start_ms, \
@@ -504,6 +567,215 @@ pub fn chrome_page_load_resource_hotspots_sql(
     sql.push_str(&format!(
         "ORDER BY overlap_ms DESC, dur_ms DESC, start_ms ASC LIMIT {row_limit}"
     ));
+    Ok(sql)
+}
+
+/// SQL builder for `chrome_page_load_resource_summary`.
+///
+/// Aggregates resource/request slices by URL so LLM agents can see page-load
+/// blockers at the same level they appear in recommendations (`main.js` /
+/// `vendor.js`) without double-reading Renderer and NetworkService slices as
+/// unrelated rows. `max_overlap_ms` is the primary ranking metric; summed
+/// overlap is also returned but may include nested/parallel trace-slice double
+/// counting for the same URL.
+pub fn chrome_page_load_resource_summary_sql(
+    filters: ChromePageLoadResourceSummaryFilters,
+) -> Result<String, PerfettoError> {
+    let ChromePageLoadResourceSummaryFilters {
+        window,
+        min_overlap_ms,
+        url_grouping,
+        limit,
+    } = filters;
+    let page_window = validate_chrome_page_load_window(window)?;
+    let min_overlap_ns = duration_ms_to_ns("min_overlap_ms", min_overlap_ms, 50_000_000)?;
+    let row_limit = chrome_tool_row_limit(limit)?;
+
+    let mut sql = String::new();
+    append_chrome_page_load_window_cte(&mut sql, "resource_window", window, page_window);
+    if sql.is_empty() {
+        sql.push_str("WITH ");
+    } else {
+        sql.push_str(", ");
+    }
+
+    let exprs = chrome_resource_window_exprs(page_window);
+    append_chrome_resource_candidates_cte(&mut sql, page_window, &exprs, 0);
+
+    let url_key_expr = match url_grouping.unwrap_or(ChromePageLoadResourceUrlGrouping::Full) {
+        ChromePageLoadResourceUrlGrouping::Full => "url".to_owned(),
+        ChromePageLoadResourceUrlGrouping::WithoutQuery => "CASE WHEN INSTR(url, '?') > 0 \
+                  THEN SUBSTR(url, 1, INSTR(url, '?') - 1) \
+                  ELSE url END"
+            .to_owned(),
+    };
+
+    sql.push_str(&format!(
+        ", resource_rows AS ( \
+           SELECT resource_candidates.*, {url_key_expr} AS url_key \
+           FROM resource_candidates \
+         ) \
+         SELECT \
+           rr.url_key, \
+           (SELECT r2.url FROM resource_rows r2 \
+            WHERE r2.url_key = rr.url_key \
+            ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS example_url, \
+           COUNT(*) AS slice_count, \
+           GROUP_CONCAT(DISTINCT rr.name) AS slice_names, \
+           GROUP_CONCAT(DISTINCT rr.process_name) AS process_names, \
+           GROUP_CONCAT(DISTINCT rr.upid) AS upids, \
+           GROUP_CONCAT(DISTINCT rr.pid) AS pids, \
+           GROUP_CONCAT(DISTINCT rr.priority) AS priorities, \
+           ROUND(MIN(rr.overlap_start_ms), 3) AS first_start_ms, \
+           ROUND(MAX(rr.overlap_end_ms), 3) AS last_end_ms, \
+           ROUND((MAX(rr.overlap_end_ts) - MIN(rr.overlap_start_ts)) / 1e6, 3) AS span_ms, \
+           ROUND(MAX(rr.overlap_dur) / 1e6, 3) AS max_overlap_ms, \
+           ROUND(SUM(rr.overlap_dur) / 1e6, 3) AS summed_overlap_ms, \
+           CASE WHEN MAX(rr.window_dur_ns) > 0 \
+                THEN ROUND(MAX(rr.overlap_dur) * 100.0 / MAX(rr.window_dur_ns), 2) \
+           END AS pct_of_window, \
+           (SELECT r2.id FROM resource_rows r2 \
+            WHERE r2.url_key = rr.url_key \
+            ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS example_slice_id \
+         FROM resource_rows rr \
+         GROUP BY rr.url_key \
+         HAVING MAX(rr.overlap_dur) >= {min_overlap_ns} \
+         ORDER BY MAX(rr.overlap_dur) DESC, \
+                  (MAX(rr.overlap_end_ts) - MIN(rr.overlap_start_ts)) DESC, \
+                  MIN(rr.overlap_start_ts) ASC \
+         LIMIT {row_limit}"
+    ));
+    Ok(sql)
+}
+
+/// SQL builder for resource-timing evidence metadata returned with
+/// `chrome_page_load_resource_summary`.
+///
+/// This is deliberately a capability probe rather than a HAR reconstruction:
+/// when phase-like slice names or arg keys are absent, LLM callers should keep
+/// resource-summary conclusions at "URL lifecycle span" level and avoid naming
+/// DNS/TLS/TTFB/download/cache as the proven bottleneck.
+pub fn chrome_page_load_resource_timing_evidence_sql(
+    window: ChromePageLoadWindowFilters,
+) -> Result<String, PerfettoError> {
+    let page_window = validate_chrome_page_load_window(window)?;
+    let mut sql = String::new();
+    append_chrome_page_load_window_cte(&mut sql, "resource_window", window, page_window);
+    if sql.is_empty() {
+        sql.push_str("WITH ");
+    } else {
+        sql.push_str(", ");
+    }
+
+    let exprs = chrome_resource_window_exprs(page_window);
+    sql.push_str(
+        "resource_timing_probe AS ( \
+           SELECT \
+             COUNT(DISTINCT CASE WHEN ( \
+               lower(s.name) GLOB '*dns*' OR \
+               lower(s.name) GLOB '*connect*' OR \
+               lower(s.name) GLOB '*socket*' OR \
+               lower(s.name) GLOB '*ssl*' OR \
+               lower(s.name) GLOB '*tls*' OR \
+               lower(s.name) GLOB '*http*' OR \
+               lower(s.name) GLOB '*cache*' OR \
+               lower(s.name) GLOB '*receive*' OR \
+               lower(s.name) GLOB '*download*' OR \
+               lower(s.name) GLOB '*ttfb*' \
+             ) THEN s.id END) AS network_phase_slice_count, \
+             COUNT(DISTINCT CASE WHEN ( \
+               lower(a.flat_key) GLOB '*dns*' OR \
+               lower(a.flat_key) GLOB '*connect*' OR \
+               lower(a.flat_key) GLOB '*socket*' OR \
+               lower(a.flat_key) GLOB '*ssl*' OR \
+               lower(a.flat_key) GLOB '*tls*' OR \
+               lower(a.flat_key) GLOB '*http*' OR \
+               lower(a.flat_key) GLOB '*cache*' OR \
+               lower(a.flat_key) GLOB '*receive*' OR \
+               lower(a.flat_key) GLOB '*download*' OR \
+               lower(a.flat_key) GLOB '*ttfb*' \
+             ) THEN s.arg_set_id END) AS network_phase_arg_count, \
+             COUNT(DISTINCT CASE WHEN s.dur < 0 \
+               AND ( \
+                 s.name GLOB '*Resource*' OR \
+                 s.name GLOB '*URLLoader*' OR \
+                 s.name GLOB '*URLRequest*' OR \
+                 s.name GLOB '*Network*' OR \
+                 s.name GLOB '*Request*' OR \
+                 s.name GLOB '*Fetch*' OR \
+                 s.name GLOB '*XHR*' \
+               ) \
+               AND ( \
+                 a.flat_key IN ( \
+                   'debug.url', 'debug.data.url', 'debug.data.request_url', \
+                   'debug.fileName', 'url', 'request_url' \
+                 ) OR \
+                 a.key IN ('url', 'request_url', 'fileName') OR \
+                 lower(a.flat_key) LIKE '%url%' \
+               ) \
+             THEN s.id END) AS incomplete_resource_slice_count \
+           FROM slice s \
+           LEFT JOIN args a ON s.arg_set_id = a.arg_set_id ",
+    );
+    if page_window.phase.is_some() {
+        sql.push_str("CROSS JOIN resource_window rw ");
+    }
+    sql.push_str(
+        "WHERE ( \
+             lower(s.name) GLOB '*dns*' OR \
+             lower(s.name) GLOB '*connect*' OR \
+             lower(s.name) GLOB '*socket*' OR \
+             lower(s.name) GLOB '*ssl*' OR \
+             lower(s.name) GLOB '*tls*' OR \
+             lower(s.name) GLOB '*http*' OR \
+             lower(s.name) GLOB '*cache*' OR \
+             lower(s.name) GLOB '*receive*' OR \
+             lower(s.name) GLOB '*download*' OR \
+             lower(s.name) GLOB '*ttfb*' OR \
+             lower(a.flat_key) GLOB '*dns*' OR \
+             lower(a.flat_key) GLOB '*connect*' OR \
+             lower(a.flat_key) GLOB '*socket*' OR \
+             lower(a.flat_key) GLOB '*ssl*' OR \
+             lower(a.flat_key) GLOB '*tls*' OR \
+             lower(a.flat_key) GLOB '*http*' OR \
+             lower(a.flat_key) GLOB '*cache*' OR \
+             lower(a.flat_key) GLOB '*receive*' OR \
+             lower(a.flat_key) GLOB '*download*' OR \
+             lower(a.flat_key) GLOB '*ttfb*' OR \
+             s.name GLOB '*Resource*' OR \
+             s.name GLOB '*URLLoader*' OR \
+             s.name GLOB '*URLRequest*' OR \
+             s.name GLOB '*Network*' OR \
+             s.name GLOB '*Request*' OR \
+             s.name GLOB '*Fetch*' OR \
+             s.name GLOB '*XHR*' \
+           )",
+    );
+    if let Some(bound) = &exprs.start_bound {
+        sql.push_str(&format!(
+            " AND ((s.dur >= 0 AND s.ts + s.dur > {bound}) OR (s.dur < 0 AND s.ts >= {bound}))"
+        ));
+    }
+    if let Some(bound) = &exprs.end_bound {
+        sql.push_str(&format!(" AND s.ts < {bound}"));
+    }
+    if page_window.phase.is_some() {
+        sql.push_str(" AND rw.start_ts IS NOT NULL AND rw.end_ts IS NOT NULL");
+    }
+    if let (Some(start), Some(end)) = (&exprs.start_bound, &exprs.end_bound) {
+        sql.push_str(&format!(" AND {end} > {start}"));
+    }
+    sql.push_str(
+        ") \
+         SELECT \
+           COALESCE(network_phase_slice_count, 0) AS network_phase_slice_count, \
+           COALESCE(network_phase_arg_count, 0) AS network_phase_arg_count, \
+           COALESCE(incomplete_resource_slice_count, 0) AS incomplete_resource_slice_count, \
+           CASE WHEN COALESCE(network_phase_slice_count, 0) \
+                   + COALESCE(network_phase_arg_count, 0) > 0 \
+                THEN 1 ELSE 0 END AS phase_breakdown_available \
+         FROM resource_timing_probe",
+    );
     Ok(sql)
 }
 

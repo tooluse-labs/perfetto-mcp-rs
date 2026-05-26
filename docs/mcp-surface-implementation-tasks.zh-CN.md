@@ -161,8 +161,12 @@
 
 ### T1.4 实现 Chrome page-load 二级分析工具（已落地核心闭环）
 
-- **已落地名称：** `chrome_page_load_resource_hotspots`、
-  `chrome_page_load_script_hotspots`。
+- **已落地名称：** `chrome_page_load_resource_summary`、
+  `chrome_page_load_resource_hotspots`、`chrome_page_load_script_hotspots`。
+- **归因边界：** `chrome_page_load_resource_summary` 返回
+  `resource_timing_evidence`，用于告诉 LLM 资源摘要当前只能归因到 URL
+  lifecycle span，还是 trace 中存在可继续拆分 DNS/TLS/TTFB/download/cache 的
+  phase hints。
 - **后续候选名称：** `chrome_page_load_detail` 或
   `chrome_renderer_context`。
 - **动机：** `chrome_page_load_summary` 能发现 FCP / load 慢，但真实会话中 agent

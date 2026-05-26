@@ -66,9 +66,11 @@ Last updated: 2026-05-26
   一次 `ambiguous column name: depth`。错误被自动修复，但这是稳定、可工具化
   的重复模式。
 - 从 `chrome_page_load_summary` 到“哪个资源或导航阶段卡住”仍需要大量手写
-  SQL。已新增 `chrome_page_load_resource_hotspots` 将 URL-bearing
-  resource-like slice 按 page-load/raw timestamp 窗口 overlap 排序，覆盖
-  trace5 中 `EnhanceConfigManager::GetResource` / URL request 这类关键路径。
+  SQL。已新增 `chrome_page_load_resource_summary` 将 URL-bearing
+  resource-like slice 按 URL 聚合，作为慢 FCP/load 的第一屏资源仪表盘，并在
+  `resource_timing_evidence` 中暴露 phase breakdown 是否可用及不安全推断边界；
+  `chrome_page_load_resource_hotspots` 继续提供 slice 级 drilldown，覆盖 trace5
+  中 `EnhanceConfigManager::GetResource` / URL request 这类关键路径。
   已新增 `chrome_page_load_script_hotspots` 聚合 renderer main-thread script /
   callback / microtask 执行，并带 descendant style/layout 信号，覆盖 trace5 中
   关键 JS 文件和 forced layout 后续 SQL 路径。后续更细的 frame/renderer 归属仍可

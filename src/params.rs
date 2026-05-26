@@ -314,6 +314,60 @@ pub struct ChromePageLoadResourceHotspotsParams {
     pub max_string_len: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromePageLoadResourceUrlGrouping {
+    /// Group by the full URL, including query string.
+    Full,
+    /// Group by URL with the query string stripped.
+    WithoutQuery,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChromePageLoadResourceSummaryParams {
+    /// Optional page-load id used to scope resources to one navigation phase.
+    /// Matches `chrome_page_loads.id`. Mutually exclusive with `navigation_id`.
+    /// If set without `phase`, defaults to `navigation_to_fcp`.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub page_load_id: Option<i64>,
+    /// Optional Chrome navigation id used to scope resources to one navigation
+    /// phase. Matches `chrome_page_loads.navigation_id`. Mutually exclusive
+    /// with `page_load_id`. If set without `phase`, defaults to
+    /// `navigation_to_fcp`.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub navigation_id: Option<i64>,
+    /// Optional page-load phase window. If set without `page_load_id` or
+    /// `navigation_id`, uses the latest page load in the trace. Values:
+    /// navigation_to_fcp, navigation_to_load, dcl_to_fcp, fcp_to_load.
+    #[serde(default)]
+    pub phase: Option<ChromePageLoadPhase>,
+    /// Optional raw trace timestamp lower bound in nanoseconds. ANDs with any
+    /// page-load window.
+    #[serde(default, alias = "start_ts", deserialize_with = "lenient_i64")]
+    pub start_ts_ns: Option<i64>,
+    /// Optional raw trace timestamp upper bound in nanoseconds, exclusive.
+    /// ANDs with any page-load window.
+    #[serde(default, alias = "end_ts", deserialize_with = "lenient_i64")]
+    pub end_ts_ns: Option<i64>,
+    /// Optional minimum per-URL max overlap in milliseconds. Defaults to 50 ms.
+    #[serde(default, deserialize_with = "lenient_f64")]
+    pub min_overlap_ms: Option<f64>,
+    /// URL grouping strategy. Defaults to full URL; use without_query to merge
+    /// signed/nonce query variants of the same endpoint.
+    #[serde(default)]
+    pub url_grouping: Option<ChromePageLoadResourceUrlGrouping>,
+    /// Optional max rows to return. Defaults to 100 and is capped at 5000.
+    /// Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+    /// Optional per-string-cell character cap applied to returned rows only.
+    /// Unset preserves full strings for precision; accepts both numbers and
+    /// numeric strings. Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub max_string_len: Option<u32>,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChromePageLoadScriptHotspotsParams {
@@ -534,6 +588,19 @@ pub struct ChromePageLoadResourceHotspotsFilters {
     /// Optional override of the default 50 ms threshold (ms; must be finite
     /// non-negative, finite when multiplied to ns).
     pub min_dur_ms: Option<f64>,
+    /// Optional override of the default `LIMIT 100`. Capped at `MAX_ROWS`.
+    /// Must be `> 0` if set.
+    pub limit: Option<u32>,
+}
+
+/// Tunable filters for `chrome_page_load_resource_summary_sql`.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ChromePageLoadResourceSummaryFilters {
+    pub window: ChromePageLoadWindowFilters,
+    /// Optional override of the default 50 ms per-URL max-overlap threshold.
+    pub min_overlap_ms: Option<f64>,
+    /// Optional URL grouping strategy. Defaults to full URL.
+    pub url_grouping: Option<ChromePageLoadResourceUrlGrouping>,
     /// Optional override of the default `LIMIT 100`. Capped at `MAX_ROWS`.
     /// Must be `> 0` if set.
     pub limit: Option<u32>,

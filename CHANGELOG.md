@@ -4,6 +4,10 @@
 
 ### Unreleased
 
+### [0.15.10](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.10) (May 26, 2026)
+
+- **New `chrome_page_load_resource_summary` tool for URL-level page-load blockers.** It groups URL-bearing resource/request slices by full URL or URL-without-query inside the same page-load/raw windows as resource hotspots, ranking by per-URL max overlap while also returning summed overlap, slice names, process ids, priorities, an example slice id, and resource-timing evidence metadata. This gives LLM agents a first-pass resource dashboard before drilling into slice-level `chrome_page_load_resource_hotspots` while making DNS/TLS/TTFB/download/cache inferences explicit when the trace lacks phase data.
+
 ### [0.15.9](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.9) (May 26, 2026)
 
 - **Release workflows no longer depend on `arduino/setup-protoc`.** GitHub reported `Sorry. Your account was suspended` for that third-party action during the v0.15.8 tag build, so CI and release jobs now install `protoc` through the runner package managers directly.

@@ -21,10 +21,12 @@ use std::path::Path;
 
 use perfetto_mcp_rs::params::{
     ChromeMainThreadHotspotsFilters, ChromePageLoadResourceHotspotsFilters,
+    ChromePageLoadResourceSummaryFilters, ChromePageLoadResourceUrlGrouping,
     ChromePageLoadScriptHotspotsFilters, ChromePageLoadWindowFilters,
 };
 use perfetto_mcp_rs::sql_templates::{
     chrome_main_thread_hotspots_sql, chrome_page_load_resource_hotspots_sql,
+    chrome_page_load_resource_summary_sql, chrome_page_load_resource_timing_evidence_sql,
     chrome_page_load_script_hotspots_sql, CHROME_PAGE_LOAD_SUMMARY_SQL,
     CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_SQL, CHROME_TRACE_PREFLIGHT_SQL,
     CHROME_WEB_CONTENT_INTERACTIONS_SQL,
@@ -155,6 +157,81 @@ fn e2e_chrome_page_load_resource_hotspots_sql_runs_cleanly() {
                 "row {i} missing overlap_ms",
             );
             assert!(table.cell(i, "url").is_some(), "row {i} missing url");
+        }
+    });
+}
+
+#[test]
+fn e2e_chrome_page_load_resource_summary_sql_runs_cleanly() {
+    // Weak assertion: this pins SQL compatibility and the URL-summary response
+    // shape. The fixture is not a slow-resource capture, so row count is not
+    // asserted.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = TraceProcessorManager::new_with_starting_port(1, 19_256);
+        let trace = Path::new("tests/fixtures/page_loads.pftrace");
+
+        let client = manager.get_client(trace).await.expect("spawn tp_shell");
+        let sql = chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(1),
+                phase: Some(perfetto_mcp_rs::params::ChromePageLoadPhase::NavigationToFcp),
+                ..Default::default()
+            },
+            min_overlap_ms: Some(0.0),
+            url_grouping: Some(ChromePageLoadResourceUrlGrouping::WithoutQuery),
+            ..Default::default()
+        })
+        .expect("resource summary SQL builder must succeed");
+        let table = client
+            .query(&sql)
+            .await
+            .expect("chrome page-load resource summary query must succeed");
+        let evidence_sql =
+            chrome_page_load_resource_timing_evidence_sql(ChromePageLoadWindowFilters {
+                page_load_id: Some(1),
+                phase: Some(perfetto_mcp_rs::params::ChromePageLoadPhase::NavigationToFcp),
+                ..Default::default()
+            })
+            .expect("resource evidence SQL builder must succeed");
+        let evidence_table = client
+            .query(&evidence_sql)
+            .await
+            .expect("chrome page-load resource evidence query must succeed");
+
+        assert_eq!(
+            evidence_table.len(),
+            1,
+            "resource evidence probe should return exactly one metadata row"
+        );
+        assert!(
+            evidence_table
+                .cell(0, "phase_breakdown_available")
+                .is_some(),
+            "evidence row missing phase_breakdown_available"
+        );
+
+        for i in 0..table.len() {
+            assert!(
+                table.cell(i, "url_key").is_some(),
+                "row {i} missing url_key"
+            );
+            assert!(
+                table.cell(i, "max_overlap_ms").is_some(),
+                "row {i} missing max_overlap_ms",
+            );
+            assert!(
+                table.cell(i, "summed_overlap_ms").is_some(),
+                "row {i} missing summed_overlap_ms",
+            );
+            assert!(
+                table.cell(i, "example_slice_id").is_some(),
+                "row {i} missing example_slice_id",
+            );
         }
     });
 }
