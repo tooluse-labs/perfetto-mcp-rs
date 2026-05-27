@@ -657,6 +657,8 @@ impl PerfettoMcpServer {
                        `chrome_page_load_resource_summary` by passing \
                        `example_slice_id` or `url_substring` for a slow URL. \
                        Returns request/resource timing facts plus an \
+                       explicit `matched_by`/`matched_url_seed` so callers can \
+                       verify why the row matched, plus an \
                        evidence_boundary reminding callers not to label \
                        DNS/TLS/TTFB/download/cache without phase-specific rows. \
                        Parameters: `url_substring` or `example_slice_id` required; \
@@ -5015,7 +5017,8 @@ mod tests {
         )
         .expect("resource builder must succeed");
         assert!(
-            sql.contains("WITH resource_candidates AS"),
+            sql.contains("WITH resource_candidate_slices AS")
+                && sql.contains("resource_candidates AS"),
             "default SQL must still use a CTE for result shaping, got: {sql}",
         );
         assert!(
@@ -5035,6 +5038,10 @@ mod tests {
             "resource SQL must include process-track slices, got: {sql}",
         );
         assert!(
+            sql.contains("resource_candidate_selected_urls") && sql.contains("MIN(rcu.url) AS url"),
+            "resource SQL must collapse same-priority URL ties deterministically, got: {sql}",
+        );
+        assert!(
             sql.contains("LEFT JOIN process_track parent_pt ON tr.parent_id = parent_pt.id"),
             "resource SQL must include async tracks parented by process tracks, got: {sql}",
         );
@@ -5043,8 +5050,8 @@ mod tests {
             "resource SQL must expose nullable thread context for async/process tracks, got: {sql}",
         );
         assert!(
-            sql.contains("HAVING url IS NOT NULL"),
-            "resource tool must suppress URL-less wrapper rows, got: {sql}",
+            sql.contains("JOIN resource_candidate_selected_urls rcsu ON rcsu.id = rcs.id"),
+            "resource tool must suppress URL-less wrapper rows through URL-priority joins, got: {sql}",
         );
         assert!(
             sql.contains("ORDER BY overlap_ms DESC, dur_ms DESC, start_ms ASC LIMIT 100"),
@@ -5393,8 +5400,22 @@ mod tests {
             "pipeline must use recursive descendants for script/layout rollup, got: {sql}",
         );
         assert!(
-            sql.contains("INSTR(url, 'main.js') > 0"),
+            sql.contains("INSTR(rc.url, 'main.js') > 0"),
             "url_substring must use literal INSTR matching, got: {sql}",
+        );
+        assert!(
+            sql.contains("matched_by") && sql.contains("matched_url_seed"),
+            "pipeline must expose URL seed/match evidence, got: {sql}",
+        );
+        assert!(
+            sql.contains("example_url_args")
+                && sql.contains("example_min_url_priority")
+                && sql.contains("SELECT MIN(eua.example_url) AS example_url"),
+            "example_slice_id URL lookup must use prioritized and deterministic URL args, got: {sql}",
+        );
+        assert!(
+            sql.contains("raw_script_selected_urls") && sql.contains("MIN(rsu.url) AS url"),
+            "script URL lookup must collapse same-priority URL ties deterministically, got: {sql}",
         );
         assert!(
             sql.contains("s.id = 54333"),

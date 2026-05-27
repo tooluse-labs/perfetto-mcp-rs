@@ -4,6 +4,10 @@
 
 ### Unreleased
 
+### [0.15.12](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.12) (May 27, 2026)
+
+- **Chrome resource pipeline URL attribution is more deterministic and explainable.** URL-bearing resource/script slices now choose a single URL by semantic arg priority before aggregation, preventing same-priority URL args from duplicating slices while keeping real request/frame URLs ahead of Chrome context placeholders such as `process_lock_url`, `site_url`, and `http://unisolated.invalid/`. `chrome_page_load_resource_pipeline` rows also include `matched_by` and `matched_url_seed`, so LLM callers can verify whether a drilldown row came from `url_substring`, `example_slice_id`, or both.
+
 ### [0.15.11](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.11) (May 27, 2026)
 
 - **URL resource drilldown is now a first-class Chrome tool.** `chrome_page_load_resource_pipeline` takes a `url_substring` or `example_slice_id` from `chrome_page_load_resource_summary` and returns the URL's lifecycle/request spans next to background parse, script evaluation, style/layout signals, size, example ids, and an explicit evidence boundary. Script metrics are clipped to the selected page-load/raw window so partial-overlap slices do not inflate attribution.

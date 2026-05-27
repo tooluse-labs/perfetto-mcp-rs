@@ -315,12 +315,15 @@ fn append_chrome_resource_candidates_cte(
         None => "NULL AS window_dur_ns".to_owned(),
     };
 
+    let url_arg_priority_expr = chrome_url_arg_priority_expr("a");
+
     sql.push_str(&format!(
-        "resource_candidates AS ( \
+        "resource_candidate_slices AS ( \
            SELECT \
              s.id, \
              s.ts, \
              s.dur, \
+             s.arg_set_id, \
              ROUND((s.ts - {}) / 1e6, 3) AS start_ms, \
              ROUND((s.ts + s.dur - {}) / 1e6, 3) AS end_ms, \
              ROUND(s.dur / 1e6, 3) AS dur_ms, \
@@ -340,16 +343,6 @@ fn append_chrome_resource_candidates_cte(
               COALESCE(p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid) \
                 AS pid, \
               COALESCE(t.name, parent_t.name) AS thread_name, \
-             COALESCE( \
-               MAX(CASE WHEN a.flat_key IN ( \
-                 'debug.url', 'debug.data.url', 'debug.data.request_url', \
-                 'debug.fileName', 'url', 'request_url' \
-               ) THEN a.display_value END), \
-               MAX(CASE WHEN a.key IN ('url', 'request_url', 'fileName') \
-                    THEN a.display_value END), \
-               MAX(CASE WHEN lower(a.flat_key) LIKE '%url%' \
-                    THEN a.display_value END) \
-             ) AS url, \
              COALESCE( \
                MAX(CASE WHEN a.flat_key IN ('debug.priority', 'priority') \
                     THEN a.display_value END), \
@@ -417,12 +410,64 @@ fn append_chrome_resource_candidates_cte(
     }
     sql.push_str(
         " GROUP BY \
-             s.id, s.ts, s.dur, s.name, \
+             s.id, s.ts, s.dur, s.arg_set_id, s.name, \
              p_thread.name, p_process.name, p_parent_thread.name, p_parent_process.name, \
              p_thread.upid, p_process.upid, p_parent_thread.upid, p_parent_process.upid, \
              p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid, \
              t.name, parent_t.name \
-           HAVING url IS NOT NULL \
+         ), \
+         resource_candidate_urls AS ( \
+           SELECT \
+             rcs.id, \
+             a.display_value AS url, \
+             ",
+    );
+    sql.push_str(&url_arg_priority_expr);
+    sql.push_str(
+        " AS url_priority \
+           FROM resource_candidate_slices rcs \
+           JOIN args a ON rcs.arg_set_id = a.arg_set_id \
+           WHERE a.display_value IS NOT NULL \
+             AND a.display_value != '' \
+         ), \
+         resource_candidate_min_url_priority AS ( \
+           SELECT id, MIN(url_priority) AS url_priority \
+           FROM resource_candidate_urls \
+           WHERE url_priority < 99 \
+           GROUP BY id \
+         ), \
+         resource_candidate_selected_urls AS ( \
+           SELECT rcu.id, MIN(rcu.url) AS url \
+           FROM resource_candidate_urls rcu \
+           JOIN resource_candidate_min_url_priority rcup \
+             ON rcup.id = rcu.id AND rcup.url_priority = rcu.url_priority \
+           GROUP BY rcu.id \
+         ), \
+         resource_candidates AS ( \
+           SELECT DISTINCT \
+             rcs.id, \
+             rcs.ts, \
+             rcs.dur, \
+             rcs.start_ms, \
+             rcs.end_ms, \
+             rcs.dur_ms, \
+             rcs.overlap_start_ts, \
+             rcs.overlap_end_ts, \
+             rcs.overlap_dur, \
+             rcs.overlap_ms, \
+             rcs.overlap_start_ms, \
+             rcs.overlap_end_ms, \
+             rcs.pct_of_window, \
+             rcs.window_dur_ns, \
+             rcs.name, \
+             rcs.process_name, \
+             rcs.upid, \
+             rcs.pid, \
+             rcs.thread_name, \
+             rcsu.url, \
+             rcs.priority \
+           FROM resource_candidate_slices rcs \
+           JOIN resource_candidate_selected_urls rcsu ON rcsu.id = rcs.id \
          ) ",
     );
 }
@@ -750,13 +795,18 @@ pub fn chrome_page_load_resource_pipeline_sql(
     append_chrome_resource_candidates_cte(&mut sql, page_window, &exprs, 0);
 
     let url_key_expr = chrome_resource_url_key_expr("url", url_grouping);
-    let example_url_key_expr = chrome_resource_url_key_expr("example_url", url_grouping);
+    let rc_url_key_expr = chrome_resource_url_key_expr("rc.url", url_grouping);
+    let eu_example_url_key_expr = chrome_resource_url_key_expr("eu.example_url", url_grouping);
     let ss_url_key_expr = chrome_resource_url_key_expr("ss.url", url_grouping);
     let s2_url_key_expr = chrome_resource_url_key_expr("s2.url", url_grouping);
-    let substring_match = match url_substring_lit {
-        Some(lit) => format!("INSTR(url, {lit}) > 0"),
+    let resource_substring_match = match &url_substring_lit {
+        Some(lit) => format!("INSTR(rc.url, {lit}) > 0"),
         None => "0".to_owned(),
     };
+    let url_substring_seed_expr = url_substring_lit.as_deref().unwrap_or("NULL");
+    let example_url_arg_priority_expr = chrome_url_arg_priority_expr("a");
+    let example_key_match = format!("{rc_url_key_expr} = {eu_example_url_key_expr}");
+    let script_url_arg_priority_expr = chrome_url_arg_priority_expr("a");
     let script_start_bound = exprs.start_bound.as_deref();
     let script_end_bound = exprs.end_bound.as_deref();
     let script_anchor_expr = &exprs.anchor_expr;
@@ -772,43 +822,68 @@ pub fn chrome_page_load_resource_pipeline_sql(
         format!("({script_overlap_end_expr} - {script_overlap_start_expr})");
 
     sql.push_str(&format!(
-        ", example_urls AS ( \
-           SELECT COALESCE( \
-             MAX(CASE WHEN a.flat_key IN ( \
-               'debug.url', 'debug.data.url', 'debug.data.request_url', \
-               'debug.data.script_url', 'debug.fileName', 'url', 'request_url', \
-               'script_url' \
-             ) THEN a.display_value END), \
-             MAX(CASE WHEN a.key IN ('url', 'request_url', 'script_url', 'fileName') \
-                  THEN a.display_value END), \
-             MAX(CASE WHEN lower(a.flat_key) LIKE '%url%' THEN a.display_value END) \
-           ) AS example_url \
+        ", example_url_args AS ( \
+           SELECT \
+             a.display_value AS example_url, \
+             {example_url_arg_priority_expr} AS url_priority \
            FROM slice s \
-           LEFT JOIN args a ON s.arg_set_id = a.arg_set_id \
+           JOIN args a ON s.arg_set_id = a.arg_set_id \
            WHERE {example_url_filter} \
-           GROUP BY s.id \
+             AND a.display_value IS NOT NULL \
+             AND a.display_value != '' \
+         ), \
+         example_min_url_priority AS ( \
+           SELECT MIN(url_priority) AS url_priority \
+           FROM example_url_args \
+           WHERE url_priority < 99 \
+         ), \
+         example_urls AS ( \
+           SELECT MIN(eua.example_url) AS example_url \
+           FROM example_url_args eua \
+           JOIN example_min_url_priority emup ON emup.url_priority = eua.url_priority \
          ), \
          resource_rows AS ( \
-           SELECT rc.*, {url_key_expr} AS url_key \
+           SELECT \
+             rc.*, \
+             {rc_url_key_expr} AS url_key, \
+             CASE \
+               WHEN {resource_substring_match} AND EXISTS ( \
+                 SELECT 1 FROM example_urls eu \
+                 WHERE eu.example_url IS NOT NULL \
+                   AND {example_key_match} \
+               ) THEN 'url_substring+example_slice_id' \
+               WHEN {resource_substring_match} THEN 'url_substring' \
+               ELSE 'example_slice_id' \
+             END AS matched_by, \
+             CASE \
+               WHEN {resource_substring_match} THEN {url_substring_seed_expr} \
+               ELSE ( \
+                 SELECT eu.example_url FROM example_urls eu \
+                 WHERE eu.example_url IS NOT NULL \
+                   AND {example_key_match} \
+                 ORDER BY eu.example_url LIMIT 1 \
+               ) \
+             END AS matched_url_seed \
            FROM resource_candidates rc \
-           WHERE {substring_match} \
+           WHERE {resource_substring_match} \
               OR EXISTS ( \
                 SELECT 1 FROM example_urls eu \
                 WHERE eu.example_url IS NOT NULL \
-                  AND {url_key_expr} = {example_url_key_expr} \
+                  AND {example_key_match} \
               ) \
-         ), \
+          ), \
          matched_url_keys AS ( \
            SELECT DISTINCT url_key FROM resource_rows \
          ), \
-         raw_script_slices AS ( \
-           SELECT \
-             s.id, \
-             s.ts, \
-             s.dur, \
-             s.thread_dur, \
-             {script_overlap_start_expr} AS overlap_start_ts, \
-             {script_overlap_end_expr} AS overlap_end_ts, \
+         raw_script_slice_base AS ( \
+            SELECT \
+              s.id, \
+              s.ts, \
+              s.dur, \
+              s.arg_set_id, \
+              s.thread_dur, \
+              {script_overlap_start_expr} AS overlap_start_ts, \
+              {script_overlap_end_expr} AS overlap_end_ts, \
              {script_overlap_dur_expr} AS overlap_dur, \
              CASE WHEN s.thread_dur IS NOT NULL AND s.dur > 0 \
                   THEN s.thread_dur * {script_overlap_dur_expr} * 1.0 / s.dur \
@@ -816,23 +891,13 @@ pub fn chrome_page_load_resource_pipeline_sql(
              s.name, \
              ROUND(({script_overlap_start_expr} - {script_anchor_expr}) / 1e6, 3) AS start_ms, \
              ROUND(({script_overlap_end_expr} - {script_anchor_expr}) / 1e6, 3) AS end_ms, \
-             p.name AS process_name, \
-             p.upid AS upid, \
-             p.pid AS pid, \
-             t.name AS thread_name, \
-             COALESCE( \
-               MAX(CASE WHEN a.flat_key IN ( \
-                 'debug.url', 'debug.data.url', 'debug.data.script_url', \
-                 'debug.fileName', 'url', 'script_url', 'fileName' \
-               ) THEN a.display_value END), \
-               MAX(CASE WHEN a.key IN ('url', 'script_url', 'fileName') \
-                    THEN a.display_value END), \
-               MAX(CASE WHEN lower(a.flat_key) LIKE '%url%' \
-                    THEN a.display_value END) \
-             ) AS url, \
-             MAX(CASE WHEN a.flat_key = 'debug.size' THEN a.int_value END) AS size_bytes \
-           FROM slice s \
-           LEFT JOIN thread_track tt ON s.track_id = tt.id \
+              p.name AS process_name, \
+              p.upid AS upid, \
+              p.pid AS pid, \
+              t.name AS thread_name, \
+              MAX(CASE WHEN a.flat_key = 'debug.size' THEN a.int_value END) AS size_bytes \
+            FROM slice s \
+            LEFT JOIN thread_track tt ON s.track_id = tt.id \
            LEFT JOIN thread t ON tt.utid = t.utid \
            LEFT JOIN process p ON t.upid = p.upid \
            LEFT JOIN args a ON s.arg_set_id = a.arg_set_id ",
@@ -868,8 +933,52 @@ pub fn chrome_page_load_resource_pipeline_sql(
         sql.push_str(&format!(" AND {end} > {start}"));
     }
     sql.push_str(&format!(
-        " GROUP BY s.id, s.ts, s.dur, s.thread_dur, s.name, p.name, p.upid, p.pid, t.name \
-          HAVING url IS NOT NULL \
+        " GROUP BY s.id, s.ts, s.dur, s.arg_set_id, s.thread_dur, s.name, p.name, p.upid, p.pid, t.name \
+         ), \
+         raw_script_url_args AS ( \
+           SELECT \
+             rss.id, \
+             a.display_value AS url, \
+             {script_url_arg_priority_expr} AS url_priority \
+           FROM raw_script_slice_base rss \
+           JOIN args a ON rss.arg_set_id = a.arg_set_id \
+           WHERE a.display_value IS NOT NULL \
+             AND a.display_value != '' \
+         ), \
+         raw_script_min_url_priority AS ( \
+           SELECT id, MIN(url_priority) AS url_priority \
+           FROM raw_script_url_args \
+           WHERE url_priority < 99 \
+           GROUP BY id \
+         ), \
+         raw_script_selected_urls AS ( \
+           SELECT rsu.id, MIN(rsu.url) AS url \
+           FROM raw_script_url_args rsu \
+           JOIN raw_script_min_url_priority rsup \
+             ON rsup.id = rsu.id AND rsup.url_priority = rsu.url_priority \
+           GROUP BY rsu.id \
+         ), \
+         raw_script_slices AS ( \
+           SELECT DISTINCT \
+             rss.id, \
+             rss.ts, \
+             rss.dur, \
+             rss.thread_dur, \
+             rss.overlap_start_ts, \
+             rss.overlap_end_ts, \
+             rss.overlap_dur, \
+             rss.overlap_thread_dur, \
+             rss.name, \
+             rss.start_ms, \
+             rss.end_ms, \
+             rss.process_name, \
+             rss.upid, \
+             rss.pid, \
+             rss.thread_name, \
+             rssu.url, \
+             rss.size_bytes \
+           FROM raw_script_slice_base rss \
+           JOIN raw_script_selected_urls rssu ON rssu.id = rss.id \
          ), \
          script_slices AS ( \
            SELECT raw_script_slices.* \
@@ -922,11 +1031,25 @@ pub fn chrome_page_load_resource_pipeline_sql(
          ), \
          resource_rollup AS ( \
            SELECT \
-             rr.url_key, \
-             (SELECT r2.url FROM resource_rows r2 \
-              WHERE r2.url_key = rr.url_key \
-              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS example_url, \
-             COUNT(*) AS resource_slice_count, \
+              rr.url_key, \
+              (SELECT r2.url FROM resource_rows r2 \
+               WHERE r2.url_key = rr.url_key \
+               ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS example_url, \
+              (SELECT r2.matched_by FROM resource_rows r2 \
+               WHERE r2.url_key = rr.url_key \
+               ORDER BY CASE r2.matched_by \
+                         WHEN 'url_substring+example_slice_id' THEN 0 \
+                         WHEN 'url_substring' THEN 1 \
+                         ELSE 2 END, \
+                        r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS matched_by, \
+              (SELECT r2.matched_url_seed FROM resource_rows r2 \
+               WHERE r2.url_key = rr.url_key \
+               ORDER BY CASE r2.matched_by \
+                         WHEN 'url_substring+example_slice_id' THEN 0 \
+                         WHEN 'url_substring' THEN 1 \
+                         ELSE 2 END, \
+                        r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS matched_url_seed, \
+              COUNT(*) AS resource_slice_count, \
              ROUND(MIN(rr.start_ms), 3) AS first_resource_start_ms, \
              ROUND(MAX(rr.end_ms), 3) AS last_resource_end_ms, \
              ROUND(MAX(rr.overlap_dur) / 1e6, 3) AS max_request_overlap_ms, \
@@ -978,6 +1101,8 @@ pub fn chrome_page_load_resource_pipeline_sql(
          SELECT \
            rr.url_key, \
            rr.example_url, \
+           rr.matched_by, \
+           rr.matched_url_seed, \
            rr.resource_slice_count, \
            COALESCE(sr.script_slice_count, 0) AS script_slice_count, \
            rr.first_resource_start_ms, \
@@ -1020,6 +1145,45 @@ fn chrome_resource_url_key_expr(
                   ELSE {url_expr} END"
         ),
     }
+}
+
+fn chrome_url_arg_priority_expr(args_alias: &str) -> String {
+    let flat_key = format!("{args_alias}.flat_key");
+    let key = format!("{args_alias}.key");
+    let value = format!("{args_alias}.display_value");
+    format!(
+        "CASE \
+           WHEN LOWER({value}) IN ('http://unisolated.invalid/', 'https://unisolated.invalid/') \
+             THEN 90 \
+           WHEN LOWER({flat_key}) IN ( \
+             'debug.url', 'debug.data.url', \
+             'debug.data.request_url', 'debug.data.script_url', \
+             'debug.filename', 'debug.navigation_request.url', \
+             'debug.initial url', 'page_load.url', \
+             'url', 'request_url', 'script_url', 'filename' \
+           ) \
+             OR LOWER({key}) IN ('url', 'request_url', 'script_url', 'filename') \
+             THEN 1 \
+           WHEN LOWER({flat_key}) GLOB '*current_frame_host.url' \
+             OR LOWER({flat_key}) GLOB '*current_frame.url' \
+             OR LOWER({flat_key}) GLOB '*frame.url' \
+             THEN 2 \
+           WHEN LOWER({flat_key}) GLOB '*process_lock_url' \
+             OR LOWER({flat_key}) GLOB '*site_url' \
+             OR LOWER({key}) GLOB '*process_lock_url' \
+             OR LOWER({key}) GLOB '*site_url' \
+             THEN 8 \
+           WHEN LOWER({flat_key}) GLOB '*request*url*' \
+             OR LOWER({flat_key}) GLOB '*script*url*' \
+             OR LOWER({key}) GLOB '*request*url*' \
+             OR LOWER({key}) GLOB '*script*url*' \
+             THEN 3 \
+           WHEN LOWER({flat_key}) LIKE '%url%' \
+             OR LOWER({key}) LIKE '%url%' \
+             THEN 5 \
+           ELSE 99 \
+         END"
+    )
 }
 
 fn chrome_page_load_raw_window_navigation_url_expr(page_window: ChromePageLoadWindowSql) -> String {
@@ -1774,6 +1938,47 @@ mod tests {
         assert!(
             origin.contains("LOWER("),
             "origin expression should normalize scheme/host case, got: {origin}",
+        );
+    }
+
+    #[test]
+    fn chrome_url_arg_priority_prefers_real_frame_url_over_placeholder_context_urls() {
+        let priority = chrome_url_arg_priority_expr("a");
+        let placeholder = priority
+            .find("LOWER(a.display_value) IN ('http://unisolated.invalid/'")
+            .expect("placeholder URL demotion must be explicit");
+        let current_frame = priority
+            .find("LOWER(a.flat_key) GLOB '*current_frame_host.url'")
+            .expect("current-frame URL must be recognized before generic URL fallback");
+        let process_lock = priority
+            .find("LOWER(a.flat_key) GLOB '*process_lock_url'")
+            .expect("process-lock URL must be demoted before generic URL fallback");
+        let request_url = priority
+            .find("LOWER(a.flat_key) GLOB '*request*url*'")
+            .expect("request URL fallback must remain available");
+        let generic_url = priority
+            .find("LOWER(a.flat_key) LIKE '%url%'")
+            .expect("generic URL fallback must remain available");
+
+        assert!(
+            placeholder < current_frame,
+            "placeholder URL demotion should run before real URL cases, got: {priority}",
+        );
+        assert!(
+            current_frame < process_lock,
+            "current-frame URLs must beat process_lock/site URL fields, got: {priority}",
+        );
+        assert!(
+            process_lock < request_url,
+            "process_lock/site URL fields must not be caught by request-url fallback, got: {priority}",
+        );
+        assert!(
+            request_url < generic_url,
+            "request/script URL fallback should still beat generic URL fallback, got: {priority}",
+        );
+        assert!(
+            priority.contains("THEN 90") && priority.contains("THEN 8"),
+            "placeholder/context URL priorities should remain worse than real URL priorities, got: {priority}",
         );
     }
 

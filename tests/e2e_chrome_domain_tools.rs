@@ -301,12 +301,78 @@ fn e2e_chrome_page_load_resource_pipeline_sql_runs_cleanly() {
                 "row {i} missing url_key"
             );
             assert!(
+                table.cell(i, "matched_by").is_some(),
+                "row {i} missing matched_by"
+            );
+            assert!(
+                table.cell(i, "matched_url_seed").is_some(),
+                "row {i} missing matched_url_seed"
+            );
+            assert!(
                 table.cell(i, "max_request_overlap_ms").is_some(),
                 "row {i} missing max_request_overlap_ms",
             );
             assert!(
                 table.cell(i, "evidence_boundary").is_some(),
                 "row {i} missing evidence_boundary",
+            );
+        }
+    });
+}
+
+#[test]
+fn e2e_chrome_page_load_resource_pipeline_substring_stays_on_matched_url() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = TraceProcessorManager::new_with_starting_port(1, 19_268);
+        let trace = Path::new("tests/fixtures/page_loads.pftrace");
+
+        let client = manager.get_client(trace).await.expect("spawn tp_shell");
+        let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(7),
+                phase: Some(perfetto_mcp_rs::params::ChromePageLoadPhase::NavigationToFcp),
+                ..Default::default()
+            },
+            url_substring: Some("Astronomy"),
+            ..Default::default()
+        })
+        .expect("resource pipeline SQL builder must succeed");
+        let table = client
+            .query(&sql)
+            .await
+            .expect("chrome page-load resource pipeline query must succeed");
+
+        assert!(
+            table.len() > 0,
+            "fixture should contain at least one Astronomy resource row"
+        );
+        for i in 0..table.len() {
+            let url_key = table
+                .cell(i, "url_key")
+                .and_then(|v| v.as_str())
+                .expect("row should carry url_key");
+            let example_url = table
+                .cell(i, "example_url")
+                .and_then(|v| v.as_str())
+                .expect("row should carry example_url");
+            assert!(
+                url_key.contains("Astronomy") || example_url.contains("Astronomy"),
+                "row {i} escaped requested URL substring: url_key={url_key:?}, example_url={example_url:?}",
+            );
+            assert_eq!(
+                table.cell(i, "matched_by").and_then(|v| v.as_str()),
+                Some("url_substring"),
+                "row {i} should report substring matching as the seed"
+            );
+            assert_eq!(
+                table.cell(i, "matched_url_seed").and_then(|v| v.as_str()),
+                Some("Astronomy"),
+                "row {i} should echo the matched substring"
             );
         }
     });

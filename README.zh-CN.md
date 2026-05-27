@@ -185,7 +185,7 @@ PowerShell 写法：`cd <原项目目录>; $env:SCOPE = 'local'; irm ... | iex`�
 | `chrome_scroll_jank_summary` | 按原因汇总最严重的 Chrome 滚动卡顿帧；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_page_load_summary` | 页面加载的 URL / 原始边界时间戳 / FCP / LCP / DCL / load 耗时；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_page_load_resource_summary` | 页面加载窗口内紧凑按 URL 聚合资源/请求 slice，按最大 overlap 排序，并带规范化 origin、导航/renderer 相关性和归因范围证据；元信息标记行/字符串是否截断（仅 Chrome trace） |
-| `chrome_page_load_resource_pipeline` | 钻取单个 URL，将资源生命周期/request span 与后台解析、脚本执行、style/layout 信号合并，并标明 DNS/TLS/TTFB/cache/download 推断边界（仅 Chrome trace） |
+| `chrome_page_load_resource_pipeline` | 钻取单个 URL，将资源生命周期/request span 与后台解析、脚本执行、style/layout 信号合并，返回显式匹配证据，并标明 DNS/TLS/TTFB/cache/download 推断边界（仅 Chrome trace） |
 | `chrome_page_load_resource_hotspots` | thread/process/async track 上带 URL 的资源/请求类 slice 按页面加载/时间窗口 overlap 排序，并尽量带进程/线程归属；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_page_load_script_hotspots` | Renderer 主线程脚本执行按 URL/slice/进程聚合，并带 style/layout 子树信号；元信息标记行/字符串是否截断（仅 Chrome trace） |
 | `chrome_main_thread_hotspots` | 主线程任务按耗时排序，带 ts、upid/pid、cpu_pct，并支持页面加载/时间窗口过滤；元信息标记行/字符串是否截断（仅 Chrome trace） |
