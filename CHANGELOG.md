@@ -4,6 +4,11 @@
 
 ### Unreleased
 
+### [0.15.11](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.11) (May 27, 2026)
+
+- **URL resource drilldown is now a first-class Chrome tool.** `chrome_page_load_resource_pipeline` takes a `url_substring` or `example_slice_id` from `chrome_page_load_resource_summary` and returns the URL's lifecycle/request spans next to background parse, script evaluation, style/layout signals, size, example ids, and an explicit evidence boundary. Script metrics are clipped to the selected page-load/raw window so partial-overlap slices do not inflate attribution.
+- **`chrome_page_load_resource_summary` is more compact and self-triaging.** The default limit is now 25 rows, full `slice_names` fan-out is replaced by a representative `primary_slice_name`, and rows include `relation_to_navigation`, `renderer_relation`, `url_host`, `url_origin`, and `target_renderer_upids`. Raw timestamp windows now choose an overlapping navigation context using the latest non-null page-load marker, `navigation_url` honors the selected URL grouping, and same-origin labels compare normalized origins rather than host-only strings. The resource-timing evidence envelope separates safe fact fields from hypothesis-only labels, reducing both context volume and cross-renderer/extension noise in LLM page-load diagnoses.
+
 ### [0.15.10](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.10) (May 26, 2026)
 
 - **New `chrome_page_load_resource_summary` tool for URL-level page-load blockers.** It groups URL-bearing resource/request slices by full URL or URL-without-query inside the same page-load/raw windows as resource hotspots, ranking by per-URL max overlap while also returning summed overlap, slice names, process ids, priorities, an example slice id, and resource-timing evidence metadata. This gives LLM agents a first-pass resource dashboard before drilling into slice-level `chrome_page_load_resource_hotspots` while making DNS/TLS/TTFB/download/cache inferences explicit when the trace lacks phase data.

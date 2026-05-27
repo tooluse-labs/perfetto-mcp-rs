@@ -21,15 +21,16 @@ use std::path::Path;
 
 use perfetto_mcp_rs::params::{
     ChromeMainThreadHotspotsFilters, ChromePageLoadResourceHotspotsFilters,
-    ChromePageLoadResourceSummaryFilters, ChromePageLoadResourceUrlGrouping,
-    ChromePageLoadScriptHotspotsFilters, ChromePageLoadWindowFilters,
+    ChromePageLoadResourcePipelineFilters, ChromePageLoadResourceSummaryFilters,
+    ChromePageLoadResourceUrlGrouping, ChromePageLoadScriptHotspotsFilters,
+    ChromePageLoadWindowFilters,
 };
 use perfetto_mcp_rs::sql_templates::{
     chrome_main_thread_hotspots_sql, chrome_page_load_resource_hotspots_sql,
-    chrome_page_load_resource_summary_sql, chrome_page_load_resource_timing_evidence_sql,
-    chrome_page_load_script_hotspots_sql, CHROME_PAGE_LOAD_SUMMARY_SQL,
-    CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_SQL, CHROME_TRACE_PREFLIGHT_SQL,
-    CHROME_WEB_CONTENT_INTERACTIONS_SQL,
+    chrome_page_load_resource_pipeline_sql, chrome_page_load_resource_summary_sql,
+    chrome_page_load_resource_timing_evidence_sql, chrome_page_load_script_hotspots_sql,
+    CHROME_PAGE_LOAD_SUMMARY_SQL, CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_SQL,
+    CHROME_TRACE_PREFLIGHT_SQL, CHROME_WEB_CONTENT_INTERACTIONS_SQL,
 };
 use perfetto_mcp_rs::tp_manager::TraceProcessorManager;
 
@@ -191,6 +192,22 @@ fn e2e_chrome_page_load_resource_summary_sql_runs_cleanly() {
             .query(&sql)
             .await
             .expect("chrome page-load resource summary query must succeed");
+        let raw_window_sql =
+            chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
+                window: ChromePageLoadWindowFilters {
+                    start_ts_ns: Some(0),
+                    end_ts_ns: Some(10_000_000_000),
+                    ..Default::default()
+                },
+                min_overlap_ms: Some(0.0),
+                url_grouping: Some(ChromePageLoadResourceUrlGrouping::WithoutQuery),
+                limit: Some(5),
+            })
+            .expect("raw-window resource summary SQL builder must succeed");
+        client
+            .query(&raw_window_sql)
+            .await
+            .expect("raw-window resource summary query must succeed");
         let evidence_sql =
             chrome_page_load_resource_timing_evidence_sql(ChromePageLoadWindowFilters {
                 page_load_id: Some(1),
@@ -229,8 +246,67 @@ fn e2e_chrome_page_load_resource_summary_sql_runs_cleanly() {
                 "row {i} missing summed_overlap_ms",
             );
             assert!(
+                table.cell(i, "relation_to_navigation").is_some(),
+                "row {i} missing relation_to_navigation",
+            );
+            assert!(
+                table.cell(i, "url_origin").is_some(),
+                "row {i} missing url_origin",
+            );
+            assert!(
+                table.cell(i, "renderer_relation").is_some(),
+                "row {i} missing renderer_relation",
+            );
+            assert!(
                 table.cell(i, "example_slice_id").is_some(),
                 "row {i} missing example_slice_id",
+            );
+        }
+    });
+}
+
+#[test]
+fn e2e_chrome_page_load_resource_pipeline_sql_runs_cleanly() {
+    // Weak assertion: protects SQL compatibility and advertised columns. The
+    // fixture may not contain a matching "main" resource, so row count is not
+    // asserted.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = TraceProcessorManager::new_with_starting_port(1, 19_258);
+        let trace = Path::new("tests/fixtures/page_loads.pftrace");
+
+        let client = manager.get_client(trace).await.expect("spawn tp_shell");
+        let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(1),
+                phase: Some(perfetto_mcp_rs::params::ChromePageLoadPhase::NavigationToFcp),
+                ..Default::default()
+            },
+            url_substring: Some("main"),
+            ..Default::default()
+        })
+        .expect("resource pipeline SQL builder must succeed");
+        let table = client
+            .query(&sql)
+            .await
+            .expect("chrome page-load resource pipeline query must succeed");
+
+        for i in 0..table.len() {
+            assert!(
+                table.cell(i, "url_key").is_some(),
+                "row {i} missing url_key"
+            );
+            assert!(
+                table.cell(i, "max_request_overlap_ms").is_some(),
+                "row {i} missing max_request_overlap_ms",
+            );
+            assert!(
+                table.cell(i, "evidence_boundary").is_some(),
+                "row {i} missing evidence_boundary",
             );
         }
     });

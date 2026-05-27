@@ -615,8 +615,6 @@ impl PerfettoMcpServer {
         &self,
         Parameters(params): Parameters<ChromePageLoadResourceSummaryParams>,
     ) -> Result<String, String> {
-        let client = self.client_for_current().await?;
-        ensure_chrome_trace(&client, "Chrome page-load resource summary").await?;
         let window = ChromePageLoadWindowFilters {
             page_load_id: params.page_load_id,
             navigation_id: params.navigation_id,
@@ -633,6 +631,8 @@ impl PerfettoMcpServer {
         .map_err(|e| e.to_string())?;
         let evidence_sql =
             chrome_page_load_resource_timing_evidence_sql(window).map_err(|e| e.to_string())?;
+        let client = self.client_for_current().await?;
+        ensure_chrome_trace(&client, "Chrome page-load resource summary").await?;
         let evidence_table = client.query(&evidence_sql).await.map_err(|e| {
             format_chrome_tool_error("Chrome page-load resource summary evidence", e)
         })?;
@@ -643,9 +643,60 @@ impl PerfettoMcpServer {
             .map_err(|e| format_chrome_tool_error("Chrome page-load resource summary", e))?;
         format_chrome_resource_summary_response(
             table,
-            chrome_hotspots_effective_limit(params.limit),
+            chrome_hotspots_effective_limit_with_default(params.limit, 25),
             params.max_string_len,
             evidence,
+        )
+    }
+
+    #[tool(
+        name = "chrome_page_load_resource_pipeline",
+        description = "Drill into one Chrome page-load resource URL and join its \
+                       lifecycle/request spans with script parse/evaluate and \
+                       style/layout signals. Use after \
+                       `chrome_page_load_resource_summary` by passing \
+                       `example_slice_id` or `url_substring` for a slow URL. \
+                       Returns request/resource timing facts plus an \
+                       evidence_boundary reminding callers not to label \
+                       DNS/TLS/TTFB/download/cache without phase-specific rows. \
+                       Parameters: `url_substring` or `example_slice_id` required; \
+                       optional page-load/window filters, `url_grouping`, `limit` \
+                       default 30, `max_string_len`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn chrome_page_load_resource_pipeline(
+        &self,
+        Parameters(params): Parameters<ChromePageLoadResourcePipelineParams>,
+    ) -> Result<String, String> {
+        let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: params.page_load_id,
+                navigation_id: params.navigation_id,
+                phase: params.phase,
+                start_ts_ns: params.start_ts_ns,
+                end_ts_ns: params.end_ts_ns,
+            },
+            url_substring: params.url_substring.as_deref(),
+            example_slice_id: params.example_slice_id,
+            url_grouping: params.url_grouping,
+            limit: params.limit,
+        })
+        .map_err(|e| e.to_string())?;
+        let client = self.client_for_current().await?;
+        ensure_chrome_trace(&client, "Chrome page-load resource pipeline").await?;
+        let table = client
+            .query(&sql)
+            .await
+            .map_err(|e| format_chrome_tool_error("Chrome page-load resource pipeline", e))?;
+        format_chrome_tool_response(
+            table,
+            chrome_hotspots_effective_limit_with_default(params.limit, 30),
+            params.max_string_len,
         )
     }
 
@@ -1270,7 +1321,9 @@ struct ChromeResourceTimingEvidence {
     phase_breakdown: &'static str,
     phase_breakdown_available: bool,
     safe_conclusion: &'static str,
+    safe_fact_fields: Vec<&'static str>,
     unsafe_inferences: Vec<&'static str>,
+    hypothesis_only: Vec<&'static str>,
     network_phase_slice_count: i64,
     network_phase_arg_count: i64,
     incomplete_resource_slice_count: i64,
@@ -1319,10 +1372,14 @@ struct SliceDescendantsRowsResponse {
 }
 
 fn chrome_hotspots_effective_limit(limit: Option<u32>) -> usize {
+    chrome_hotspots_effective_limit_with_default(limit, DEFAULT_CHROME_TOOL_ROWS)
+}
+
+fn chrome_hotspots_effective_limit_with_default(limit: Option<u32>, default_limit: usize) -> usize {
     match limit {
         Some(n) if (n as usize) > MAX_ROWS => MAX_ROWS,
         Some(n) => n as usize,
-        None => DEFAULT_CHROME_TOOL_ROWS,
+        None => default_limit,
     }
 }
 
@@ -1438,6 +1495,12 @@ fn chrome_resource_timing_evidence_from_probe(
             phase_breakdown: "phase_hints_present",
             phase_breakdown_available: true,
             safe_conclusion: "Summary rows rank URL lifecycle/request spans; phase-like trace signals exist, so inspect phase rows before assigning DNS/TLS/TTFB/download/cache cause.",
+            safe_fact_fields: vec![
+                "url lifecycle/request span",
+                "window overlap",
+                "process/thread/upid evidence",
+                "renderer/navigation relatedness",
+            ],
             unsafe_inferences: vec![
                 "dns",
                 "tls",
@@ -1446,6 +1509,12 @@ fn chrome_resource_timing_evidence_from_probe(
                 "cache",
                 "cdn",
                 "server_response",
+            ],
+            hypothesis_only: vec![
+                "cache/proxy delay",
+                "cdn/server latency",
+                "network bandwidth",
+                "http2 priority/connection contention",
             ],
             network_phase_slice_count,
             network_phase_arg_count,
@@ -1458,6 +1527,12 @@ fn chrome_resource_timing_evidence_from_probe(
             phase_breakdown: "absent",
             phase_breakdown_available: false,
             safe_conclusion: "These URLs have long resource/request lifecycle spans overlapping the selected window.",
+            safe_fact_fields: vec![
+                "url lifecycle/request span",
+                "window overlap",
+                "process/thread/upid evidence",
+                "renderer/navigation relatedness",
+            ],
             unsafe_inferences: vec![
                 "dns",
                 "tls",
@@ -1466,6 +1541,12 @@ fn chrome_resource_timing_evidence_from_probe(
                 "cache",
                 "cdn",
                 "server_response",
+            ],
+            hypothesis_only: vec![
+                "cache/proxy delay",
+                "cdn/server latency",
+                "network bandwidth",
+                "http2 priority/connection contention",
             ],
             network_phase_slice_count,
             network_phase_arg_count,
@@ -2373,6 +2454,7 @@ fn recommended_tools(trace_profile: &str) -> Vec<String> {
         "chrome" => [
             "chrome_page_load_summary",
             "chrome_page_load_resource_summary",
+            "chrome_page_load_resource_pipeline",
             "chrome_page_load_resource_hotspots",
             "chrome_page_load_script_hotspots",
             "chrome_scroll_jank_summary",
@@ -2902,7 +2984,9 @@ mod tests {
             phase_breakdown: "absent",
             phase_breakdown_available: false,
             safe_conclusion: "safe",
+            safe_fact_fields: vec!["url lifecycle/request span"],
             unsafe_inferences: vec!["dns", "ttfb"],
+            hypothesis_only: vec!["cdn/server latency"],
             network_phase_slice_count: 0,
             network_phase_arg_count: 0,
             incomplete_resource_slice_count: 1,
@@ -3551,6 +3635,7 @@ mod tests {
             vec![
                 "chrome_main_thread_hotspots",
                 "chrome_page_load_resource_hotspots",
+                "chrome_page_load_resource_pipeline",
                 "chrome_page_load_resource_summary",
                 "chrome_page_load_script_hotspots",
                 "chrome_page_load_summary",
@@ -3888,6 +3973,32 @@ mod tests {
             assert!(err.contains("list_stdlib_modules"), "got: {err}");
 
             let r = server
+                .chrome_page_load_resource_pipeline(Parameters(
+                    ChromePageLoadResourcePipelineParams {
+                        url_substring: Some("main.js".to_owned()),
+                        example_slice_id: None,
+                        page_load_id: None,
+                        navigation_id: None,
+                        phase: None,
+                        start_ts_ns: None,
+                        end_ts_ns: None,
+                        url_grouping: None,
+                        limit: None,
+                        max_string_len: None,
+                    },
+                ))
+                .await;
+            let err = r
+                .map(|_| ())
+                .expect_err("chrome_page_load_resource_pipeline: preflight must reject");
+            assert!(
+                err.contains("Chrome page-load resource pipeline"),
+                "got: {err}"
+            );
+            assert!(err.contains("Chrome-family trace"), "got: {err}");
+            assert!(err.contains("list_stdlib_modules"), "got: {err}");
+
+            let r = server
                 .chrome_page_load_script_hotspots(Parameters(ChromePageLoadScriptHotspotsParams {
                     process_name: None,
                     pid: None,
@@ -4152,6 +4263,25 @@ mod tests {
     }
 
     #[test]
+    fn chrome_page_load_resource_pipeline_params_accepts_stringified_numerics() {
+        let p: ChromePageLoadResourcePipelineParams = serde_json::from_str(
+            r#"{"url_substring": "main.js", "example_slice_id": "123", "navigation_id": "7", "start_ts_ns": "100", "end_ts_ns": "200", "url_grouping": "without_query", "limit": "30", "max_string_len": "260"}"#,
+        )
+        .expect("stringified numerics must deserialize");
+        assert_eq!(p.url_substring.as_deref(), Some("main.js"));
+        assert_eq!(p.example_slice_id, Some(123));
+        assert_eq!(p.navigation_id, Some(7));
+        assert_eq!(p.start_ts_ns, Some(100));
+        assert_eq!(p.end_ts_ns, Some(200));
+        assert_eq!(
+            p.url_grouping,
+            Some(ChromePageLoadResourceUrlGrouping::WithoutQuery)
+        );
+        assert_eq!(p.limit, Some(30));
+        assert_eq!(p.max_string_len, Some(260));
+    }
+
+    #[test]
     fn chrome_page_load_script_hotspots_params_accepts_stringified_numerics() {
         let p: ChromePageLoadScriptHotspotsParams = serde_json::from_str(
             r#"{"upid": "14", "navigation_id": "7", "start_ts_ns": "100", "end_ts_ns": "200", "min_total_ms": "20", "limit": "30", "max_string_len": "260"}"#,
@@ -4226,6 +4356,18 @@ mod tests {
                     ("start_ts_ns", "integer"),
                     ("end_ts_ns", "integer"),
                     ("min_overlap_ms", "number"),
+                    ("limit", "integer"),
+                    ("max_string_len", "integer"),
+                ],
+            ),
+            (
+                "chrome_page_load_resource_pipeline",
+                vec![
+                    ("example_slice_id", "integer"),
+                    ("page_load_id", "integer"),
+                    ("navigation_id", "integer"),
+                    ("start_ts_ns", "integer"),
+                    ("end_ts_ns", "integer"),
                     ("limit", "integer"),
                     ("max_string_len", "integer"),
                 ],
@@ -5078,8 +5220,16 @@ mod tests {
             "auxiliary summed metric must be explicit, got: {sql}",
         );
         assert!(
-            sql.contains("GROUP_CONCAT(DISTINCT rr.name) AS slice_names"),
-            "summary must preserve contributing slice names, got: {sql}",
+            sql.contains("AS relation_to_navigation"),
+            "summary must classify URL relatedness to the navigation URL, got: {sql}",
+        );
+        assert!(
+            sql.contains("AS renderer_relation"),
+            "summary must classify target vs other renderer involvement, got: {sql}",
+        );
+        assert!(
+            sql.contains("AS primary_slice_name"),
+            "compact summary should expose one representative slice name, got: {sql}",
         );
         assert!(
             sql.contains("GROUP_CONCAT(DISTINCT rr.priority) AS priorities"),
@@ -5092,6 +5242,10 @@ mod tests {
         assert!(
             sql.contains("HAVING MAX(rr.overlap_dur) >= 50000000"),
             "default min_overlap_ms must be 50 ms, got: {sql}",
+        );
+        assert!(
+            sql.contains("LIMIT 25"),
+            "default summary limit should be compact, got: {sql}",
         );
     }
 
@@ -5129,6 +5283,182 @@ mod tests {
         assert!(
             sql.contains("LIMIT 25"),
             "explicit limit must be applied, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_summary_sql_scopes_navigation_context_to_raw_window() {
+        let sql = chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
+            window: ChromePageLoadWindowFilters {
+                start_ts_ns: Some(1000),
+                end_ts_ns: Some(2000),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("resource summary raw-window builder must succeed");
+        assert!(
+            sql.contains("navigation_start_ts < 2000"),
+            "raw-window navigation context must not use latest whole-trace nav, got: {sql}",
+        );
+        assert!(
+            sql.contains("NULLIF(MAX(") && sql.contains("COALESCE(mark_interactive_ts, -1)"),
+            "raw-window navigation context must use the latest non-null page-load marker, got: {sql}",
+        );
+        assert!(
+            sql.contains("), -1) > 1000"),
+            "raw-window navigation context must require latest marker overlap with the raw start, got: {sql}",
+        );
+        assert!(
+            sql.contains("WHEN (SELECT nav_url FROM navigation_context) IS NULL THEN 'unknown'"),
+            "missing raw-window navigation context must not classify same/cross origin, got: {sql}",
+        );
+        assert!(
+            sql.contains("WHEN (SELECT target_renderer_upids FROM navigation_context) IS NULL"),
+            "missing target renderer context must not report other_renderer/browser-only, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_summary_sql_compares_full_origin_for_same_origin() {
+        let sql =
+            chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters::default())
+                .expect("resource summary builder must succeed");
+        assert!(
+            sql.contains("AS url_origin"),
+            "summary should expose normalized origin evidence, got: {sql}",
+        );
+        assert!(
+            sql.contains("SUBSTR(rr.url_key, 1, INSTR(rr.url_key, '://') + 2)"),
+            "same-origin comparison must include scheme, not host only, got: {sql}",
+        );
+        assert!(
+            sql.contains("INSTR(SUBSTR(rr.url_key, INSTR(rr.url_key, '://') + 3), '?')"),
+            "origin/host extraction must stop before query-only URLs, got: {sql}",
+        );
+        assert!(
+            sql.contains("THEN 'same_origin'"),
+            "same-origin label should still be available after origin normalization, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_summary_sql_compares_grouped_navigation_key() {
+        let sql = chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
+            url_grouping: Some(ChromePageLoadResourceUrlGrouping::WithoutQuery),
+            ..Default::default()
+        })
+        .expect("resource summary builder must succeed");
+        assert!(
+            sql.contains("WHEN rr.url_key = CASE WHEN INSTR(COALESCE((SELECT nav_url FROM navigation_context), ''), '?') > 0"),
+            "navigation_url classification must apply the same URL grouping to nav_url, got: {sql}",
+        );
+        assert!(
+            !sql.contains("WHEN rr.url_key = COALESCE((SELECT nav_url FROM navigation_context), '')"),
+            "navigation_url classification must not compare grouped resource keys to raw nav_url, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_pipeline_sql_requires_url_seed() {
+        let err = chrome_page_load_resource_pipeline_sql(
+            ChromePageLoadResourcePipelineFilters::default(),
+        )
+        .expect_err("pipeline must require a URL seed");
+        assert!(
+            err.to_string().contains("url_substring")
+                && err.to_string().contains("example_slice_id"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_pipeline_sql_builds_url_drilldown() {
+        let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(7),
+                phase: Some(ChromePageLoadPhase::NavigationToFcp),
+                start_ts_ns: Some(1000),
+                end_ts_ns: Some(2000),
+                ..Default::default()
+            },
+            url_substring: Some("main.js"),
+            example_slice_id: Some(54333),
+            url_grouping: Some(ChromePageLoadResourceUrlGrouping::WithoutQuery),
+            limit: None,
+        })
+        .expect("pipeline SQL builder must succeed");
+        assert!(
+            sql.contains("WITH RECURSIVE"),
+            "pipeline must use recursive descendants for script/layout rollup, got: {sql}",
+        );
+        assert!(
+            sql.contains("INSTR(url, 'main.js') > 0"),
+            "url_substring must use literal INSTR matching, got: {sql}",
+        );
+        assert!(
+            sql.contains("s.id = 54333"),
+            "example_slice_id must seed URL lookup, got: {sql}",
+        );
+        assert!(
+            sql.contains("request_span_ms"),
+            "pipeline must expose request span evidence, got: {sql}",
+        );
+        assert!(
+            sql.contains("background_parse_ms"),
+            "pipeline must expose background parse evidence, got: {sql}",
+        );
+        assert!(
+            sql.contains("max_evaluate_ms"),
+            "pipeline must expose script evaluate evidence, got: {sql}",
+        );
+        assert!(
+            sql.contains("evidence_boundary"),
+            "pipeline must carry attribution boundary text, got: {sql}",
+        );
+        assert!(
+            sql.contains("LIMIT 30"),
+            "default pipeline limit should be compact, got: {sql}",
+        );
+    }
+
+    #[test]
+    fn chrome_page_load_resource_pipeline_sql_clips_script_metrics_to_window() {
+        let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(7),
+                phase: Some(ChromePageLoadPhase::NavigationToFcp),
+                start_ts_ns: Some(1000),
+                end_ts_ns: Some(2000),
+                ..Default::default()
+            },
+            url_substring: Some("main.js"),
+            ..Default::default()
+        })
+        .expect("pipeline SQL builder must succeed");
+        assert!(
+            sql.contains("MAX(s.ts, MAX(rw.start_ts, 1000)) AS overlap_start_ts"),
+            "script slices must compute clipped overlap starts, got: {sql}",
+        );
+        assert!(
+            sql.contains("MIN(s.ts + s.dur, MIN(rw.end_ts, 2000)) AS overlap_end_ts"),
+            "script slices must compute clipped overlap ends, got: {sql}",
+        );
+        assert!(
+            sql.contains("THEN ss.overlap_dur ELSE 0 END) / 1e6, 3)"),
+            "script totals must aggregate clipped overlap durations, got: {sql}",
+        );
+        assert!(
+            sql.contains("ROUND(MAX(ss.overlap_thread_dur) / 1e6, 3) AS max_script_cpu_ms"),
+            "script CPU must be prorated to the clipped overlap, got: {sql}",
+        );
+        assert!(
+            sql.contains("ORDER BY s2.overlap_dur DESC, s2.dur DESC"),
+            "example script id should rank by clipped overlap before full duration, got: {sql}",
+        );
+        assert!(
+            !sql.contains("THEN ss.dur ELSE 0 END) / 1e6, 3)"),
+            "windowed script totals must not use full slice duration, got: {sql}",
         );
     }
 

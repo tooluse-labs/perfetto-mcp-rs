@@ -187,7 +187,8 @@ it in place.
 | `slice_descendants_breakdown` | Summarize child slices under long slice ids without hand-writing recursive CTEs |
 | `chrome_scroll_jank_summary` | Worst janky frames with cause, sub-cause, delay_since_last_frame; metadata flags row/string truncation (Chrome trace) |
 | `chrome_page_load_summary` | Page loads: URL, raw boundary timestamps, FCP, LCP, DCL, load timings in ms; metadata flags row/string truncation (Chrome trace) |
-| `chrome_page_load_resource_summary` | URL-level resource/request summary for page-load windows, ranked by max overlap with grouped slice names/processes/priorities plus attribution-scope evidence; metadata flags row/string truncation (Chrome trace) |
+| `chrome_page_load_resource_summary` | Compact URL-level resource/request summary for page-load windows, ranked by max overlap with normalized origin, navigation/renderer relatedness, and attribution-scope evidence; metadata flags row/string truncation (Chrome trace) |
+| `chrome_page_load_resource_pipeline` | URL drilldown that joins one resource's lifecycle/request spans with background parse, script evaluation, style/layout signals, and an evidence boundary for DNS/TLS/TTFB/cache/download hypotheses (Chrome trace) |
 | `chrome_page_load_resource_hotspots` | URL-bearing resource/request slices on thread, process, and async tracks ranked by page-load/window overlap, with process/thread identity where available; metadata flags row/string truncation (Chrome trace) |
 | `chrome_page_load_script_hotspots` | Renderer main-thread script execution grouped by URL/slice/process within a page-load/window, with style/layout descendant signals; metadata flags row/string truncation (Chrome trace) |
 | `chrome_main_thread_hotspots` | Top main-thread tasks by duration with ts, upid/pid, cpu_pct, and optional page-load/time-window filters; metadata flags row/string truncation (Chrome trace) |
@@ -217,14 +218,15 @@ Typical flow depends on trace type:
 
 - **Chrome traces**: `load_trace` → dedicated `chrome_*` tools
   (`chrome_scroll_jank_summary`, `chrome_page_load_summary`,
-  `chrome_page_load_resource_summary`, `chrome_page_load_resource_hotspots`,
-  `chrome_page_load_script_hotspots`,
+  `chrome_page_load_resource_summary`, `chrome_page_load_resource_pipeline`,
+  `chrome_page_load_resource_hotspots`, `chrome_page_load_script_hotspots`,
   `chrome_main_thread_hotspots`, `chrome_startup_summary`,
   `chrome_web_content_interactions`) →
   `execute_sql` for deeper analysis on the returned rows. For slow FCP/load,
-  check URL-level resource summary first, then resource hotspots for slice
-  drilldown, before interpreting main-thread `ResourceLoad*` slices as full
-  request time. The summary's `resource_timing_evidence` says whether DNS/TLS/
+  check URL-level resource summary first, then use resource pipeline for one
+  slow URL or resource hotspots for slice drilldown, before interpreting
+  main-thread `ResourceLoad*` slices as full request time. The summary's
+  `resource_timing_evidence` says whether DNS/TLS/
   TTFB/download/cache phase hints exist; keep conclusions at URL lifecycle-span
   level when phase breakdown is absent. Use script hotspots for post-resource
   JS and style/layout work, and `slice_descendants_breakdown` on a long task
