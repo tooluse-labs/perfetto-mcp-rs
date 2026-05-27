@@ -348,7 +348,7 @@ fn e2e_chrome_page_load_resource_pipeline_substring_stays_on_matched_url() {
             .expect("chrome page-load resource pipeline query must succeed");
 
         assert!(
-            table.len() > 0,
+            !table.is_empty(),
             "fixture should contain at least one Astronomy resource row"
         );
         for i in 0..table.len() {

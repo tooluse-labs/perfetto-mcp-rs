@@ -769,7 +769,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
     let page_window = validate_chrome_page_load_window(window)?;
     let row_limit = chrome_tool_row_limit_with_default(limit, 30)?;
     let url_substring_lit = match url_substring {
-        Some(s) if s.is_empty() => {
+        Some("") => {
             return Err(PerfettoError::InvalidParam(
                 "url_substring must not be empty when set".to_owned(),
             ));
