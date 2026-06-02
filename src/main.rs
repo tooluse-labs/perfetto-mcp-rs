@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::fmt::format::FmtSpan;
 
 use perfetto_mcp_rs::download::DownloadConfig;
 use perfetto_mcp_rs::install::{self, InstallArgs, UninstallArgs};
@@ -41,6 +42,11 @@ struct Cli {
     /// Same env-reading contract as `startup_timeout_ms`.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     query_timeout_ms: Option<u64>,
+
+    /// Emit tracing span close timings for performance hotspot diagnosis.
+    /// Env fallback: PERFETTO_MCP_SPAN_TIMINGS=1|true|yes|on.
+    #[arg(long)]
+    span_timings: bool,
 
     /// Override the base URL used to download trace_processor_shell.
     /// Leave unset to use the default Perfetto LUCI artifacts bucket.
@@ -97,10 +103,17 @@ fn result_to_exit_code(r: anyhow::Result<()>) -> std::process::ExitCode {
 }
 
 async fn run_server(cli: Cli) -> anyhow::Result<()> {
+    let span_timings = resolve_span_timings(cli.span_timings, "PERFETTO_MCP_SPAN_TIMINGS")?;
+
     // MCP servers must not write to stdout (reserved for JSON-RPC).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        .with_span_events(if span_timings {
+            FmtSpan::CLOSE
+        } else {
+            FmtSpan::NONE
+        })
         .init();
 
     let startup_timeout_ms = resolve_timeout_ms(
@@ -113,11 +126,12 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
 
     let download_config = DownloadConfig::from_override(cli.artifacts_base_url.clone());
     tracing::info!(
-        "perfetto-mcp-rs v{} (max_instances={}, startup_timeout_ms={}, query_timeout_ms={}, artifacts_base_url={})",
+        "perfetto-mcp-rs v{} (max_instances={}, startup_timeout_ms={}, query_timeout_ms={}, span_timings={}, artifacts_base_url={})",
         env!("CARGO_PKG_VERSION"),
         cli.max_instances,
         startup_timeout_ms,
         query_timeout_ms,
+        span_timings,
         download_config.redacted_base_url(),
     );
 
@@ -154,5 +168,72 @@ fn resolve_timeout_ms(cli_value: Option<u64>, env_name: &str, default: u64) -> a
             Ok(v)
         }
         Err(_) => Ok(default),
+    }
+}
+
+fn resolve_span_timings(cli_enabled: bool, env_name: &str) -> anyhow::Result<bool> {
+    if cli_enabled {
+        return Ok(true);
+    }
+    match std::env::var(env_name) {
+        Ok(value) => parse_span_timings_value(env_name, &value),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(anyhow::anyhow!("invalid {env_name}: not valid UTF-8"))
+        }
+    }
+}
+
+fn parse_span_timings_value(env_name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        _ => Err(anyhow::anyhow!(
+            "invalid {env_name}: expected a boolean value (1/0, true/false, yes/no, on/off); got {value:?}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn span_timings_cli_flag_enables_close_events() {
+        let cli = Cli::try_parse_from(["perfetto-mcp-rs", "--span-timings"]).unwrap();
+
+        assert!(cli.span_timings);
+    }
+
+    #[test]
+    fn span_timings_default_is_off() {
+        let cli = Cli::try_parse_from(["perfetto-mcp-rs"]).unwrap();
+
+        assert!(
+            !resolve_span_timings(cli.span_timings, "PERFETTO_MCP_SPAN_TIMINGS_TEST_UNSET")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn span_timings_env_parser_accepts_boolean_values() {
+        assert!(!parse_span_timings_value("PERFETTO_MCP_SPAN_TIMINGS", "0").unwrap());
+        assert!(!parse_span_timings_value("PERFETTO_MCP_SPAN_TIMINGS", "false").unwrap());
+        assert!(parse_span_timings_value("PERFETTO_MCP_SPAN_TIMINGS", "1").unwrap());
+        assert!(parse_span_timings_value("PERFETTO_MCP_SPAN_TIMINGS", "true").unwrap());
+        assert!(parse_span_timings_value("PERFETTO_MCP_SPAN_TIMINGS", "yes").unwrap());
+        assert!(parse_span_timings_value("PERFETTO_MCP_SPAN_TIMINGS", "on").unwrap());
+    }
+
+    #[test]
+    fn span_timings_env_parser_rejects_unknown_values() {
+        let err = parse_span_timings_value("PERFETTO_MCP_SPAN_TIMINGS", "close").unwrap_err();
+
+        assert!(err.to_string().contains("PERFETTO_MCP_SPAN_TIMINGS"));
+    }
+
+    #[test]
+    fn span_events_cli_option_is_removed() {
+        assert!(Cli::try_parse_from(["perfetto-mcp-rs", "--span-events", "close"]).is_err());
     }
 }
