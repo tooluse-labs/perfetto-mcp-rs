@@ -14,5 +14,6 @@ pub(crate) mod query;
 pub mod server;
 pub mod sql_templates;
 pub mod stdlib_catalog;
+pub(crate) mod telemetry;
 pub mod tp_client;
 pub mod tp_manager;

@@ -73,6 +73,17 @@ pub(super) enum ExecuteSqlOutputMode {
     ColumnsOnly,
 }
 
+impl ExecuteSqlOutputMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExecuteSqlOutputMode::FullRows => "full_rows",
+            ExecuteSqlOutputMode::LimitedRows(_) => "limited_rows",
+            ExecuteSqlOutputMode::Summary(_) => "summary",
+            ExecuteSqlOutputMode::ColumnsOnly => "columns_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ExecuteSqlOutputShape {
     pub(super) mode: ExecuteSqlOutputMode,
@@ -230,6 +241,17 @@ pub(super) fn format_chrome_tool_response_with_redaction(
     max_string_len: Option<usize>,
     redact_strings: bool,
 ) -> Result<String, String> {
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "chrome_rows",
+        row_count = table.rows.len(),
+        effective_limit,
+        max_string_len_set = max_string_len.is_some(),
+        redact_strings,
+        string_truncated = tracing::field::Empty,
+        redacted = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     let shape = ExecuteSqlOutputShape {
         mode: ExecuteSqlOutputMode::FullRows,
         active: true,
@@ -238,6 +260,8 @@ pub(super) fn format_chrome_tool_response_with_redaction(
     };
     let returned_rows = table.rows.len();
     let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+    tracing::Span::current().record("string_truncated", string_truncated);
+    tracing::Span::current().record("redacted", redacted);
     serde_json::to_string(&ChromeToolRowsResponse {
         columns: table.columns,
         row_count: None,
@@ -274,6 +298,18 @@ pub(super) fn format_chrome_resource_summary_response_with_redaction(
     redact_strings: bool,
     evidence: ChromeResourceTimingEvidence,
 ) -> Result<String, String> {
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "chrome_resource_summary",
+        row_count = table.rows.len(),
+        effective_limit,
+        max_string_len_set = max_string_len.is_some(),
+        redact_strings,
+        phase_breakdown_available = evidence.phase_breakdown_available,
+        string_truncated = tracing::field::Empty,
+        redacted = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     let shape = ExecuteSqlOutputShape {
         mode: ExecuteSqlOutputMode::FullRows,
         active: true,
@@ -282,6 +318,8 @@ pub(super) fn format_chrome_resource_summary_response_with_redaction(
     };
     let returned_rows = table.rows.len();
     let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+    tracing::Span::current().record("string_truncated", string_truncated);
+    tracing::Span::current().record("redacted", redacted);
     serde_json::to_string(&ChromeResourceSummaryRowsResponse {
         columns: table.columns,
         row_count: None,
@@ -408,6 +446,18 @@ pub(super) fn format_slice_descendants_tool_response_with_redaction(
     max_string_len: Option<usize>,
     redact_strings: bool,
 ) -> Result<String, String> {
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "slice_descendants",
+        row_count = table.rows.len(),
+        effective_limit,
+        missing_root_count = missing_root_ids.len(),
+        max_string_len_set = max_string_len.is_some(),
+        redact_strings,
+        string_truncated = tracing::field::Empty,
+        redacted = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     let shape = ExecuteSqlOutputShape {
         mode: ExecuteSqlOutputMode::FullRows,
         active: true,
@@ -416,6 +466,8 @@ pub(super) fn format_slice_descendants_tool_response_with_redaction(
     };
     let returned_rows = table.rows.len();
     let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+    tracing::Span::current().record("string_truncated", string_truncated);
+    tracing::Span::current().record("redacted", redacted);
     serde_json::to_string(&SliceDescendantsRowsResponse {
         columns: table.columns,
         row_count: None,
@@ -449,11 +501,18 @@ pub(super) fn dedupe_slice_ids_preserving_order(ids: &[i64]) -> Vec<i64> {
 /// every row to carry sentinel NULLs. The per-call cost is a single
 /// `id IN (...)` lookup against the indexed `slice.id` column; cheap
 /// relative to the recursive expansion that follows.
+#[tracing::instrument(
+    level = "debug",
+    name = "slice_descendants.missing_roots",
+    skip(client, deduped_root_ids),
+    fields(root_count = deduped_root_ids.len(), missing_root_count = tracing::field::Empty)
+)]
 pub(super) async fn fetch_missing_slice_ids(
     client: &crate::tp_client::TraceProcessorClient,
     deduped_root_ids: &[i64],
 ) -> Result<Vec<i64>, PerfettoError> {
     if deduped_root_ids.is_empty() {
+        tracing::Span::current().record("missing_root_count", 0);
         return Ok(Vec::new());
     }
     let id_list = deduped_root_ids
@@ -470,11 +529,13 @@ pub(super) async fn fetch_missing_slice_ids(
             found.insert(id);
         }
     }
-    Ok(deduped_root_ids
+    let missing = deduped_root_ids
         .iter()
         .copied()
         .filter(|id| !found.contains(id))
-        .collect())
+        .collect::<Vec<_>>();
+    tracing::Span::current().record("missing_root_count", missing.len());
+    Ok(missing)
 }
 
 pub(super) fn format_execute_sql_response(
@@ -490,7 +551,21 @@ pub(super) fn format_execute_sql_response_with_redaction(
     redact_strings: bool,
 ) -> Result<String, String> {
     let shape = execute_sql_output_shape(params, redact_strings)?;
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "execute_sql",
+        row_count = table.rows.len(),
+        shape_active = shape.active,
+        output_mode = shape.mode.as_str(),
+        max_string_len_set = shape.max_string_len.is_some(),
+        redact_strings,
+        string_truncated = tracing::field::Empty,
+        redacted = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     if !shape.active {
+        tracing::Span::current().record("string_truncated", false);
+        tracing::Span::current().record("redacted", false);
         return serde_json::to_string(&table)
             .map_err(|e| format!("Failed to serialize results: {e}"));
     }
@@ -498,6 +573,8 @@ pub(super) fn format_execute_sql_response_with_redaction(
     let row_count = table.rows.len();
     match shape.mode {
         ExecuteSqlOutputMode::ColumnsOnly => {
+            tracing::Span::current().record("string_truncated", false);
+            tracing::Span::current().record("redacted", false);
             serde_json::to_string(&ExecuteSqlColumnsOnlyResponse {
                 columns: table.columns,
                 row_count,
@@ -513,6 +590,8 @@ pub(super) fn format_execute_sql_response_with_redaction(
         ExecuteSqlOutputMode::Summary(limit) => {
             let (sample_rows, string_truncated, redacted) =
                 transform_rows(table.rows.iter().take(limit), shape);
+            tracing::Span::current().record("string_truncated", string_truncated);
+            tracing::Span::current().record("redacted", redacted);
             serde_json::to_string(&ExecuteSqlSummaryResponse {
                 columns: table.columns,
                 returned_rows: sample_rows.len(),
@@ -529,6 +608,8 @@ pub(super) fn format_execute_sql_response_with_redaction(
         ExecuteSqlOutputMode::LimitedRows(limit) => {
             let (rows, string_truncated, redacted) =
                 transform_rows(table.rows.iter().take(limit), shape);
+            tracing::Span::current().record("string_truncated", string_truncated);
+            tracing::Span::current().record("redacted", redacted);
             serde_json::to_string(&ExecuteSqlRowsResponse {
                 columns: table.columns,
                 returned_rows: rows.len(),
@@ -544,6 +625,8 @@ pub(super) fn format_execute_sql_response_with_redaction(
         }
         ExecuteSqlOutputMode::FullRows => {
             let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+            tracing::Span::current().record("string_truncated", string_truncated);
+            tracing::Span::current().record("redacted", redacted);
             serde_json::to_string(&ExecuteSqlRowsResponse {
                 columns: table.columns,
                 returned_rows: rows.len(),

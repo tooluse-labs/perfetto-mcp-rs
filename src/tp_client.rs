@@ -4,10 +4,12 @@
 use std::time::Duration;
 
 use prost::Message;
+use tracing::Instrument;
 
 use crate::error::PerfettoError;
 use crate::proto::{QueryArgs, QueryResult, StatusResult};
 use crate::query::{decode_query_result, DecodedTable};
+use crate::telemetry::{perfetto_error_span_kind, sql_span_kind};
 
 /// HTTP client for a single trace_processor_shell RPC instance.
 #[derive(Clone, Debug)]
@@ -31,36 +33,89 @@ impl TraceProcessorClient {
 
     /// Execute a SQL query and return the decoded columnar table.
     pub async fn query(&self, sql: &str) -> Result<DecodedTable, PerfettoError> {
-        let args = QueryArgs {
-            sql_query: Some(sql.to_owned()),
-            tag: None,
-        };
-        let body = args.encode_to_vec();
+        let span = tracing::debug_span!(
+            "trace_processor.query",
+            rpc = "/query",
+            sql_kind = sql_span_kind(sql),
+            sql_len = sql.len(),
+            row_count = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
+        );
 
-        let resp = self
-            .http
-            .post(format!("{}/query", self.base_url))
-            .header("Content-Type", "application/x-protobuf")
-            .body(body)
-            .send()
-            .await?
-            .error_for_status()?;
+        async move {
+            let args = QueryArgs {
+                sql_query: Some(sql.to_owned()),
+                tag: None,
+            };
+            let body = args.encode_to_vec();
 
-        let bytes = resp.bytes().await?;
-        let result = QueryResult::decode(bytes)?;
-        decode_query_result(&result)
+            let result = async {
+                let resp = self
+                    .http
+                    .post(format!("{}/query", self.base_url))
+                    .header("Content-Type", "application/x-protobuf")
+                    .body(body)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+
+                let bytes = resp.bytes().await?;
+                let result = QueryResult::decode(bytes)?;
+                decode_query_result(&result)
+            }
+            .await;
+
+            match &result {
+                Ok(table) => {
+                    tracing::Span::current().record("row_count", table.len());
+                }
+                Err(err) => {
+                    tracing::Span::current().record("error_kind", perfetto_error_span_kind(err));
+                }
+            }
+
+            result
+        }
+        .instrument(span)
+        .await
     }
 
     /// Get the status of the trace_processor_shell instance.
     pub async fn status(&self) -> Result<StatusResult, PerfettoError> {
-        let resp = self
-            .http
-            .get(format!("{}/status", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?;
+        let span = tracing::debug_span!(
+            "trace_processor.status",
+            rpc = "/status",
+            loaded_trace_name_len = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
+        );
 
-        let bytes = resp.bytes().await?;
-        Ok(StatusResult::decode(bytes)?)
+        async move {
+            let result = async {
+                let resp = self
+                    .http
+                    .get(format!("{}/status", self.base_url))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+
+                let bytes = resp.bytes().await?;
+                Ok(StatusResult::decode(bytes)?)
+            }
+            .await;
+
+            match &result {
+                Ok(status) => {
+                    let name_len = status.loaded_trace_name.as_ref().map_or(0, Vec::len);
+                    tracing::Span::current().record("loaded_trace_name_len", name_len);
+                }
+                Err(err) => {
+                    tracing::Span::current().record("error_kind", perfetto_error_span_kind(err));
+                }
+            }
+
+            result
+        }
+        .instrument(span)
+        .await
     }
 }

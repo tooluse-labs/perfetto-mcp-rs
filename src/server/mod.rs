@@ -143,10 +143,18 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "load_trace", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn load_trace(
         &self,
         Parameters(params): Parameters<LoadTraceParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!("path_len={}", params.path.len()))
+            .await;
         let client = self.client_for(&params.path).await?;
 
         let status = client
@@ -213,10 +221,28 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "execute_sql", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn execute_sql(
         &self,
         Parameters(params): Parameters<ExecuteSqlParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "sql_kind={},sql_len={},shaping={}",
+            crate::telemetry::sql_span_kind(&params.sql),
+            params.sql.len(),
+            params.columns_only
+                || params.summary
+                || params.head.is_some()
+                || params.limit.is_some()
+                || params.include_row_count
+                || params.max_string_len.is_some()
+        ))
+        .await;
         let client = self.client_for_current().await?;
         let table = client
             .query(&params.sql)
@@ -256,10 +282,18 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "list_tables", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn list_tables(
         &self,
         Parameters(params): Parameters<ListTablesParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!("pattern_set={}", params.pattern.is_some()))
+            .await;
         let client = self.client_for_current().await?;
 
         let sql = match &params.pattern {
@@ -332,10 +366,18 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "list_table_structure", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn list_table_structure(
         &self,
         Parameters(params): Parameters<TableStructureParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!("table_name_len={}", params.table_name.len()))
+            .await;
         let client = self.client_for_current().await?;
         let table_name = sanitize_glob_param(&params.table_name).map_err(|e| e.to_string())?;
 
@@ -385,10 +427,17 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "list_processes", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn list_processes(
         &self,
         Parameters(_params): Parameters<ListProcessesParams>,
     ) -> Result<String, String> {
+        self.record_tool_span("no_params".to_owned()).await;
         let client = self.client_for_current().await?;
         let table = client
             .query("SELECT upid, pid, name, start_ts, end_ts FROM process ORDER BY start_ts")
@@ -426,10 +475,22 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "list_threads_in_process", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn list_threads_in_process(
         &self,
         Parameters(params): Parameters<ListThreadsInProcessParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "upid_set={},process_name_set={}",
+            params.upid.is_some(),
+            params.process_name.is_some()
+        ))
+        .await;
         // Validate inputs BEFORE opening the trace — failing fast on bad
         // params avoids spawning trace_processor_shell for a request that
         // can't possibly succeed.
@@ -511,10 +572,21 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_scroll_jank_summary", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_scroll_jank_summary(
         &self,
         Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "max_string_len_set={}",
+            params.max_string_len.is_some()
+        ))
+        .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome scroll jank summary").await?;
         let table = client
@@ -555,10 +627,21 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_page_load_summary", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_page_load_summary(
         &self,
         Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "max_string_len_set={}",
+            params.max_string_len.is_some()
+        ))
+        .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page load summary").await?;
         let table = client
@@ -583,10 +666,28 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_page_load_resource_hotspots", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_page_load_resource_hotspots(
         &self,
         Parameters(params): Parameters<ChromePageLoadResourceHotspotsParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "window_set={},min_dur_ms_set={},limit_set={},max_string_len_set={}",
+            params.page_load_id.is_some()
+                || params.navigation_id.is_some()
+                || params.phase.is_some()
+                || params.start_ts_ns.is_some()
+                || params.end_ts_ns.is_some(),
+            params.min_dur_ms.is_some(),
+            params.limit.is_some(),
+            params.max_string_len.is_some()
+        ))
+        .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page-load resource hotspots").await?;
         let sql = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
@@ -628,10 +729,29 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_page_load_resource_summary", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_page_load_resource_summary(
         &self,
         Parameters(params): Parameters<ChromePageLoadResourceSummaryParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "window_set={},min_overlap_ms_set={},url_grouping_set={},limit_set={},max_string_len_set={}",
+            params.page_load_id.is_some()
+                || params.navigation_id.is_some()
+                || params.phase.is_some()
+                || params.start_ts_ns.is_some()
+                || params.end_ts_ns.is_some(),
+            params.min_overlap_ms.is_some(),
+            params.url_grouping.is_some(),
+            params.limit.is_some(),
+            params.max_string_len.is_some()
+        ))
+        .await;
         let window = ChromePageLoadWindowFilters {
             page_load_id: params.page_load_id,
             navigation_id: params.navigation_id,
@@ -688,10 +808,30 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_page_load_resource_pipeline", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_page_load_resource_pipeline(
         &self,
         Parameters(params): Parameters<ChromePageLoadResourcePipelineParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "window_set={},url_substring_set={},example_slice_id_set={},url_grouping_set={},limit_set={},max_string_len_set={}",
+            params.page_load_id.is_some()
+                || params.navigation_id.is_some()
+                || params.phase.is_some()
+                || params.start_ts_ns.is_some()
+                || params.end_ts_ns.is_some(),
+            params.url_substring.is_some(),
+            params.example_slice_id.is_some(),
+            params.url_grouping.is_some(),
+            params.limit.is_some(),
+            params.max_string_len.is_some()
+        ))
+        .await;
         let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
             window: ChromePageLoadWindowFilters {
                 page_load_id: params.page_load_id,
@@ -738,10 +878,29 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_page_load_script_hotspots", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_page_load_script_hotspots(
         &self,
         Parameters(params): Parameters<ChromePageLoadScriptHotspotsParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "process_filter_set={},window_set={},min_total_ms_set={},limit_set={},max_string_len_set={}",
+            params.process_name.is_some() || params.pid.is_some() || params.upid.is_some(),
+            params.page_load_id.is_some()
+                || params.navigation_id.is_some()
+                || params.phase.is_some()
+                || params.start_ts_ns.is_some()
+                || params.end_ts_ns.is_some(),
+            params.min_total_ms.is_some(),
+            params.limit.is_some(),
+            params.max_string_len.is_some()
+        ))
+        .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page-load script hotspots").await?;
         let sql = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
@@ -824,10 +983,29 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_main_thread_hotspots", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_main_thread_hotspots(
         &self,
         Parameters(params): Parameters<ChromeMainThreadHotspotsParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "process_filter_set={},window_set={},min_dur_ms_set={},limit_set={},max_string_len_set={}",
+            params.process_name.is_some() || params.pid.is_some() || params.upid.is_some(),
+            params.page_load_id.is_some()
+                || params.navigation_id.is_some()
+                || params.phase.is_some()
+                || params.start_ts_ns.is_some()
+                || params.end_ts_ns.is_some(),
+            params.min_dur_ms.is_some(),
+            params.limit.is_some(),
+            params.max_string_len.is_some()
+        ))
+        .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome main-thread hotspots").await?;
         let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
@@ -877,10 +1055,26 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "slice_descendants_breakdown", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn slice_descendants_breakdown(
         &self,
         Parameters(params): Parameters<SliceDescendantsBreakdownParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "slice_id_count={},min_dur_ms_set={},max_depth_set={},limit_set={},include_args={},max_string_len_set={}",
+            params.slice_ids.len(),
+            params.min_dur_ms.is_some(),
+            params.max_depth.is_some(),
+            params.limit.is_some(),
+            params.include_args,
+            params.max_string_len.is_some()
+        ))
+        .await;
         let max_string_len = tool_max_string_len(params.max_string_len)?;
         let effective_limit =
             slice_descendants_effective_limit(params.limit).map_err(|e| e.to_string())?;
@@ -961,10 +1155,21 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_startup_summary", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_startup_summary(
         &self,
         Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "max_string_len_set={}",
+            params.max_string_len.is_some()
+        ))
+        .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome startup summary").await?;
         let table = client
@@ -1005,10 +1210,21 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "chrome_web_content_interactions", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn chrome_web_content_interactions(
         &self,
         Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "max_string_len_set={}",
+            params.max_string_len.is_some()
+        ))
+        .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome web content interactions").await?;
         let table = client
@@ -1036,10 +1252,23 @@ impl PerfettoMcpServer {
             open_world_hint = false
         )
     )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "list_stdlib_modules", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
     async fn list_stdlib_modules(
         &self,
         Parameters(params): Parameters<ListStdlibModulesParams>,
     ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "domain_set={},query_set={},limit_set={}",
+            params.domain.is_some(),
+            params.query.is_some(),
+            params.limit.is_some()
+        ))
+        .await;
         filtered_stdlib_modules_json(&params)
     }
 }
@@ -1059,6 +1288,13 @@ impl PerfettoMcpServer {
         let service = self.serve(transport).await?;
         service.waiting().await?;
         Ok(())
+    }
+
+    async fn record_tool_span(&self, param_summary: String) {
+        let trace_loaded = self.current_trace.lock().await.is_some();
+        let span = tracing::Span::current();
+        span.record("trace_loaded", trace_loaded);
+        span.record("param_summary", param_summary);
     }
 
     /// Return the current trace path set by `load_trace`, or a clear error

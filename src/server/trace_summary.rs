@@ -40,6 +40,12 @@ pub(super) struct LoadTraceSummary {
     pub(super) warnings: Vec<String>,
 }
 
+#[tracing::instrument(
+    level = "debug",
+    name = "load_trace.summary",
+    skip_all,
+    fields(trace_path_len = trace_path.len(), available = tracing::field::Empty)
+)]
 pub(super) async fn collect_load_trace_summary(
     client: &crate::tp_client::TraceProcessorClient,
     trace_path: &str,
@@ -54,11 +60,9 @@ pub(super) async fn collect_load_trace_summary(
         .map_err(|e| format!("overview query failed: {e}"))?;
     let file_size_bytes = std::fs::metadata(trace_path).map(|m| m.len()).ok();
 
-    Ok(build_load_trace_summary(
-        &metadata,
-        &overview,
-        file_size_bytes,
-    ))
+    let summary = build_load_trace_summary(&metadata, &overview, file_size_bytes);
+    tracing::Span::current().record("available", summary.available);
+    Ok(summary)
 }
 
 pub(super) fn build_load_trace_summary(
@@ -169,15 +173,29 @@ pub(super) fn format_load_trace_response(
     display: &str,
     summary: Result<LoadTraceSummary, String>,
 ) -> Result<String, String> {
+    let display_len = display.len();
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "load_trace",
+        display_len,
+        summary_available = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     let summary_json = match summary {
-        Ok(summary) => serde_json::to_string(&summary)
-            .map_err(|e| format!("Failed to serialize load summary: {e}"))?,
-        Err(error) => serde_json::to_string(&serde_json::json!({
-            "available": false,
-            "error": error,
-            "redaction_policy": current_redaction_policy(),
-        }))
-        .map_err(|e| format!("Failed to serialize load summary: {e}"))?,
+        Ok(summary) => {
+            tracing::Span::current().record("summary_available", true);
+            serde_json::to_string(&summary)
+                .map_err(|e| format!("Failed to serialize load summary: {e}"))?
+        }
+        Err(error) => {
+            tracing::Span::current().record("summary_available", false);
+            serde_json::to_string(&serde_json::json!({
+                "available": false,
+                "error": error,
+                "redaction_policy": current_redaction_policy(),
+            }))
+            .map_err(|e| format!("Failed to serialize load summary: {e}"))?
+        }
     };
 
     Ok(format!(
