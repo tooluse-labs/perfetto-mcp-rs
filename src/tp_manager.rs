@@ -4,7 +4,7 @@
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use lru::LruCache;
@@ -64,6 +64,28 @@ struct TraceProcessorInstance {
     port: u16,
     client: TraceProcessorClient,
     stderr_tail: SharedStderrTail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceFileFingerprint {
+    size_bytes: u64,
+    modified: Option<SystemTime>,
+}
+
+impl TraceFileFingerprint {
+    fn from_path(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("failed to stat trace file: {}", path.display()))?;
+        Ok(Self {
+            size_bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+struct CachedTraceProcessorInstance {
+    instance: TraceProcessorInstance,
+    fingerprint: TraceFileFingerprint,
 }
 
 impl TraceProcessorInstance {
@@ -243,7 +265,9 @@ impl Drop for TraceProcessorInstance {
 }
 
 /// Manages a pool of trace_processor_shell instances, one per trace file,
-/// with LRU eviction when the pool exceeds `max_instances`.
+/// with LRU eviction when the pool exceeds `max_instances`. Instances are
+/// keyed by canonical path and invalidated when that file's size/mtime
+/// fingerprint changes.
 pub struct TraceProcessorManager {
     inner: Mutex<ManagerInner>,
     spawn_locks: Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>,
@@ -262,7 +286,7 @@ impl std::fmt::Debug for TraceProcessorManager {
 }
 
 struct ManagerInner {
-    instances: LruCache<PathBuf, TraceProcessorInstance>,
+    instances: LruCache<PathBuf, CachedTraceProcessorInstance>,
     next_port: u16,
     starting_port: u16,
 }
@@ -362,17 +386,14 @@ impl TraceProcessorManager {
     /// respawned. If the cache is full, the least recently used instance
     /// is evicted (its process is killed via `kill_on_drop`).
     pub async fn get_client(&self, trace_path: &Path) -> Result<TraceProcessorClient> {
-        let canonical = trace_path
-            .canonicalize()
-            .with_context(|| format!("trace file not found: {}", trace_path.display()))?;
+        let (canonical, fingerprint, shell_path) = resolve_trace_identity(trace_path)?;
         // Cache key stays canonical so two requests for the same trace
         // (regardless of which shell-friendly alias we pick) share an
         // instance. shell_path is what we hand the child process — usually
         // identical, but on Windows + non-ASCII we may rewrite it to the
         // 8.3 short name to dodge the ANSI-codepage argv mangling.
-        let shell_path = resolve_trace_path_for_shell(&canonical)?;
         let binary = self.ensure_binary().await?.to_path_buf();
-        self.get_or_spawn_instance(canonical, move |port, _canonical| async move {
+        self.get_or_spawn_instance(canonical, fingerprint, move |port, _canonical| async move {
             TraceProcessorInstance::spawn(&binary, &shell_path, port, self.config).await
         })
         .await
@@ -381,6 +402,7 @@ impl TraceProcessorManager {
     async fn get_or_spawn_instance<F, Fut>(
         &self,
         canonical: PathBuf,
+        fingerprint: TraceFileFingerprint,
         spawn: F,
     ) -> Result<TraceProcessorClient>
     where
@@ -390,7 +412,7 @@ impl TraceProcessorManager {
         let path_lock = self.spawn_lock(canonical.clone()).await;
         let _path_guard = path_lock.lock().await;
         let result = self
-            .get_or_spawn_instance_locked(canonical.clone(), spawn)
+            .get_or_spawn_instance_locked(canonical.clone(), fingerprint, spawn)
             .await;
         self.cleanup_spawn_lock(&canonical, &path_lock).await;
         result
@@ -399,13 +421,14 @@ impl TraceProcessorManager {
     async fn get_or_spawn_instance_locked<F, Fut>(
         &self,
         canonical: PathBuf,
+        fingerprint: TraceFileFingerprint,
         spawn: F,
     ) -> Result<TraceProcessorClient>
     where
         F: FnOnce(u16, PathBuf) -> Fut,
         Fut: std::future::Future<Output = Result<TraceProcessorInstance>>,
     {
-        if let Some(client) = self.cached_client(&canonical).await? {
+        if let Some(client) = self.cached_client(&canonical, &fingerprint).await? {
             return Ok(client);
         }
 
@@ -419,22 +442,44 @@ impl TraceProcessorManager {
 
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.instances.get(&canonical) {
-            return Ok(existing.client.clone());
+            return Ok(existing.instance.client.clone());
         }
-        inner.instances.put(canonical, instance);
+        inner.instances.put(
+            canonical,
+            CachedTraceProcessorInstance {
+                instance,
+                fingerprint,
+            },
+        );
         Ok(client)
     }
 
-    async fn cached_client(&self, canonical: &Path) -> Result<Option<TraceProcessorClient>> {
+    async fn cached_client(
+        &self,
+        canonical: &Path,
+        fingerprint: &TraceFileFingerprint,
+    ) -> Result<Option<TraceProcessorClient>> {
         let mut inner = self.inner.lock().await;
-        if let Some(inst) = inner.instances.get_mut(canonical) {
-            match inst.try_wait()? {
-                None => return Ok(Some(inst.client.clone())),
+        if let Some(cached) = inner.instances.get_mut(canonical) {
+            if cached.fingerprint != *fingerprint {
+                tracing::info!(
+                    "trace file metadata changed for {}; respawning cached trace_processor_shell on port {} (old={:?}, new={:?})",
+                    canonical.display(),
+                    cached.instance.port,
+                    cached.fingerprint,
+                    fingerprint,
+                );
+                inner.instances.pop(canonical);
+                return Ok(None);
+            }
+
+            match cached.instance.try_wait()? {
+                None => return Ok(Some(cached.instance.client.clone())),
                 Some(status) => {
                     tracing::warn!(
                         "trace_processor_shell on port {} exited with {status}; respawning{}",
-                        inst.port,
-                        format_stderr_tail(&inst.stderr_tail),
+                        cached.instance.port,
+                        format_stderr_tail(&cached.instance.stderr_tail),
                     );
                     inner.instances.pop(canonical);
                 }
@@ -459,6 +504,15 @@ impl TraceProcessorManager {
             locks.remove(canonical);
         }
     }
+}
+
+fn resolve_trace_identity(path: &Path) -> Result<(PathBuf, TraceFileFingerprint, PathBuf)> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("trace file not found: {}", path.display()))?;
+    let fingerprint = TraceFileFingerprint::from_path(&canonical)?;
+    let shell_path = resolve_trace_path_for_shell(&canonical)?;
+    Ok((canonical, fingerprint, shell_path))
 }
 
 fn allocate_next_port(inner: &mut ManagerInner) -> Result<u16> {
@@ -1393,11 +1447,15 @@ mod tests {
             let spawn_count = Arc::clone(&spawn_count);
             tokio::spawn(async move {
                 manager
-                    .get_or_spawn_instance(canonical, move |port, _| async move {
-                        spawn_count.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        Ok(fake_instance(port))
-                    })
+                    .get_or_spawn_instance(
+                        canonical,
+                        test_fingerprint(1),
+                        move |port, _| async move {
+                            spawn_count.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Ok(fake_instance(port))
+                        },
+                    )
                     .await
             })
         };
@@ -1408,10 +1466,14 @@ mod tests {
             let spawn_count = Arc::clone(&spawn_count);
             tokio::spawn(async move {
                 manager
-                    .get_or_spawn_instance(canonical, move |port, _| async move {
-                        spawn_count.fetch_add(1, Ordering::SeqCst);
-                        Ok(fake_instance(port))
-                    })
+                    .get_or_spawn_instance(
+                        canonical,
+                        test_fingerprint(1),
+                        move |port, _| async move {
+                            spawn_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(fake_instance(port))
+                        },
+                    )
                     .await
             })
         };
@@ -1438,6 +1500,7 @@ mod tests {
                 manager
                     .get_or_spawn_instance(
                         PathBuf::from("/tmp/concurrent-a.perfetto-trace"),
+                        test_fingerprint(1),
                         move |port, _| async move {
                             spawn_count.fetch_add(1, Ordering::SeqCst);
                             Ok(fake_instance(port))
@@ -1454,6 +1517,7 @@ mod tests {
                 manager
                     .get_or_spawn_instance(
                         PathBuf::from("/tmp/concurrent-b.perfetto-trace"),
+                        test_fingerprint(1),
                         move |port, _| async move {
                             spawn_count.fetch_add(1, Ordering::SeqCst);
                             Ok(fake_instance(port))
@@ -1484,10 +1548,14 @@ mod tests {
         for path in [&trace_a, &trace_b, &trace_c] {
             let counter = Arc::clone(&spawn_count);
             manager
-                .get_or_spawn_instance(path.clone(), move |port, _| async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(fake_instance(port))
-                })
+                .get_or_spawn_instance(
+                    path.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
                 .await
                 .expect("initial spawn");
         }
@@ -1501,7 +1569,7 @@ mod tests {
         {
             let counter = Arc::clone(&spawn_count);
             manager
-                .get_or_spawn_instance(trace_a, move |port, _| async move {
+                .get_or_spawn_instance(trace_a, test_fingerprint(1), move |port, _| async move {
                     counter.fetch_add(1, Ordering::SeqCst);
                     Ok(fake_instance(port))
                 })
@@ -1518,7 +1586,7 @@ mod tests {
         {
             let counter = Arc::clone(&spawn_count);
             manager
-                .get_or_spawn_instance(trace_c, move |port, _| async move {
+                .get_or_spawn_instance(trace_c, test_fingerprint(1), move |port, _| async move {
                     counter.fetch_add(1, Ordering::SeqCst);
                     Ok(fake_instance(port))
                 })
@@ -1533,6 +1601,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_or_spawn_instance_respawns_when_trace_fingerprint_changes() {
+        let manager = Arc::new(TraceProcessorManager::new(2));
+        let canonical = PathBuf::from("/tmp/changed-trace.perfetto-trace");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+
+        {
+            let counter = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    canonical.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("initial spawn");
+        }
+
+        {
+            let counter = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(canonical, test_fingerprint(2), move |port, _| async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(fake_instance(port))
+                })
+                .await
+                .expect("respawn changed trace");
+        }
+
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            2,
+            "same path with changed size/mtime fingerprint must respawn",
+        );
+    }
+
+    #[tokio::test]
+    async fn same_canonical_path_respawns_after_real_file_metadata_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let trace = tmp.path().join("same-name.perfetto-trace");
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested dir");
+        std::fs::write(&trace, b"old").expect("write initial trace");
+
+        let aliased_path = nested.join("..").join("same-name.perfetto-trace");
+        let expected_canonical = trace.canonicalize().expect("canonical trace");
+        let manager = Arc::new(TraceProcessorManager::new(2));
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+
+        let (canonical, fingerprint, _shell_path) =
+            resolve_trace_identity(&aliased_path).expect("resolve initial trace identity");
+        let metadata = std::fs::metadata(&trace).expect("initial trace metadata");
+        assert_eq!(canonical, expected_canonical);
+        assert_eq!(fingerprint.size_bytes, metadata.len());
+        assert_eq!(fingerprint.modified, metadata.modified().ok());
+
+        {
+            let counter = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    canonical.clone(),
+                    fingerprint.clone(),
+                    move |port, observed_canonical| async move {
+                        assert_eq!(observed_canonical, expected_canonical);
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("initial spawn");
+        }
+
+        let (canonical_again, fingerprint_again, _shell_path) =
+            resolve_trace_identity(&aliased_path).expect("resolve unchanged trace identity");
+        assert_eq!(canonical_again, canonical);
+        assert_eq!(fingerprint_again, fingerprint);
+        {
+            let counter = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    canonical.clone(),
+                    fingerprint_again,
+                    move |port, _| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("unchanged cache hit");
+        }
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "unchanged canonical path + metadata must reuse cached instance",
+        );
+
+        std::fs::write(&trace, b"new trace contents are larger").expect("overwrite trace");
+        let (canonical_changed, changed_fingerprint, _shell_path) =
+            resolve_trace_identity(&aliased_path).expect("resolve changed trace identity");
+        assert_eq!(canonical_changed, canonical);
+        assert_ne!(
+            changed_fingerprint.size_bytes, fingerprint.size_bytes,
+            "test setup must change file size",
+        );
+        assert_ne!(
+            changed_fingerprint, fingerprint,
+            "real size/mtime fingerprint must change after overwrite",
+        );
+
+        {
+            let counter = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    canonical_changed,
+                    changed_fingerprint,
+                    move |port, _| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("changed metadata respawn");
+        }
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            2,
+            "same canonical path with changed real file metadata must respawn",
+        );
+    }
+
+    #[tokio::test]
     async fn get_or_spawn_instance_recovers_after_process_death() {
         let manager = Arc::new(TraceProcessorManager::new(2));
         let canonical = PathBuf::from("/tmp/auto-recovery-trace.perfetto-trace");
@@ -1542,10 +1743,14 @@ mod tests {
         {
             let counter = Arc::clone(&spawn_count);
             manager
-                .get_or_spawn_instance(canonical.clone(), move |port, _| async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(fake_instance_with_process(port, spawn_quick_exit_process()))
-                })
+                .get_or_spawn_instance(
+                    canonical.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance_with_process(port, spawn_quick_exit_process()))
+                    },
+                )
                 .await
                 .expect("initial spawn");
         }
@@ -1557,7 +1762,7 @@ mod tests {
         {
             let counter = Arc::clone(&spawn_count);
             manager
-                .get_or_spawn_instance(canonical, move |port, _| async move {
+                .get_or_spawn_instance(canonical, test_fingerprint(1), move |port, _| async move {
                     counter.fetch_add(1, Ordering::SeqCst);
                     Ok(fake_instance(port))
                 })
@@ -1743,6 +1948,13 @@ mod tests {
             port,
             client: TraceProcessorClient::new(port, Duration::from_secs(1)),
             stderr_tail: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
+        }
+    }
+
+    fn test_fingerprint(version: u64) -> TraceFileFingerprint {
+        TraceFileFingerprint {
+            size_bytes: 42,
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(version)),
         }
     }
 

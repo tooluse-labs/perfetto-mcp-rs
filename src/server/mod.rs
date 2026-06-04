@@ -130,7 +130,8 @@ impl PerfettoMcpServer {
                        trace_processor accepts — content-sniffed, not by extension). \
                        Calling again with a new path replaces the active \
                        trace; cached `trace_processor_shell` instances make repeat loads \
-                       near-zero-cost.\n\
+                       near-zero-cost unless the same path's file size or modified time \
+                       changed since it was loaded.\n\
                        \n\
                        Errors when: the file doesn't exist, isn't a valid Perfetto \
                        trace, or `trace_processor_shell` fails to parse it (corrupt \

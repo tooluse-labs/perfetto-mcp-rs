@@ -51,9 +51,11 @@ Five files carry the load. Read them in this order before making non-trivial cha
 
 - **`src/tp_manager.rs`** — `TraceProcessorManager` keeps an LRU pool of running
   `trace_processor_shell` child processes (`--max-instances`, default 3), one per
-  *canonical* trace path, each bound to a distinct localhost port starting at 9001.
-  `kill_on_drop` cleans up evicted instances. Spawn readiness has a two-phase wait: first a
-  stderr-marker gate; if no marker arrives within `STATUS_FALLBACK_DELAY`, it falls back to
+  *canonical* trace path, each bound to a distinct localhost port starting at 9001. Cached
+  entries store the trace file's size/mtime fingerprint and respawn if the same path is
+  overwritten with different metadata. `kill_on_drop` cleans up evicted instances. Spawn
+  readiness has a two-phase wait: first a stderr-marker gate; if no marker arrives within
+  `STATUS_FALLBACK_DELAY`, it falls back to
   polling `/status` and confirming `loaded_trace_name` matches the expected trace (this is
   the instance-identity check — `/status` alone could otherwise succeed against an unrelated
   process on the same port).
