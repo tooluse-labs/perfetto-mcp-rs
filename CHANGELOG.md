@@ -4,6 +4,11 @@
 
 ### Unreleased
 
+### [0.15.13](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.13) (June 4, 2026)
+
+- **Reloading an overwritten trace path now invalidates the cached trace processor.** `load_trace` still reuses `trace_processor_shell` instances by canonical path for fast repeat analysis, but each cache entry now records the trace file's size and modified time. If the same path is overwritten with different metadata inside one MCP session, the old process is evicted and the new trace is parsed instead of returning stale rows from the previous file.
+- **Server diagnostics are more useful without changing tool outputs.** MCP tools, trace-processor RPCs, Chrome preflight checks, load summaries, and response shaping now emit coarse privacy-preserving tracing spans; span close timings remain opt-in through `--span-timings` or `PERFETTO_MCP_SPAN_TIMINGS`. Server and SQL-template helper modules were also split by domain to keep future tool changes easier to review while preserving the existing public module paths and MCP surface.
+
 ### [0.15.12](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.12) (May 27, 2026)
 
 - **Chrome resource pipeline URL attribution is more deterministic and explainable.** URL-bearing resource/script slices now choose a single URL by semantic arg priority before aggregation, preventing same-priority URL args from duplicating slices while keeping real request/frame URLs ahead of Chrome context placeholders such as `process_lock_url`, `site_url`, and `http://unisolated.invalid/`. `chrome_page_load_resource_pipeline` rows also include `matched_by` and `matched_url_seed`, so LLM callers can verify whether a drilldown row came from `url_substring`, `example_slice_id`, or both.
