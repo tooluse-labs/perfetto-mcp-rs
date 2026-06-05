@@ -50,14 +50,19 @@ pub(super) async fn collect_load_trace_summary(
     client: &crate::tp_client::TraceProcessorClient,
     trace_path: &str,
 ) -> Result<LoadTraceSummary, String> {
-    let metadata = client
-        .query(LOAD_TRACE_METADATA_SQL)
-        .await
-        .map_err(|e| format!("metadata query failed: {e}"))?;
-    let overview = client
-        .query(LOAD_TRACE_OVERVIEW_SQL)
-        .await
-        .map_err(|e| format!("overview query failed: {e}"))?;
+    let metadata = async {
+        client
+            .query(LOAD_TRACE_METADATA_SQL)
+            .await
+            .map_err(|e| format!("metadata query failed: {e}"))
+    };
+    let overview = async {
+        client
+            .query(LOAD_TRACE_OVERVIEW_SQL)
+            .await
+            .map_err(|e| format!("overview query failed: {e}"))
+    };
+    let (metadata, overview) = tokio::try_join!(metadata, overview)?;
     let file_size_bytes = std::fs::metadata(trace_path).map(|m| m.len()).ok();
 
     let summary = build_load_trace_summary(&metadata, &overview, file_size_bytes);

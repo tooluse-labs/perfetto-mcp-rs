@@ -258,6 +258,38 @@ fn load_trace_response_preserves_success_when_summary_unavailable() {
 }
 
 #[test]
+fn schema_cache_is_scoped_to_trace_fingerprint() {
+    let key_a = SchemaCacheTraceKey {
+        canonical_path: PathBuf::from("/tmp/a.perfetto-trace"),
+        size_bytes: 1,
+        modified: None,
+    };
+    let key_b = SchemaCacheTraceKey {
+        canonical_path: PathBuf::from("/tmp/a.perfetto-trace"),
+        size_bytes: 2,
+        modified: None,
+    };
+    let mut cache = SchemaCache::default();
+
+    cache.store_table_list(key_a.clone(), None, r#"{"names":["slice"]}"#.to_owned());
+    cache.store_table_structure(
+        key_a.clone(),
+        "slice".to_owned(),
+        r#"{"table":"slice","columns":[]}"#.to_owned(),
+    );
+
+    assert_eq!(
+        cache.table_list(&key_a, &None).as_deref(),
+        Some(r#"{"names":["slice"]}"#)
+    );
+    assert!(cache.table_list(&key_b, &None).is_none());
+    assert!(
+        cache.table_structure(&key_a, "slice").is_none(),
+        "switching trace fingerprints must clear stale structures too"
+    );
+}
+
+#[test]
 fn load_trace_returns_summary_from_real_trace() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -774,6 +806,82 @@ fn execute_sql_head_limits_returned_rows_and_marks_truncation() {
             .contains("post-SQL decoded rows"),
         "note must prevent SQL-limit confusion: {parsed}",
     );
+}
+
+#[test]
+fn execute_sql_decode_options_materialize_only_requested_rows() {
+    let mut params = execute_sql_params("SELECT n FROM nums");
+
+    assert_eq!(
+        execute_sql_decode_options(&params).expect("valid params"),
+        crate::query::DecodeQueryOptions { max_rows: None }
+    );
+
+    params.head = Some(5);
+    assert_eq!(
+        execute_sql_decode_options(&params).expect("valid head"),
+        crate::query::DecodeQueryOptions { max_rows: Some(5) }
+    );
+
+    params.head = None;
+    params.summary = true;
+    assert_eq!(
+        execute_sql_decode_options(&params).expect("valid summary"),
+        crate::query::DecodeQueryOptions {
+            max_rows: Some(DEFAULT_EXECUTE_SQL_SUMMARY_ROWS)
+        }
+    );
+
+    params.summary = false;
+    params.columns_only = true;
+    assert_eq!(
+        execute_sql_decode_options(&params).expect("valid columns_only"),
+        crate::query::DecodeQueryOptions { max_rows: Some(0) }
+    );
+}
+
+#[test]
+fn execute_sql_decoded_response_uses_exact_count_from_limited_decoder() {
+    let decoded = crate::query::DecodedQueryResult {
+        table: decoded_table(&["n"], vec![vec![json!(1)]]),
+        row_count: 3,
+        row_count_known: true,
+        rows_truncated: true,
+    };
+    let mut params = execute_sql_params("SELECT n FROM nums");
+    params.head = Some(1);
+
+    let response = format_execute_sql_decoded_response_with_redaction(decoded, &params, false)
+        .expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    assert_eq!(parsed["rows"], json!([[1]]));
+    assert_eq!(parsed["row_count"], json!(3));
+    assert_eq!(parsed["returned_rows"], json!(1));
+    assert_eq!(parsed["truncated"], json!(true));
+    assert_eq!(parsed["row_count_known"], json!(true));
+}
+
+#[test]
+fn execute_sql_columns_only_can_return_count_without_row_values() {
+    let decoded = crate::query::DecodedQueryResult {
+        table: decoded_table(&["a", "b"], vec![]),
+        row_count: 42,
+        row_count_known: true,
+        rows_truncated: true,
+    };
+    let mut params = execute_sql_params("SELECT a, b FROM t");
+    params.columns_only = true;
+
+    let response = format_execute_sql_decoded_response_with_redaction(decoded, &params, false)
+        .expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    assert_eq!(parsed["columns"], json!(["a", "b"]));
+    assert_eq!(parsed["row_count"], json!(42));
+    assert_eq!(parsed["returned_rows"], json!(0));
+    assert_eq!(parsed["row_count_known"], json!(true));
+    assert!(parsed.get("rows").is_none(), "columns_only must omit rows");
 }
 
 #[test]

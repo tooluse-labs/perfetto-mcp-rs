@@ -5,7 +5,7 @@ use crate::params::{
     default_redact_strings, ExecuteSqlParams, SliceDescendantsBreakdownParams,
     REDACT_STRINGS_DEFAULT_ENV,
 };
-use crate::query::DecodedTable;
+use crate::query::{DecodeQueryOptions, DecodedQueryResult, DecodedTable};
 use crate::sql_templates::{
     dedupe_preserving_order, DEFAULT_SLICE_DESCENDANTS_MAX_DEPTH,
     DEFAULT_SLICE_DESCENDANTS_MIN_DUR_MS,
@@ -15,7 +15,8 @@ pub(super) const DEFAULT_CHROME_TOOL_ROWS: usize = 100;
 pub(super) const DEFAULT_TOOL_MAX_STRING_LEN: Option<usize> = None;
 pub(super) const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 pub(super) const EXECUTE_SQL_SHAPING_NOTE: &str =
-    "row_count is post-SQL decoded rows; head/limit only trims returned tool rows.";
+    "row_count is exact post-SQL decoded rows when row_count_known=true; \
+     head/limit only trims returned tool rows and does not rewrite SQL.";
 pub(super) const CHROME_TOOL_SHAPING_NOTE: &str =
     "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened.";
 pub(super) const SLICE_DESCENDANTS_BREAKDOWN_SCOPE: &str = "descendants only; root slices excluded";
@@ -538,23 +539,39 @@ pub(super) async fn fetch_missing_slice_ids(
     Ok(missing)
 }
 
-pub(super) fn format_execute_sql_response(
-    table: DecodedTable,
-    params: &ExecuteSqlParams,
-) -> Result<String, String> {
-    format_execute_sql_response_with_redaction(table, params, default_redact_strings())
-}
-
+#[cfg(test)]
 pub(super) fn format_execute_sql_response_with_redaction(
     table: DecodedTable,
     params: &ExecuteSqlParams,
     redact_strings: bool,
 ) -> Result<String, String> {
+    let row_count = table.rows.len();
+    format_execute_sql_decoded_response_with_redaction(
+        DecodedQueryResult {
+            table,
+            row_count,
+            row_count_known: true,
+            rows_truncated: false,
+        },
+        params,
+        redact_strings,
+    )
+}
+
+pub(super) fn format_execute_sql_decoded_response_with_redaction(
+    decoded: DecodedQueryResult,
+    params: &ExecuteSqlParams,
+    redact_strings: bool,
+) -> Result<String, String> {
     let shape = execute_sql_output_shape(params, redact_strings)?;
+    let table = decoded.table;
     let span = tracing::debug_span!(
         "mcp.response_shape",
         response = "execute_sql",
         row_count = table.rows.len(),
+        decoded_row_count = decoded.row_count,
+        row_count_known = decoded.row_count_known,
+        rows_truncated = decoded.rows_truncated,
         shape_active = shape.active,
         output_mode = shape.mode.as_str(),
         max_string_len_set = shape.max_string_len.is_some(),
@@ -570,7 +587,7 @@ pub(super) fn format_execute_sql_response_with_redaction(
             .map_err(|e| format!("Failed to serialize results: {e}"));
     }
 
-    let row_count = table.rows.len();
+    let row_count = decoded.row_count;
     match shape.mode {
         ExecuteSqlOutputMode::ColumnsOnly => {
             tracing::Span::current().record("string_truncated", false);
@@ -580,7 +597,7 @@ pub(super) fn format_execute_sql_response_with_redaction(
                 row_count,
                 returned_rows: 0,
                 truncated: false,
-                row_count_known: true,
+                row_count_known: decoded.row_count_known,
                 string_truncated: false,
                 redacted: false,
                 note: EXECUTE_SQL_SHAPING_NOTE,
@@ -597,8 +614,8 @@ pub(super) fn format_execute_sql_response_with_redaction(
                 returned_rows: sample_rows.len(),
                 sample_rows,
                 row_count,
-                truncated: row_count > limit,
-                row_count_known: true,
+                truncated: decoded.rows_truncated || row_count > limit,
+                row_count_known: decoded.row_count_known,
                 string_truncated,
                 redacted,
                 note: EXECUTE_SQL_SHAPING_NOTE,
@@ -615,8 +632,8 @@ pub(super) fn format_execute_sql_response_with_redaction(
                 returned_rows: rows.len(),
                 rows,
                 row_count,
-                truncated: row_count > limit,
-                row_count_known: true,
+                truncated: decoded.rows_truncated || row_count > limit,
+                row_count_known: decoded.row_count_known,
                 string_truncated,
                 redacted,
                 note: EXECUTE_SQL_SHAPING_NOTE,
@@ -633,7 +650,7 @@ pub(super) fn format_execute_sql_response_with_redaction(
                 rows,
                 row_count,
                 truncated: false,
-                row_count_known: true,
+                row_count_known: decoded.row_count_known,
                 string_truncated,
                 redacted,
                 note: EXECUTE_SQL_SHAPING_NOTE,
@@ -691,6 +708,20 @@ pub(super) fn execute_sql_output_shape(
         max_string_len,
         redact_strings,
     })
+}
+
+pub(super) fn execute_sql_decode_options(
+    params: &ExecuteSqlParams,
+) -> Result<DecodeQueryOptions, String> {
+    let shape = execute_sql_output_shape(params, false)?;
+    let max_rows = match shape.mode {
+        ExecuteSqlOutputMode::ColumnsOnly => Some(0),
+        ExecuteSqlOutputMode::Summary(limit) | ExecuteSqlOutputMode::LimitedRows(limit) => {
+            Some(limit)
+        }
+        ExecuteSqlOutputMode::FullRows => None,
+    };
+    Ok(DecodeQueryOptions { max_rows })
 }
 
 pub(super) fn transform_rows<'a>(

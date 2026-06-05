@@ -18,7 +18,7 @@ use crate::proto::QueryResult;
 /// single boundary for query results — it serializes to the wire shape
 /// `{"columns": [...], "rows": [[...], ...]}` and is what every JSON-emitting
 /// MCP tool returns inside `rmcp::Json<...>`.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 pub struct DecodedTable {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
@@ -46,6 +46,28 @@ impl DecodedTable {
     }
 }
 
+/// Controls how many row values are materialized while decoding a
+/// `QueryResult`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeQueryOptions {
+    /// Maximum number of rows to materialize. `None` materializes every row
+    /// up to `MAX_ROWS`; `Some(0)` counts rows and returns no row values.
+    pub max_rows: Option<usize>,
+}
+
+/// A decoded query plus completeness metadata for output shaping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedQueryResult {
+    pub table: DecodedTable,
+    /// Exact number of complete rows reported by trace_processor for this
+    /// output statement. This is counted from cell metadata, so callers can
+    /// return accurate `row_count` without materializing every JSON cell.
+    pub row_count: usize,
+    pub row_count_known: bool,
+    /// True when fewer row values were materialized than `row_count`.
+    pub rows_truncated: bool,
+}
+
 /// Decode a protobuf QueryResult into a columnar `DecodedTable`.
 ///
 /// `columns` is taken straight from `result.column_names` — the
@@ -53,7 +75,15 @@ impl DecodedTable {
 /// `Vec<Value>` whose entries align positionally with `columns`.
 ///
 /// Returns early with `TooManyRows` if the result exceeds `MAX_ROWS`.
+#[cfg(test)]
 pub fn decode_query_result(result: &QueryResult) -> Result<DecodedTable, PerfettoError> {
+    Ok(decode_query_result_with_options(result, DecodeQueryOptions::default())?.table)
+}
+
+pub fn decode_query_result_with_options(
+    result: &QueryResult,
+    options: DecodeQueryOptions,
+) -> Result<DecodedQueryResult, PerfettoError> {
     if let Some(ref err) = result.error {
         if !err.is_empty() {
             return Err(PerfettoError::QueryError {
@@ -66,12 +96,31 @@ pub fn decode_query_result(result: &QueryResult) -> Result<DecodedTable, Perfett
     let columns: Vec<String> = result.column_names.clone();
     let num_cols = columns.len();
     if num_cols == 0 {
-        return Ok(DecodedTable {
-            columns,
-            rows: Vec::new(),
+        return Ok(DecodedQueryResult {
+            table: DecodedTable {
+                columns,
+                rows: Vec::new(),
+            },
+            row_count: 0,
+            row_count_known: true,
+            rows_truncated: false,
         });
     }
 
+    let row_count = complete_row_count(result, num_cols);
+    if options.max_rows == Some(0) {
+        return Ok(DecodedQueryResult {
+            table: DecodedTable {
+                columns,
+                rows: Vec::new(),
+            },
+            row_count,
+            row_count_known: true,
+            rows_truncated: row_count > 0,
+        });
+    }
+
+    let max_rows = options.max_rows.unwrap_or(usize::MAX);
     let mut rows: Vec<Vec<Value>> = Vec::new();
 
     for batch in &result.batch {
@@ -119,11 +168,36 @@ pub fn decode_query_result(result: &QueryResult) -> Result<DecodedTable, Perfett
                 if rows.len() > MAX_ROWS {
                     return Err(PerfettoError::TooManyRows);
                 }
+                if rows.len() >= max_rows {
+                    return Ok(DecodedQueryResult {
+                        table: DecodedTable { columns, rows },
+                        row_count,
+                        row_count_known: true,
+                        rows_truncated: row_count > max_rows,
+                    });
+                }
             }
         }
     }
 
-    Ok(DecodedTable { columns, rows })
+    Ok(DecodedQueryResult {
+        table: DecodedTable { columns, rows },
+        row_count,
+        row_count_known: true,
+        rows_truncated: false,
+    })
+}
+
+fn complete_row_count(result: &QueryResult, num_cols: usize) -> usize {
+    if num_cols == 0 {
+        return 0;
+    }
+    result
+        .batch
+        .iter()
+        .map(|batch| batch.cells.len())
+        .sum::<usize>()
+        / num_cols
 }
 
 #[cfg(test)]
@@ -245,6 +319,86 @@ mod tests {
             matches!(err, PerfettoError::TooManyRows),
             "expected TooManyRows, got: {err:?}",
         );
+    }
+
+    #[test]
+    fn decode_with_row_limit_counts_without_materializing_every_row() {
+        let batch = CellsBatch {
+            cells: vec![
+                CellType::CellVarint as i32,
+                CellType::CellString as i32,
+                CellType::CellVarint as i32,
+                CellType::CellString as i32,
+                CellType::CellVarint as i32,
+                CellType::CellString as i32,
+            ],
+            varint_cells: vec![1, 2, 3],
+            float64_cells: vec![],
+            blob_cells: vec![],
+            string_cells: Some("a\0b\0c".to_owned()),
+            is_last_batch: Some(true),
+        };
+        let result = make_result(vec!["id", "name"], vec![batch]);
+        let decoded =
+            decode_query_result_with_options(&result, DecodeQueryOptions { max_rows: Some(1) })
+                .unwrap();
+
+        assert_eq!(decoded.row_count, 3);
+        assert!(decoded.row_count_known);
+        assert!(decoded.rows_truncated);
+        assert_eq!(
+            decoded.table.rows,
+            vec![vec![Value::from(1), Value::from("a")]]
+        );
+    }
+
+    #[test]
+    fn decode_columns_only_counts_rows_without_values() {
+        let batch = CellsBatch {
+            cells: vec![
+                CellType::CellVarint as i32,
+                CellType::CellVarint as i32,
+                CellType::CellVarint as i32,
+            ],
+            varint_cells: vec![1, 2, 3],
+            float64_cells: vec![],
+            blob_cells: vec![],
+            string_cells: None,
+            is_last_batch: Some(true),
+        };
+        let result = make_result(vec!["n"], vec![batch]);
+        let decoded =
+            decode_query_result_with_options(&result, DecodeQueryOptions { max_rows: Some(0) })
+                .unwrap();
+
+        assert_eq!(decoded.row_count, 3);
+        assert!(decoded.row_count_known);
+        assert!(decoded.rows_truncated);
+        assert_eq!(decoded.table.columns, vec!["n"]);
+        assert!(decoded.table.rows.is_empty());
+    }
+
+    #[test]
+    fn decode_limited_query_over_max_rows_does_not_error_when_returning_sample() {
+        let row_count = MAX_ROWS + 1;
+        let cells = vec![CellType::CellVarint as i32; row_count];
+        let varint_cells: Vec<i64> = (0..row_count as i64).collect();
+        let batch = CellsBatch {
+            cells,
+            varint_cells,
+            float64_cells: vec![],
+            blob_cells: vec![],
+            string_cells: None,
+            is_last_batch: Some(true),
+        };
+        let result = make_result(vec!["n"], vec![batch]);
+        let decoded =
+            decode_query_result_with_options(&result, DecodeQueryOptions { max_rows: Some(10) })
+                .unwrap();
+
+        assert_eq!(decoded.row_count, MAX_ROWS + 1);
+        assert_eq!(decoded.table.rows.len(), 10);
+        assert!(decoded.rows_truncated);
     }
 
     #[test]

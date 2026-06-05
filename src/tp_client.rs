@@ -8,7 +8,9 @@ use tracing::Instrument;
 
 use crate::error::PerfettoError;
 use crate::proto::{QueryArgs, QueryResult, StatusResult};
-use crate::query::{decode_query_result, DecodedTable};
+use crate::query::{
+    decode_query_result_with_options, DecodeQueryOptions, DecodedQueryResult, DecodedTable,
+};
 use crate::telemetry::{perfetto_error_span_kind, sql_span_kind};
 
 /// HTTP client for a single trace_processor_shell RPC instance.
@@ -33,12 +35,28 @@ impl TraceProcessorClient {
 
     /// Execute a SQL query and return the decoded columnar table.
     pub async fn query(&self, sql: &str) -> Result<DecodedTable, PerfettoError> {
+        Ok(self
+            .query_with_options(sql, DecodeQueryOptions::default())
+            .await?
+            .table)
+    }
+
+    /// Execute a SQL query and return decoded rows plus completeness metadata.
+    pub async fn query_with_options(
+        &self,
+        sql: &str,
+        options: DecodeQueryOptions,
+    ) -> Result<DecodedQueryResult, PerfettoError> {
         let span = tracing::debug_span!(
             "trace_processor.query",
             rpc = "/query",
             sql_kind = sql_span_kind(sql),
             sql_len = sql.len(),
+            decode_limited = options.max_rows.is_some(),
+            decode_max_rows = options.max_rows.unwrap_or(0),
             row_count = tracing::field::Empty,
+            returned_rows = tracing::field::Empty,
+            rows_truncated = tracing::field::Empty,
             error_kind = tracing::field::Empty,
         );
 
@@ -61,13 +79,15 @@ impl TraceProcessorClient {
 
                 let bytes = resp.bytes().await?;
                 let result = QueryResult::decode(bytes)?;
-                decode_query_result(&result)
+                decode_query_result_with_options(&result, options)
             }
             .await;
 
             match &result {
-                Ok(table) => {
-                    tracing::Span::current().record("row_count", table.len());
+                Ok(decoded) => {
+                    tracing::Span::current().record("row_count", decoded.row_count);
+                    tracing::Span::current().record("returned_rows", decoded.table.len());
+                    tracing::Span::current().record("rows_truncated", decoded.rows_truncated);
                 }
                 Err(err) => {
                     tracing::Span::current().record("error_kind", perfetto_error_span_kind(err));

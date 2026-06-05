@@ -1,8 +1,10 @@
 // Copyright 2025 The perfetto-mcp-rs Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -54,7 +56,70 @@ use trace_summary::*;
 pub struct PerfettoMcpServer {
     manager: Arc<TraceProcessorManager>,
     current_trace: Arc<Mutex<Option<String>>>,
+    schema_cache: Arc<Mutex<SchemaCache>>,
     tool_router: ToolRouter<Self>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaCacheTraceKey {
+    canonical_path: PathBuf,
+    size_bytes: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Default)]
+struct SchemaCache {
+    trace_key: Option<SchemaCacheTraceKey>,
+    table_lists: HashMap<Option<String>, String>,
+    table_structures: HashMap<String, String>,
+}
+
+impl SchemaCache {
+    fn table_list(
+        &mut self,
+        trace_key: &SchemaCacheTraceKey,
+        pattern: &Option<String>,
+    ) -> Option<String> {
+        self.ensure_trace(trace_key);
+        self.table_lists.get(pattern).cloned()
+    }
+
+    fn store_table_list(
+        &mut self,
+        trace_key: SchemaCacheTraceKey,
+        pattern: Option<String>,
+        response: String,
+    ) {
+        self.ensure_trace(&trace_key);
+        self.table_lists.insert(pattern, response);
+    }
+
+    fn table_structure(
+        &mut self,
+        trace_key: &SchemaCacheTraceKey,
+        table_name: &str,
+    ) -> Option<String> {
+        self.ensure_trace(trace_key);
+        self.table_structures.get(table_name).cloned()
+    }
+
+    fn store_table_structure(
+        &mut self,
+        trace_key: SchemaCacheTraceKey,
+        table_name: String,
+        response: String,
+    ) {
+        self.ensure_trace(&trace_key);
+        self.table_structures.insert(table_name, response);
+    }
+
+    fn ensure_trace(&mut self, trace_key: &SchemaCacheTraceKey) {
+        if self.trace_key.as_ref() != Some(trace_key) {
+            self.trace_key = Some(trace_key.clone());
+            self.table_lists.clear();
+            self.table_structures.clear();
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -244,12 +309,17 @@ impl PerfettoMcpServer {
                 || params.max_string_len.is_some()
         ))
         .await;
+        let decode_options = execute_sql_decode_options(&params)?;
         let client = self.client_for_current().await?;
-        let table = client
-            .query(&params.sql)
+        let decoded = client
+            .query_with_options(&params.sql, decode_options)
             .await
             .map_err(format_execute_sql_error)?;
-        format_execute_sql_response(table, &params)
+        format_execute_sql_decoded_response_with_redaction(
+            decoded,
+            &params,
+            default_redact_strings(),
+        )
     }
 
     #[tool(
@@ -295,14 +365,28 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span(format!("pattern_set={}", params.pattern.is_some()))
             .await;
-        let client = self.client_for_current().await?;
+        let trace_path = self.current_trace_path().await?;
+        let trace_key = trace_schema_cache_key(&trace_path)?;
+        let pattern_key = match &params.pattern {
+            Some(pat) => Some(sanitize_glob_param(pat).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        if let Some(cached) = self
+            .schema_cache
+            .lock()
+            .await
+            .table_list(&trace_key, &pattern_key)
+        {
+            return Ok(cached);
+        }
 
-        let sql = match &params.pattern {
+        let client = self.client_for(&trace_path).await?;
+
+        let sql = match &pattern_key {
             Some(pat) => {
-                let safe = sanitize_glob_param(pat).map_err(|e| e.to_string())?;
                 format!(
                     "SELECT name FROM sqlite_master \
-                     WHERE type IN ('table', 'view') AND name GLOB '{safe}' \
+                     WHERE type IN ('table', 'view') AND name GLOB '{pat}' \
                      ORDER BY name"
                 )
             }
@@ -335,8 +419,13 @@ impl PerfettoMcpServer {
             })
             .collect::<Result<Vec<_>, String>>()?;
 
-        serde_json::to_string(&TableList { names })
-            .map_err(|e| format!("Failed to serialize results: {e}"))
+        let response = serde_json::to_string(&TableList { names })
+            .map_err(|e| format!("Failed to serialize results: {e}"))?;
+        self.schema_cache
+            .lock()
+            .await
+            .store_table_list(trace_key, pattern_key, response.clone());
+        Ok(response)
     }
 
     #[tool(
@@ -379,8 +468,18 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span(format!("table_name_len={}", params.table_name.len()))
             .await;
-        let client = self.client_for_current().await?;
+        let trace_path = self.current_trace_path().await?;
+        let trace_key = trace_schema_cache_key(&trace_path)?;
         let table_name = sanitize_glob_param(&params.table_name).map_err(|e| e.to_string())?;
+        if let Some(cached) = self
+            .schema_cache
+            .lock()
+            .await
+            .table_structure(&trace_key, &table_name)
+        {
+            return Ok(cached);
+        }
+        let client = self.client_for(&trace_path).await?;
 
         let sql = format!("PRAGMA table_info('{table_name}')");
         let pragma = client
@@ -396,11 +495,17 @@ impl PerfettoMcpServer {
             .map(|i| pragma_row_to_column_info(&pragma, i))
             .collect::<Result<Vec<_>, String>>()?;
 
-        serde_json::to_string(&TableInfo {
-            table: table_name,
+        let response = serde_json::to_string(&TableInfo {
+            table: table_name.clone(),
             columns,
         })
-        .map_err(|e| format!("Failed to serialize results: {e}"))
+        .map_err(|e| format!("Failed to serialize results: {e}"))?;
+        self.schema_cache.lock().await.store_table_structure(
+            trace_key,
+            table_name,
+            response.clone(),
+        );
+        Ok(response)
     }
 
     #[tool(
@@ -1279,6 +1384,7 @@ impl PerfettoMcpServer {
         Self {
             manager,
             current_trace: Arc::new(Mutex::new(None)),
+            schema_cache: Arc::new(Mutex::new(SchemaCache::default())),
             tool_router: Self::tool_router(),
         }
     }
@@ -1324,6 +1430,20 @@ impl PerfettoMcpServer {
             .await
             .map_err(|e| format!("Failed to open trace {trace_path:?}: {e}"))
     }
+}
+
+fn trace_schema_cache_key(trace_path: &str) -> Result<SchemaCacheTraceKey, String> {
+    let path = Path::new(trace_path);
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|e| format!("Failed to stat current trace {trace_path:?}: {e}"))?;
+    let metadata = std::fs::metadata(&canonical_path)
+        .map_err(|e| format!("Failed to stat current trace {:?}: {e}", canonical_path))?;
+    Ok(SchemaCacheTraceKey {
+        canonical_path,
+        size_bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 #[cfg(test)]
