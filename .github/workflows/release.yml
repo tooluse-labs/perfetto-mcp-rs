@@ -148,7 +148,7 @@ jobs:
       # App-installation tokens auto-rotate per workflow run and the App
       # credentials themselves never expire. Same pattern as the publish-crate
       # job's crates.io Trusted Publishing.
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/create-github-app-token@v3.2.0
         id: app-token
         with:
           app-id: ${{ secrets.HOMEBREW_TAP_APP_ID }}
