@@ -4,6 +4,11 @@
 
 ### Unreleased
 
+### [0.15.14](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.14) (June 6, 2026)
+
+- **`execute_sql` now shapes large responses without materializing rows it will not return.** The protobuf decoder counts the full decoded result set from trace processor cell metadata while only building row values needed by `summary`, `head`, `limit`, or `columns_only`, so `row_count_known=true` remains an exact post-SQL count and response shaping does not rewrite caller SQL.
+- **Schema discovery and load summaries do less repeated work.** `list_tables` and `list_table_structure` now cache schema responses per trace file fingerprint (canonical path, size, and modified time), and `load_trace` gathers summary metadata and overview probes concurrently to reduce repeated trace-processor round trips.
+
 ### [0.15.13](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.13) (June 4, 2026)
 
 - **Reloading an overwritten trace path now invalidates the cached trace processor.** `load_trace` still reuses `trace_processor_shell` instances by canonical path for fast repeat analysis, but each cache entry now records the trace file's size and modified time. If the same path is overwritten with different metadata inside one MCP session, the old process is evicted and the new trace is parsed instead of returning stale rows from the previous file.
