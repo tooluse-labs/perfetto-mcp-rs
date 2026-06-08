@@ -92,12 +92,16 @@ pub const CHROME_PAGE_LOAD_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.p
        fcp_ts, \
        dom_content_loaded_event_ts, \
        load_event_ts, \
-       fcp / 1e6 AS fcp_ms, \
-       lcp / 1e6 AS lcp_ms, \
+       CASE WHEN fcp IS NOT NULL AND fcp >= 0 THEN fcp / 1e6 END AS fcp_ms, \
+       CASE WHEN lcp IS NOT NULL AND lcp >= 0 THEN lcp / 1e6 END AS lcp_ms, \
        CASE WHEN dom_content_loaded_event_ts IS NOT NULL \
+              AND navigation_start_ts IS NOT NULL \
+              AND dom_content_loaded_event_ts >= navigation_start_ts \
             THEN (dom_content_loaded_event_ts - navigation_start_ts) / 1e6 \
        END AS dcl_ms, \
        CASE WHEN load_event_ts IS NOT NULL \
+              AND navigation_start_ts IS NOT NULL \
+              AND load_event_ts >= navigation_start_ts \
             THEN (load_event_ts - navigation_start_ts) / 1e6 \
        END AS load_ms \
      FROM chrome_page_loads \
@@ -131,7 +135,11 @@ pub const CHROME_STARTUP_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.sta
        id, \
        name, \
        launch_cause, \
-       (first_visible_content_ts - startup_begin_ts) / 1e6 AS startup_duration_ms, \
+       CASE WHEN first_visible_content_ts IS NOT NULL \
+              AND startup_begin_ts IS NOT NULL \
+              AND first_visible_content_ts >= startup_begin_ts \
+            THEN (first_visible_content_ts - startup_begin_ts) / 1e6 \
+       END AS startup_duration_ms, \
        startup_begin_ts, \
        first_visible_content_ts, \
        browser_upid \

@@ -2686,6 +2686,47 @@ fn chrome_trace_params_accept_stringified_numerics() {
     assert_eq!(p.max_string_len, Some(300));
 }
 
+#[test]
+fn chrome_page_load_summary_sql_nulls_negative_or_missing_milestone_durations() {
+    let compact = compact_sql(CHROME_PAGE_LOAD_SUMMARY_SQL);
+    assert!(
+        compact.contains("CASE WHEN fcp IS NOT NULL AND fcp >= 0 THEN fcp / 1e6 END AS fcp_ms"),
+        "FCP duration must not surface negative values as real milliseconds: {CHROME_PAGE_LOAD_SUMMARY_SQL}",
+    );
+    assert!(
+        compact.contains("CASE WHEN lcp IS NOT NULL AND lcp >= 0 THEN lcp / 1e6 END AS lcp_ms"),
+        "LCP duration must not surface negative values as real milliseconds: {CHROME_PAGE_LOAD_SUMMARY_SQL}",
+    );
+    assert!(
+        compact.contains(
+            "CASE WHEN dom_content_loaded_event_ts IS NOT NULL AND navigation_start_ts IS NOT NULL AND dom_content_loaded_event_ts >= navigation_start_ts THEN"
+        ),
+        "DCL duration must require ordered timestamps: {CHROME_PAGE_LOAD_SUMMARY_SQL}",
+    );
+    assert!(
+        compact.contains(
+            "CASE WHEN load_event_ts IS NOT NULL AND navigation_start_ts IS NOT NULL AND load_event_ts >= navigation_start_ts THEN"
+        ),
+        "load duration must require ordered timestamps: {CHROME_PAGE_LOAD_SUMMARY_SQL}",
+    );
+}
+
+#[test]
+fn chrome_startup_summary_sql_nulls_negative_startup_duration() {
+    let compact = compact_sql(CHROME_STARTUP_SUMMARY_SQL);
+    assert!(
+        compact.contains(
+            "CASE WHEN first_visible_content_ts IS NOT NULL AND startup_begin_ts IS NOT NULL AND first_visible_content_ts >= startup_begin_ts THEN"
+        ),
+        "startup duration must require ordered timestamps: {CHROME_STARTUP_SUMMARY_SQL}",
+    );
+    assert!(
+        !compact
+            .contains("(first_visible_content_ts - startup_begin_ts) / 1e6 AS startup_duration_ms"),
+        "startup SQL must not expose unchecked negative durations: {CHROME_STARTUP_SUMMARY_SQL}",
+    );
+}
+
 /// JsonSchema must still advertise strict types so well-behaved LLMs
 /// don't see "string-or-integer" weirdness on `tools/list`. The
 /// `deserialize_with` is server-side leniency only, invisible to the
