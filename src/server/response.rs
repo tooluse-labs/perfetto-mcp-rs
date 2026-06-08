@@ -20,11 +20,17 @@ pub(super) const EXECUTE_SQL_SHAPING_NOTE: &str =
      head/limit only trims returned tool rows, is capped at 5000, and does not rewrite SQL; \
      full blob cells render as blob:hex:<hex>; truncated blobs keep the prefix and include \
      remaining-byte count; non-finite floats render as float:NaN/float:Infinity.";
+#[cfg(test)]
 pub(super) const CHROME_TOOL_SHAPING_NOTE: &str =
     "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened; \
      full blob cells use blob:hex:<hex>; non-finite floats use float:* strings.";
 pub(super) const CHROME_TOOL_KNOWN_ROW_COUNT_NOTE: &str =
     "row_count is exact for the tool query; truncated=true means more rows exist than returned; \
+     string_truncated=cell text shortened; full blob cells use blob:hex:<hex>; \
+     non-finite floats use float:* strings.";
+pub(super) const CHROME_TOOL_PROBED_ROW_COUNT_NOTE: &str =
+    "row_count unknown; truncated=true means an extra-row probe found more rows than returned; \
+     at the 5000-row global cap, absence of truncated does not prove completeness; \
      string_truncated=cell text shortened; full blob cells use blob:hex:<hex>; \
      non-finite floats use float:* strings.";
 pub(super) const SLICE_DESCENDANTS_BREAKDOWN_SCOPE: &str = "descendants only; root slices excluded";
@@ -33,7 +39,9 @@ pub(super) const SLICE_DESCENDANTS_SHAPING_NOTE: &str =
      min_dur_ms within max_depth; inclusive_total_ms is inclusive wall time and overlaps \
      across depths, so do not sum it across rows/depths; self_ms subtracts direct child \
      inclusive durations per descendant slice and is clamped at zero; limit caps returned \
-     groups; example_slice_id is the longest-duration descendant per group (ties broken by \
+     groups and truncated=true means an extra group was probed; at the 5000-row global cap, \
+     absence of truncated does not prove completeness; example_slice_id is the \
+     longest-duration descendant per group (ties broken by \
      smallest id); first_ts_ns is raw nanoseconds; missing_root_ids lists requested slice_ids \
      that do not exist in the loaded trace; incomplete_descendant_count counts dur<0 \
      descendants excluded from duration aggregates; example_args, when present, comes only \
@@ -243,18 +251,11 @@ pub(super) struct SliceDescendantsRowsResponse {
     pub(super) rows: Vec<Vec<serde_json::Value>>,
 }
 
-pub(super) fn chrome_hotspots_effective_limit(limit: Option<u32>) -> usize {
-    chrome_hotspots_effective_limit_with_default(limit, DEFAULT_CHROME_TOOL_ROWS)
-}
-
-pub(super) fn chrome_hotspots_effective_limit_with_default(
-    limit: Option<u32>,
-    default_limit: usize,
-) -> usize {
-    match limit {
-        Some(n) if (n as usize) > MAX_ROWS => MAX_ROWS,
-        Some(n) => n as usize,
-        None => default_limit,
+pub(super) fn extra_row_probe_limit(effective_limit: usize) -> usize {
+    if effective_limit < MAX_ROWS {
+        effective_limit + 1
+    } else {
+        MAX_ROWS
     }
 }
 
@@ -278,6 +279,7 @@ pub(super) fn tool_max_string_len(max_string_len: Option<u32>) -> Result<Option<
     }
 }
 
+#[cfg(test)]
 pub(super) fn format_chrome_tool_response(
     table: DecodedTable,
     effective_limit: usize,
@@ -291,6 +293,7 @@ pub(super) fn format_chrome_tool_response(
     )
 }
 
+#[cfg(test)]
 pub(super) fn format_chrome_tool_response_with_redaction(
     table: DecodedTable,
     effective_limit: usize,
@@ -327,6 +330,62 @@ pub(super) fn format_chrome_tool_response_with_redaction(
         string_truncated,
         redacted,
         note: CHROME_TOOL_SHAPING_NOTE,
+        rows,
+    })
+    .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+pub(super) fn format_chrome_tool_response_with_probe_limit(
+    table: DecodedTable,
+    effective_limit: usize,
+    max_string_len: Option<u32>,
+) -> Result<String, String> {
+    format_chrome_tool_response_with_probe_limit_and_redaction(
+        table,
+        effective_limit,
+        tool_max_string_len(max_string_len)?,
+        default_redact_strings(),
+    )
+}
+
+pub(super) fn format_chrome_tool_response_with_probe_limit_and_redaction(
+    table: DecodedTable,
+    effective_limit: usize,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+) -> Result<String, String> {
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "chrome_rows_probe",
+        fetched_rows = table.rows.len(),
+        effective_limit,
+        max_string_len_set = max_string_len.is_some(),
+        redact_strings,
+        string_truncated = tracing::field::Empty,
+        redacted = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let shape = ExecuteSqlOutputShape {
+        mode: ExecuteSqlOutputMode::FullRows,
+        active: true,
+        max_string_len,
+        redact_strings,
+    };
+    let truncated = effective_limit > 0 && table.rows.len() > effective_limit;
+    let returned_rows = table.rows.len().min(effective_limit);
+    let (rows, string_truncated, redacted) =
+        transform_rows(table.rows.iter().take(effective_limit), shape);
+    tracing::Span::current().record("string_truncated", string_truncated);
+    tracing::Span::current().record("redacted", redacted);
+    serde_json::to_string(&ChromeToolRowsResponse {
+        columns: table.columns,
+        row_count: None,
+        returned_rows,
+        truncated,
+        row_count_known: false,
+        string_truncated,
+        redacted,
+        note: CHROME_TOOL_PROBED_ROW_COUNT_NOTE,
         rows,
     })
     .map_err(|e| format!("Failed to serialize results: {e}"))
@@ -453,21 +512,7 @@ pub(super) fn decode_list_threads_process_counts(
         .collect()
 }
 
-pub(super) fn format_chrome_resource_summary_response(
-    table: DecodedTable,
-    effective_limit: usize,
-    max_string_len: Option<u32>,
-    evidence: ChromeResourceTimingEvidence,
-) -> Result<String, String> {
-    format_chrome_resource_summary_response_with_redaction(
-        table,
-        effective_limit,
-        tool_max_string_len(max_string_len)?,
-        default_redact_strings(),
-        evidence,
-    )
-}
-
+#[cfg(test)]
 pub(super) fn format_chrome_resource_summary_response_with_redaction(
     table: DecodedTable,
     effective_limit: usize,
@@ -507,6 +552,67 @@ pub(super) fn format_chrome_resource_summary_response_with_redaction(
         redacted,
         resource_timing_evidence: evidence,
         note: CHROME_TOOL_SHAPING_NOTE,
+        rows,
+    })
+    .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+pub(super) fn format_chrome_resource_summary_response_with_probe_limit(
+    table: DecodedTable,
+    effective_limit: usize,
+    max_string_len: Option<u32>,
+    evidence: ChromeResourceTimingEvidence,
+) -> Result<String, String> {
+    format_chrome_resource_summary_response_with_probe_limit_and_redaction(
+        table,
+        effective_limit,
+        tool_max_string_len(max_string_len)?,
+        default_redact_strings(),
+        evidence,
+    )
+}
+
+pub(super) fn format_chrome_resource_summary_response_with_probe_limit_and_redaction(
+    table: DecodedTable,
+    effective_limit: usize,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+    evidence: ChromeResourceTimingEvidence,
+) -> Result<String, String> {
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "chrome_resource_summary_probe",
+        fetched_rows = table.rows.len(),
+        effective_limit,
+        max_string_len_set = max_string_len.is_some(),
+        redact_strings,
+        phase_breakdown_available = evidence.phase_breakdown_available,
+        string_truncated = tracing::field::Empty,
+        redacted = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let shape = ExecuteSqlOutputShape {
+        mode: ExecuteSqlOutputMode::FullRows,
+        active: true,
+        max_string_len,
+        redact_strings,
+    };
+    let truncated = effective_limit > 0 && table.rows.len() > effective_limit;
+    let returned_rows = table.rows.len().min(effective_limit);
+    let (rows, string_truncated, redacted) =
+        transform_rows(table.rows.iter().take(effective_limit), shape);
+    tracing::Span::current().record("string_truncated", string_truncated);
+    tracing::Span::current().record("redacted", redacted);
+    serde_json::to_string(&ChromeResourceSummaryRowsResponse {
+        columns: table.columns,
+        row_count: None,
+        returned_rows,
+        truncated,
+        row_count_known: false,
+        string_truncated,
+        redacted,
+        resource_timing_evidence: evidence,
+        note: CHROME_TOOL_PROBED_ROW_COUNT_NOTE,
         rows,
     })
     .map_err(|e| format!("Failed to serialize results: {e}"))
@@ -674,15 +780,17 @@ pub(super) fn format_slice_descendants_tool_response_with_redaction(
         max_string_len,
         redact_strings,
     };
-    let returned_rows = table.rows.len();
-    let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+    let truncated = effective_limit > 0 && table.rows.len() > effective_limit;
+    let returned_rows = table.rows.len().min(effective_limit);
+    let (rows, string_truncated, redacted) =
+        transform_rows(table.rows.iter().take(effective_limit), shape);
     tracing::Span::current().record("string_truncated", string_truncated);
     tracing::Span::current().record("redacted", redacted);
     serde_json::to_string(&SliceDescendantsRowsResponse {
         columns: table.columns,
         row_count: None,
         returned_rows,
-        truncated: effective_limit > 0 && returned_rows >= effective_limit,
+        truncated,
         row_count_known: false,
         string_truncated,
         redacted,
@@ -1152,17 +1260,20 @@ pub(super) fn redact_user_path_segments(s: &str) -> (String, bool) {
         let mut search_from = 0;
         while let Some(rel) = out[search_from..].find(prefix) {
             let prefix_start = search_from + rel;
-            if is_network_url_path_context(&out, prefix_start) {
-                search_from = prefix_start + prefix.len();
-                continue;
-            }
             let start = prefix_start + prefix.len();
             let tail = &out[start..];
             let end = tail
                 .char_indices()
-                .find(|(_, c)| *c == '\\' || *c == '/')
+                .find(|(_, c)| *c == '\\' || *c == '/' || is_string_cell_token_boundary(*c))
                 .map(|(idx, _)| start + idx)
                 .unwrap_or(out.len());
+            if is_network_url_path_context(&out, prefix_start)
+                || is_http_request_target_context(&out, prefix_start)
+                || is_bare_unix_user_path_without_child(&out, prefix, end, prefix_start)
+            {
+                search_from = prefix_start + prefix.len();
+                continue;
+            }
             if start < end && &out[start..end] != "<user>" {
                 out.replace_range(start..end, "<user>");
                 changed = true;
@@ -1175,23 +1286,62 @@ pub(super) fn redact_user_path_segments(s: &str) -> (String, bool) {
     (out, changed)
 }
 
-pub(super) fn is_network_url_path_context(s: &str, prefix_start: usize) -> bool {
-    let before = &s[..prefix_start];
-    let Some(scheme_sep) = before.rfind("://") else {
+fn is_bare_unix_user_path_without_child(
+    s: &str,
+    prefix: &str,
+    segment_end: usize,
+    prefix_start: usize,
+) -> bool {
+    // `/home/<name>` is also a common web route, so a terminal segment is left
+    // intact unless a child path proves it is likely a filesystem path. `/Users`
+    // is kept privacy-first because it is much more often a local macOS path.
+    if prefix != "/home/" || is_file_url_path_context(s, prefix_start) {
         return false;
-    };
+    }
+
+    !s[segment_end..]
+        .chars()
+        .next()
+        .is_some_and(|c| c == '/' || c == '\\')
+}
+
+pub(super) fn is_network_url_path_context(s: &str, prefix_start: usize) -> bool {
+    scheme_before_path(s, prefix_start).is_some_and(|scheme| !scheme.eq_ignore_ascii_case("file"))
+}
+
+fn is_file_url_path_context(s: &str, prefix_start: usize) -> bool {
+    scheme_before_path(s, prefix_start).is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
+}
+
+fn scheme_before_path(s: &str, prefix_start: usize) -> Option<&str> {
+    let before = &s[..prefix_start];
+    let scheme_sep = before.rfind("://")?;
     if before[scheme_sep + 3..]
         .chars()
         .any(is_string_cell_token_boundary)
     {
-        return false;
+        return None;
     }
     let scheme_start = before[..scheme_sep]
         .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    let scheme = &before[scheme_start..scheme_sep];
-    !scheme.eq_ignore_ascii_case("file")
+    Some(&before[scheme_start..scheme_sep])
+}
+
+fn is_http_request_target_context(s: &str, prefix_start: usize) -> bool {
+    let line_start = s[..prefix_start]
+        .rfind(['\r', '\n'])
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let before = &s[line_start..prefix_start];
+    let Some(method) = before.strip_suffix(' ') else {
+        return false;
+    };
+    matches!(
+        method,
+        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "TRACE"
+    )
 }
 
 fn is_string_cell_token_boundary(c: char) -> bool {
@@ -1394,7 +1544,12 @@ pub(super) fn sensitive_assignment_value_end(
     let tail = &s[value_start..];
     let plain_end = tail
         .char_indices()
-        .find(|(_, c)| matches!(*c, '&' | ' ' | '\r' | '\n' | '"' | '\'' | ';'))
+        .find(|(_, c)| {
+            matches!(
+                *c,
+                '&' | ' ' | '\r' | '\n' | '"' | '\'' | ';' | ')' | ']' | '}' | '>' | ','
+            )
+        })
         .map(|(idx, _)| value_start + idx);
     let encoded_amp_end = encoded_marker
         .then(|| {

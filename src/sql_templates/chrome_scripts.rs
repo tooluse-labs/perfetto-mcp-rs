@@ -77,7 +77,10 @@ pub fn chrome_page_load_script_hotspots_sql(
              {overlap_end_expr} AS overlap_end_ts, \
              {overlap_dur_expr} AS overlap_dur, \
              CASE WHEN s.thread_dur IS NOT NULL AND s.dur > 0 \
-                  THEN s.thread_dur * {overlap_dur_expr} * 1.0 / s.dur \
+                  THEN MAX(MIN( \
+                    s.thread_dur * {overlap_dur_expr} * 1.0 / s.dur, \
+                    {overlap_dur_expr} \
+                  ), 0.0) \
              END AS overlap_thread_dur, \
              s.name, \
              ROUND(({overlap_start_expr} - {anchor_expr}) / 1e6, 3) AS start_ms, \
@@ -152,7 +155,12 @@ pub fn chrome_page_load_script_hotspots_sql(
            SELECT sd.root_id, child.id, sd.depth + 1 \
            FROM script_descendants sd \
            JOIN slice child ON child.parent_id = sd.id \
-           WHERE sd.depth < 8 AND child.dur > 0 \
+           WHERE sd.depth < 8 \
+             AND child.dur > 0 \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM script_slices nested_root \
+               WHERE nested_root.id = child.id \
+             ) \
          ), \
          descendant_rollup AS ( \
            SELECT \

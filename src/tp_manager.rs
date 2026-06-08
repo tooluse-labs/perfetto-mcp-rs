@@ -1923,19 +1923,25 @@ mod tests {
                 .expect("initial spawn");
         }
 
-        // Give the kernel a moment to reap the exited child so try_wait observes it.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Second call: cached_client must detect the dead process and respawn.
-        {
+        // cached_client must detect the dead process and respawn. Process
+        // reaping can lag briefly, so poll instead of relying on one sleep.
+        for _ in 0..50 {
             let counter = Arc::clone(&spawn_count);
             manager
-                .get_or_spawn_instance(canonical, test_fingerprint(1), move |port, _| async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(fake_instance(port))
-                })
+                .get_or_spawn_instance(
+                    canonical.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
                 .await
                 .expect("auto-recovery respawn");
+            if spawn_count.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         assert_eq!(

@@ -92,11 +92,14 @@ pub fn chrome_main_thread_hotspots_sql(
            ct.dur / 1e6 AS dur_ms, \
            ROUND({overlap_dur_expr} / 1e6, 3) AS overlap_dur_ms, \
            CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
-                THEN ROUND(ct.thread_dur * 100.0 / ct.dur, 1) \
+                THEN MAX(MIN(ROUND(ct.thread_dur * 100.0 / ct.dur, 1), 100.0), 0.0) \
            END AS cpu_pct, \
            ct.thread_dur / 1e6 AS thread_dur_ms, \
            CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
-                THEN ROUND(ct.thread_dur * {overlap_dur_expr} * 1.0 / ct.dur / 1e6, 3) \
+                THEN ROUND(MAX(MIN( \
+                  ct.thread_dur * {overlap_dur_expr} * 1.0 / ct.dur, \
+                  {overlap_dur_expr} \
+                ), 0.0) / 1e6, 3) \
            END AS overlap_thread_dur_ms \
          FROM chrome_tasks ct \
          LEFT JOIN thread t ON ct.utid = t.utid \

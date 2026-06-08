@@ -113,11 +113,12 @@ pub const CHROME_WEB_CONTENT_INTERACTIONS_SQL: &str =
      SELECT \
        id, \
        ts, \
-       dur / 1e6 AS dur_ms, \
+       total_duration_ms, \
+       dur / 1e6 AS longest_event_dur_ms, \
        interaction_type, \
        renderer_upid \
      FROM chrome_web_content_interactions \
-     ORDER BY dur DESC \
+     ORDER BY total_duration_ms DESC, dur DESC \
      LIMIT 100";
 
 pub const CHROME_WEB_CONTENT_INTERACTIONS_COUNT_SQL: &str =

@@ -602,10 +602,13 @@ pub fn chrome_page_load_resource_pipeline_sql(
               s.arg_set_id, \
               s.thread_dur, \
               {script_overlap_start_expr} AS overlap_start_ts, \
-              {script_overlap_end_expr} AS overlap_end_ts, \
+             {script_overlap_end_expr} AS overlap_end_ts, \
              {script_overlap_dur_expr} AS overlap_dur, \
              CASE WHEN s.thread_dur IS NOT NULL AND s.dur > 0 \
-                  THEN s.thread_dur * {script_overlap_dur_expr} * 1.0 / s.dur \
+                  THEN MAX(MIN( \
+                    s.thread_dur * {script_overlap_dur_expr} * 1.0 / s.dur, \
+                    {script_overlap_dur_expr} \
+                  ), 0.0) \
              END AS overlap_thread_dur, \
              s.name, \
              ROUND(({script_overlap_start_expr} - {script_anchor_expr}) / 1e6, 3) AS start_ms, \
@@ -710,7 +713,12 @@ pub fn chrome_page_load_resource_pipeline_sql(
            SELECT sd.root_id, child.id, sd.depth + 1 \
            FROM script_descendants sd \
            JOIN slice child ON child.parent_id = sd.id \
-           WHERE sd.depth < 8 AND child.dur > 0 \
+           WHERE sd.depth < 8 \
+             AND child.dur > 0 \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM script_slices nested_root \
+               WHERE nested_root.id = child.id \
+             ) \
          ), \
           script_descendant_rollup AS ( \
             SELECT \
@@ -784,7 +792,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
              ROUND(MAX(CASE WHEN rr.name IN ( \
                'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
                'REQUEST_ALIVE', 'CORS_REQUEST' \
-             ) THEN rr.dur END) / 1e6, 3) AS request_span_ms, \
+             ) THEN rr.overlap_dur END) / 1e6, 3) AS request_span_ms, \
              ROUND(MIN(CASE WHEN rr.name = 'Resource::Create' \
                THEN rr.start_ms END), 3) AS resource_create_ms, \
              ROUND(MIN(CASE WHEN rr.name GLOB '*OnReceiveResponse*' \
@@ -792,7 +800,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
                THEN rr.start_ms END), 3) AS response_start_ms, \
              ROUND(MAX(CASE WHEN rr.name GLOB '*Cache*' \
                OR rr.name GLOB '*GetResource*' \
-               THEN rr.dur END) / 1e6, 3) AS cache_or_get_resource_span_ms, \
+               THEN rr.overlap_dur END) / 1e6, 3) AS cache_or_get_resource_span_ms, \
              (SELECT r2.id FROM resource_rows r2 \
               WHERE r2.url_key = rr.url_key \
               ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS example_resource_slice_id \

@@ -369,7 +369,7 @@ pub struct ChromePageLoadResourceSummaryParams {
     /// signed/nonce query variants of the same endpoint.
     #[serde(default)]
     pub url_grouping: Option<ChromePageLoadResourceUrlGrouping>,
-    /// Optional max rows to return. Defaults to 100 and is capped at 5000.
+    /// Optional max rows to return. Defaults to 25 and is capped at 5000.
     /// Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,

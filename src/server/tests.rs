@@ -546,6 +546,51 @@ fn chrome_tool_response_with_known_row_count_only_truncates_when_more_rows_exist
 }
 
 #[test]
+fn extra_row_probe_limit_adds_one_until_global_cap() {
+    assert_eq!(extra_row_probe_limit(25), 26);
+    assert_eq!(extra_row_probe_limit(MAX_ROWS - 1), MAX_ROWS);
+    assert_eq!(extra_row_probe_limit(MAX_ROWS), MAX_ROWS);
+}
+
+#[test]
+fn chrome_tool_probe_response_trims_extra_row_and_avoids_cap_false_positive() {
+    let exact_table = decoded_table(&["id"], vec![vec![json!(1)], vec![json!(2)]]);
+    let exact_response = format_chrome_tool_response_with_probe_limit_and_redaction(
+        exact_table,
+        2,
+        DEFAULT_TOOL_MAX_STRING_LEN,
+        false,
+    )
+    .expect("serialize");
+    let exact: serde_json::Value = serde_json::from_str(&exact_response).expect("json");
+    assert_eq!(exact["returned_rows"], json!(2));
+    assert_eq!(exact["truncated"], json!(false));
+    assert!(
+        exact["note"]
+            .as_str()
+            .expect("note")
+            .contains("extra-row probe"),
+        "probe responses must explain truncation semantics: {exact}",
+    );
+
+    let extra_table = decoded_table(
+        &["id"],
+        vec![vec![json!(1)], vec![json!(2)], vec![json!(3)]],
+    );
+    let extra_response = format_chrome_tool_response_with_probe_limit_and_redaction(
+        extra_table,
+        2,
+        DEFAULT_TOOL_MAX_STRING_LEN,
+        false,
+    )
+    .expect("serialize");
+    let extra: serde_json::Value = serde_json::from_str(&extra_response).expect("json");
+    assert_eq!(extra["returned_rows"], json!(2));
+    assert_eq!(extra["truncated"], json!(true));
+    assert_eq!(extra["rows"], json!([[1], [2]]));
+}
+
+#[test]
 fn list_threads_response_exposes_exact_count_and_truncation() {
     let table = decoded_table(
         &["tid", "thread_name", "pid", "upid", "machine_id"],
@@ -976,6 +1021,40 @@ fn slice_descendants_response_includes_missing_root_ids() {
 }
 
 #[test]
+fn slice_descendants_response_trims_extra_probe_row() {
+    let table = decoded_table(
+        &["root_id", "depth", "name", "slice_count"],
+        vec![
+            vec![json!(1), json!(1), json!("a"), json!(1)],
+            vec![json!(1), json!(1), json!("b"), json!(1)],
+            vec![json!(1), json!(1), json!("c"), json!(1)],
+        ],
+    );
+    let applied_filters = SliceDescendantsAppliedFilters {
+        min_dur_ms: DEFAULT_SLICE_DESCENDANTS_MIN_DUR_MS,
+        max_depth: DEFAULT_SLICE_DESCENDANTS_MAX_DEPTH,
+        limit: 2,
+        include_args: false,
+    };
+
+    let response = format_slice_descendants_tool_response_with_redaction(
+        table,
+        2,
+        applied_filters,
+        Vec::new(),
+        0,
+        None,
+        false,
+    )
+    .expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    assert_eq!(parsed["returned_rows"], json!(2));
+    assert_eq!(parsed["truncated"], json!(true));
+    assert_eq!(parsed["rows"], json!([[1, 1, "a", 1], [1, 1, "b", 1]]));
+}
+
+#[test]
 fn slice_descendants_applied_filters_use_effective_defaults() {
     let params = SliceDescendantsBreakdownParams {
         slice_ids: vec![10],
@@ -1386,11 +1465,19 @@ fn execute_sql_redact_strings_respects_query_key_boundaries() {
 #[test]
 fn execute_sql_redact_strings_does_not_rewrite_network_url_paths_as_user_paths() {
     let table = decoded_table(
-        &["cdn_url", "local_path", "file_url"],
+        &[
+            "cdn_url",
+            "local_path",
+            "file_url",
+            "request_line",
+            "bare_route",
+        ],
         vec![vec![
             json!("https://cdn.example.test/Users/avatars/42.png"),
             json!("/Users/alice/trace.pftrace"),
             json!("file:///Users/alice/trace.pftrace"),
+            json!("GET /home/feed HTTP/1.1"),
+            json!("/home/dashboard"),
         ]],
     );
     let params = execute_sql_params("SELECT paths");
@@ -1408,6 +1495,8 @@ fn execute_sql_redact_strings_does_not_rewrite_network_url_paths_as_user_paths()
         parsed["rows"][0][2],
         json!("file:///Users/<user>/trace.pftrace")
     );
+    assert_eq!(parsed["rows"][0][3], json!("GET /home/feed HTTP/1.1"));
+    assert_eq!(parsed["rows"][0][4], json!("/home/dashboard"));
     assert_eq!(parsed["redacted"], json!(true));
 }
 
@@ -1469,12 +1558,13 @@ fn execute_sql_redact_strings_does_not_treat_suffix_shapes_as_safe_secrets() {
 #[test]
 fn execute_sql_redact_strings_masks_terminal_user_profile_paths() {
     let table = decoded_table(
-        &["win", "win_slash", "mac", "linux"],
+        &["win", "win_slash", "mac", "mac_file", "linux"],
         vec![vec![
             json!("C:\\Users\\Alice"),
             json!("C:/Users/Alice"),
             json!("/Users/Alice"),
-            json!("/home/alice"),
+            json!("/Users/Alice/trace.pftrace"),
+            json!("/home/alice/.cache"),
         ]],
     );
     let params = execute_sql_params("SELECT profile_paths");
@@ -1486,8 +1576,36 @@ fn execute_sql_redact_strings_masks_terminal_user_profile_paths() {
     assert_eq!(parsed["rows"][0][0], json!("C:\\Users\\<user>"));
     assert_eq!(parsed["rows"][0][1], json!("C:/Users/<user>"));
     assert_eq!(parsed["rows"][0][2], json!("/Users/<user>"));
-    assert_eq!(parsed["rows"][0][3], json!("/home/<user>"));
+    assert_eq!(parsed["rows"][0][3], json!("/Users/<user>/trace.pftrace"));
+    assert_eq!(parsed["rows"][0][4], json!("/home/<user>/.cache"));
     assert_eq!(parsed["redacted"], json!(true));
+}
+
+#[test]
+fn execute_sql_redact_strings_preserves_assignment_closing_delimiters() {
+    let table = decoded_table(
+        &["values"],
+        vec![vec![json!(
+            "<sig=abc> [token=def] {session=ghi} (auth=jkl), uid=0"
+        )]],
+    );
+    let params = execute_sql_params("SELECT values");
+
+    let response =
+        format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+    let value = parsed["rows"][0][0].as_str().expect("redacted values");
+
+    assert!(
+        value.starts_with("<sig=<redacted:") && value.contains("> [token=<redacted:"),
+        "angle/bracket structure should survive redaction: {value}",
+    );
+    assert!(
+        value.contains(">] {session=<redacted:")
+            && value.contains(">} (auth=<redacted:")
+            && value.contains(">), uid=<redacted:"),
+        "closing delimiters should remain outside redacted values: {value}",
+    );
 }
 
 #[test]
@@ -1656,6 +1774,26 @@ fn tool_router_exposes_expected_tools() {
             "load_trace",
             "slice_descendants_breakdown",
         ],
+    );
+}
+
+#[test]
+fn chrome_web_content_interactions_sql_ranks_by_total_interaction_duration() {
+    assert!(
+        CHROME_WEB_CONTENT_INTERACTIONS_SQL.contains("total_duration_ms"),
+        "web interaction SQL must expose INP-style total interaction duration: {CHROME_WEB_CONTENT_INTERACTIONS_SQL}",
+    );
+    assert!(
+        CHROME_WEB_CONTENT_INTERACTIONS_SQL.contains("dur / 1e6 AS longest_event_dur_ms"),
+        "web interaction SQL should keep the single-event duration as a secondary fact: {CHROME_WEB_CONTENT_INTERACTIONS_SQL}",
+    );
+    assert!(
+        CHROME_WEB_CONTENT_INTERACTIONS_SQL.contains("ORDER BY total_duration_ms DESC, dur DESC"),
+        "web interaction SQL must rank by total interaction duration before single-event duration: {CHROME_WEB_CONTENT_INTERACTIONS_SQL}",
+    );
+    assert!(
+        !CHROME_WEB_CONTENT_INTERACTIONS_SQL.contains("AS dur_ms"),
+        "ambiguous dur_ms column should not hide total vs single-event semantics: {CHROME_WEB_CONTENT_INTERACTIONS_SQL}",
     );
 }
 
@@ -2640,6 +2778,7 @@ fn tool_input_schemas_use_path_not_trace_path() {
 fn chrome_main_thread_hotspots_sql_no_filter_runs_all_main_threads() {
     let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters::default())
         .expect("builder must succeed");
+    let compact = compact_sql(&sql);
     assert!(sql.contains("ct.ts"));
     assert!(sql.contains("ct.upid"));
     assert!(sql.contains("p.pid"));
@@ -2651,6 +2790,14 @@ fn chrome_main_thread_hotspots_sql_no_filter_runs_all_main_threads() {
         sql.contains("ct.dur / 1e6 AS dur_ms")
             && sql.contains("ROUND(ct.dur / 1e6, 3) AS overlap_dur_ms"),
         "no-window overlap duration should equal full task duration, got: {sql}",
+    );
+    assert!(
+        compact.contains("MAX(MIN(ROUND(ct.thread_dur * 100.0 / ct.dur, 1), 100.0), 0.0)"),
+        "cpu_pct must be clamped to 0..100%, got: {sql}",
+    );
+    assert!(
+        compact.contains("MAX(MIN( ct.thread_dur * ct.dur * 1.0 / ct.dur, ct.dur ), 0.0)"),
+        "overlap_thread_dur_ms must be clamped to the overlap duration range, got: {sql}",
     );
     assert!(sql.contains("ORDER BY ct.dur DESC LIMIT 100"));
     assert!(
@@ -2770,6 +2917,7 @@ fn chrome_main_thread_hotspots_sql_with_raw_window_emits_ts_filters() {
         ..Default::default()
     })
     .expect("raw-window builder must succeed");
+    let compact = compact_sql(&sql);
     assert!(sql.contains("MAX(ct.ts, 1000)"), "got: {sql}");
     assert!(sql.contains("MIN(ct.ts + ct.dur, 2000)"), "got: {sql}");
     assert!(sql.contains("AND ct.ts + ct.dur > 1000"), "got: {sql}");
@@ -2781,6 +2929,12 @@ fn chrome_main_thread_hotspots_sql_with_raw_window_emits_ts_filters() {
     assert!(
         sql.contains("ORDER BY (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) DESC, ct.dur DESC"),
         "windowed hotspots must rank by clipped overlap before full duration, got: {sql}",
+    );
+    assert!(
+        compact.contains(
+            "MAX(MIN( ct.thread_dur * (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) * 1.0 / ct.dur, (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) ), 0.0)"
+        ),
+        "windowed overlap_thread_dur_ms must clamp the prorated CPU estimate to the clipped overlap range, got: {sql}",
     );
     assert!(
         !sql.contains("hotspot_window"),
@@ -3477,6 +3631,11 @@ fn chrome_page_load_resource_pipeline_sql_builds_url_drilldown() {
         "pipeline must expose request span evidence, got: {sql}",
     );
     assert!(
+        sql.contains("THEN rr.overlap_dur END) / 1e6, 3) AS request_span_ms")
+            && sql.contains("THEN rr.overlap_dur END) / 1e6, 3) AS cache_or_get_resource_span_ms"),
+        "pipeline request/cache spans must use clipped overlap duration, got: {sql}",
+    );
+    assert!(
         sql.contains("background_parse_ms"),
         "pipeline must expose background parse evidence, got: {sql}",
     );
@@ -3524,6 +3683,17 @@ fn chrome_page_load_resource_pipeline_sql_clips_script_metrics_to_window() {
         sql.contains("ROUND(MAX(ss.overlap_thread_dur) / 1e6, 3) AS max_script_cpu_ms"),
         "script CPU must be prorated to the clipped overlap, got: {sql}",
     );
+    let compact = compact_sql(&sql);
+    assert!(
+        compact.contains("MAX(MIN( s.thread_dur *")
+            && compact.contains("* 1.0 / s.dur,")
+            && compact.contains("), 0.0) END AS overlap_thread_dur"),
+        "pipeline script CPU estimate must be clamped to the clipped overlap range, got: {sql}",
+    );
+    assert!(
+        sql.contains("FROM script_slices nested_root") && sql.contains("nested_root.id = child.id"),
+        "pipeline script descendant recursion must stop at nested script roots, got: {sql}",
+    );
     assert!(
         sql.contains("ORDER BY s2.overlap_dur DESC, s2.dur DESC"),
         "example script id should rank by clipped overlap before full duration, got: {sql}",
@@ -3532,7 +3702,6 @@ fn chrome_page_load_resource_pipeline_sql_clips_script_metrics_to_window() {
         !sql.contains("THEN ss.dur ELSE 0 END) / 1e6, 3)"),
         "windowed script totals must not use full slice duration, got: {sql}",
     );
-    let compact = compact_sql(&sql);
     assert!(
         compact.contains(
             "child.name GLOB '*Style*' OR child.name = 'Blink.Style.UpdateTime' ) AND NOT ( child.name GLOB '*ForcedStyle*'"
@@ -3594,6 +3763,7 @@ fn chrome_page_load_resource_timing_evidence_sql_probes_phase_and_incomplete_sig
 fn chrome_page_load_script_hotspots_sql_defaults_to_grouped_script_scan() {
     let sql = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters::default())
         .expect("script builder must succeed");
+    let compact = compact_sql(&sql);
     assert!(
         sql.contains("WITH RECURSIVE script_slices AS"),
         "script SQL must use recursive CTEs for descendant rollups, got: {sql}",
@@ -3638,8 +3808,10 @@ fn chrome_page_load_script_hotspots_sql_defaults_to_grouped_script_scan() {
         "script max wall time must use clipped overlap duration, got: {sql}",
     );
     assert!(
-        sql.contains("* 1.0 / s.dur"),
-        "clipped CPU estimate must avoid integer division, got: {sql}",
+        compact.contains("MAX(MIN( s.thread_dur *")
+            && compact.contains("* 1.0 / s.dur,")
+            && compact.contains("), 0.0) END AS overlap_thread_dur"),
+        "clipped CPU estimate must avoid integer division and clamp to the overlap range, got: {sql}",
     );
     assert!(
         sql.contains("ORDER BY s2.overlap_dur DESC, s2.dur DESC, s2.id ASC"),
@@ -3650,6 +3822,12 @@ fn chrome_page_load_script_hotspots_sql_defaults_to_grouped_script_scan() {
         "descendant rollups must see the root clipped window, got: {sql}",
     );
     assert!(
+        sql.contains("NOT EXISTS (")
+            && sql.contains("FROM script_slices nested_root")
+            && sql.contains("nested_root.id = child.id"),
+        "descendant recursion must stop at nested script roots to avoid double-counting child style/layout work, got: {sql}",
+    );
+    assert!(
         sql.contains("root.overlap_start_ts"),
         "descendant style/layout duration must be clipped to root overlap start, got: {sql}",
     );
@@ -3657,7 +3835,6 @@ fn chrome_page_load_script_hotspots_sql_defaults_to_grouped_script_scan() {
         sql.contains("root.overlap_end_ts"),
         "descendant style/layout duration must be clipped to root overlap end, got: {sql}",
     );
-    let compact = compact_sql(&sql);
     assert!(
         compact.contains(
             "d.name GLOB '*Recalculate*Style*' OR d.name GLOB '*UpdateStyle*' OR d.name GLOB '*StyleRecalc*' ) AND NOT ( d.name GLOB '*Forced*Layout*'"

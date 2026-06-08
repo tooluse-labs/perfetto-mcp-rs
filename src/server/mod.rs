@@ -857,6 +857,8 @@ impl PerfettoMcpServer {
         .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page-load resource hotspots").await?;
+        let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
+        let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
             window: ChromePageLoadWindowFilters {
                 page_load_id: params.page_load_id,
@@ -866,18 +868,14 @@ impl PerfettoMcpServer {
                 end_ts_ns: params.end_ts_ns,
             },
             min_dur_ms: params.min_dur_ms,
-            limit: params.limit,
+            limit: Some(probe_limit as u32),
         })
         .map_err(|e| e.to_string())?;
         let table = client
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page-load resource hotspots", e))?;
-        format_chrome_tool_response(
-            table,
-            chrome_hotspots_effective_limit(params.limit),
-            params.max_string_len,
-        )
+        format_chrome_tool_response_with_probe_limit(table, effective_limit, params.max_string_len)
     }
 
     #[tool(
@@ -928,11 +926,13 @@ impl PerfettoMcpServer {
             start_ts_ns: params.start_ts_ns,
             end_ts_ns: params.end_ts_ns,
         };
+        let effective_limit = bounded_tool_limit(params.limit, 25)?;
+        let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
             window,
             min_overlap_ms: params.min_overlap_ms,
             url_grouping: params.url_grouping,
-            limit: params.limit,
+            limit: Some(probe_limit as u32),
         })
         .map_err(|e| e.to_string())?;
         let evidence_sql =
@@ -947,9 +947,9 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page-load resource summary", e))?;
-        format_chrome_resource_summary_response(
+        format_chrome_resource_summary_response_with_probe_limit(
             table,
-            chrome_hotspots_effective_limit_with_default(params.limit, 25),
+            effective_limit,
             params.max_string_len,
             evidence,
         )
@@ -1001,6 +1001,8 @@ impl PerfettoMcpServer {
             params.max_string_len.is_some()
         ))
         .await;
+        let effective_limit = bounded_tool_limit(params.limit, 30)?;
+        let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
             window: ChromePageLoadWindowFilters {
                 page_load_id: params.page_load_id,
@@ -1012,7 +1014,7 @@ impl PerfettoMcpServer {
             url_substring: params.url_substring.as_deref(),
             example_slice_id: params.example_slice_id,
             url_grouping: params.url_grouping,
-            limit: params.limit,
+            limit: Some(probe_limit as u32),
         })
         .map_err(|e| e.to_string())?;
         let client = self.client_for_current().await?;
@@ -1021,11 +1023,7 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page-load resource pipeline", e))?;
-        format_chrome_tool_response(
-            table,
-            chrome_hotspots_effective_limit_with_default(params.limit, 30),
-            params.max_string_len,
-        )
+        format_chrome_tool_response_with_probe_limit(table, effective_limit, params.max_string_len)
     }
 
     #[tool(
@@ -1072,6 +1070,8 @@ impl PerfettoMcpServer {
         .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page-load script hotspots").await?;
+        let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
+        let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
             process_name: params.process_name.as_deref(),
             pid: params.pid,
@@ -1084,18 +1084,14 @@ impl PerfettoMcpServer {
                 end_ts_ns: params.end_ts_ns,
             },
             min_total_ms: params.min_total_ms,
-            limit: params.limit,
+            limit: Some(probe_limit as u32),
         })
         .map_err(|e| e.to_string())?;
         let table = client
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page-load script hotspots", e))?;
-        format_chrome_tool_response(
-            table,
-            chrome_hotspots_effective_limit(params.limit),
-            params.max_string_len,
-        )
+        format_chrome_tool_response_with_probe_limit(table, effective_limit, params.max_string_len)
     }
 
     #[tool(
@@ -1141,7 +1137,7 @@ impl PerfettoMcpServer {
                           Unset preserves full strings for precision. Must be > 0 if set.\n\
                         \n\
                         Output: metadata-first JSON preserving `columns` / \
-                        `rows`; `truncated=true` means the row cap was reached; \
+                        `rows`; `truncated=true` means an extra-row probe found more rows; \
                         `string_truncated=true` means cell text was shortened.\n\
                         \n\
                         Empty result: no detected main-thread tasks exceeded `min_dur_ms` \
@@ -1179,6 +1175,8 @@ impl PerfettoMcpServer {
         .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome main-thread hotspots").await?;
+        let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
+        let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
             process_name: params.process_name.as_deref(),
             pid: params.pid,
@@ -1189,18 +1187,14 @@ impl PerfettoMcpServer {
             start_ts_ns: params.start_ts_ns,
             end_ts_ns: params.end_ts_ns,
             min_dur_ms: params.min_dur_ms,
-            limit: params.limit,
+            limit: Some(probe_limit as u32),
         })
         .map_err(|e| e.to_string())?;
         let table = client
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome main-thread hotspots", e))?;
-        format_chrome_tool_response(
-            table,
-            chrome_hotspots_effective_limit(params.limit),
-            params.max_string_len,
-        )
+        format_chrome_tool_response_with_probe_limit(table, effective_limit, params.max_string_len)
     }
 
     #[tool(
@@ -1251,6 +1245,7 @@ impl PerfettoMcpServer {
         let max_string_len = tool_max_string_len(params.max_string_len)?;
         let effective_limit =
             slice_descendants_effective_limit(params.limit).map_err(|e| e.to_string())?;
+        let probe_limit = extra_row_probe_limit(effective_limit as usize) as u32;
         let applied_filters = slice_descendants_applied_filters(&params, effective_limit);
 
         let client = self.client_for_current().await?;
@@ -1285,7 +1280,7 @@ impl PerfettoMcpServer {
             min_dur_ms: params.min_dur_ms,
             max_depth: params.max_depth,
             include_args: params.include_args,
-            row_limit: effective_limit,
+            row_limit: probe_limit,
         })
         .map_err(|e| e.to_string())?;
 
@@ -1368,12 +1363,12 @@ impl PerfettoMcpServer {
 
     #[tool(
         name = "chrome_web_content_interactions",
-        description = "Rank web content interactions in a Chrome trace by duration: id, \
-                       ts, dur_ms, interaction_type, renderer_upid. Sorted by dur_ms \
-                       DESC. Read-only.\n\
+        description = "Rank Chrome web content interactions by total_duration_ms: \
+                       id, ts, total_duration_ms, longest_event_dur_ms, \
+                       interaction_type, renderer_upid. Read-only.\n\
                        \n\
-                       Use when: INP (Interaction to Next Paint) analysis, reproducing \
-                       user-felt latency, finding slow click/tap/keyboard handlers.\n\
+                       Use when: INP analysis, reproducing user-felt latency, finding \
+                       slow click/tap/keyboard handlers.\n\
                        \n\
                        Don't use for: non-Chrome traces (will error). For interactions \
                        filtered by `interaction_type`, drop to \

@@ -713,7 +713,14 @@ fn e2e_chrome_web_content_interactions_sql_runs_cleanly() {
                 table.cell(i, "interaction_type").is_some(),
                 "row {i} missing interaction_type",
             );
-            assert!(table.cell(i, "dur_ms").is_some(), "row {i} missing dur_ms",);
+            assert!(
+                table.cell(i, "total_duration_ms").is_some(),
+                "row {i} missing total_duration_ms",
+            );
+            assert!(
+                table.cell(i, "longest_event_dur_ms").is_some(),
+                "row {i} missing longest_event_dur_ms",
+            );
         }
     });
 }
