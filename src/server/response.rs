@@ -200,6 +200,8 @@ pub(super) struct ChromeResourceTimingEvidence {
     pub(super) attribution_scope: &'static str,
     pub(super) phase_breakdown: &'static str,
     pub(super) phase_breakdown_available: bool,
+    pub(super) phase_breakdown_signal: &'static str,
+    pub(super) phase_breakdown_is_heuristic: bool,
     pub(super) safe_conclusion: &'static str,
     pub(super) safe_fact_fields: Vec<&'static str>,
     pub(super) unsafe_inferences: Vec<&'static str>,
@@ -694,9 +696,11 @@ pub(super) fn chrome_resource_timing_evidence_from_probe(
     if phase_breakdown_available {
         ChromeResourceTimingEvidence {
             attribution_scope: "url_lifecycle_span_with_phase_hints",
-            phase_breakdown: "phase_hints_present",
+            phase_breakdown: "heuristic_phase_hints_present",
             phase_breakdown_available: true,
-            safe_conclusion: "Summary rows rank URL lifecycle/request spans; phase-like trace signals exist, so inspect phase rows before assigning DNS/TLS/TTFB/download/cache cause.",
+            phase_breakdown_signal: "slice_or_arg_name_glob_match",
+            phase_breakdown_is_heuristic: true,
+            safe_conclusion: "Summary rows rank URL lifecycle/request spans; phase-like trace name/arg hints exist, so inspect phase rows before assigning DNS/TLS/TTFB/download/cache cause.",
             safe_fact_fields: vec![
                 "url lifecycle/request span",
                 "window overlap",
@@ -728,6 +732,8 @@ pub(super) fn chrome_resource_timing_evidence_from_probe(
             attribution_scope: "url_lifecycle_span",
             phase_breakdown: "absent",
             phase_breakdown_available: false,
+            phase_breakdown_signal: "none",
+            phase_breakdown_is_heuristic: false,
             safe_conclusion: "These URLs have long resource/request lifecycle spans overlapping the selected window.",
             safe_fact_fields: vec![
                 "url lifecycle/request span",

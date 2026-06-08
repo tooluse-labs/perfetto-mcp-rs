@@ -881,6 +881,8 @@ fn resource_summary_response_carries_attribution_evidence_before_rows() {
         attribution_scope: "url_lifecycle_span",
         phase_breakdown: "absent",
         phase_breakdown_available: false,
+        phase_breakdown_signal: "none",
+        phase_breakdown_is_heuristic: false,
         safe_conclusion: "safe",
         safe_fact_fields: vec!["url lifecycle/request span"],
         unsafe_inferences: vec!["dns", "ttfb"],
@@ -908,6 +910,14 @@ fn resource_summary_response_carries_attribution_evidence_before_rows() {
     );
     assert_eq!(
         parsed["resource_timing_evidence"]["phase_breakdown_available"],
+        json!(false)
+    );
+    assert_eq!(
+        parsed["resource_timing_evidence"]["phase_breakdown_signal"],
+        json!("none")
+    );
+    assert_eq!(
+        parsed["resource_timing_evidence"]["phase_breakdown_is_heuristic"],
         json!(false)
     );
     assert_eq!(
@@ -948,6 +958,8 @@ fn resource_timing_evidence_probe_distinguishes_absent_and_present_phase_hints()
     let absent_evidence = chrome_resource_timing_evidence_from_probe(&absent);
     assert_eq!(absent_evidence.attribution_scope, "url_lifecycle_span");
     assert_eq!(absent_evidence.phase_breakdown, "absent");
+    assert_eq!(absent_evidence.phase_breakdown_signal, "none");
+    assert!(!absent_evidence.phase_breakdown_is_heuristic);
     assert!(absent_evidence.unsafe_inferences.contains(&"download"));
     assert_eq!(absent_evidence.incomplete_duration_resource_slice_count, 2);
     assert!(absent_evidence.incomplete_duration_resource_slices_are_candidates);
@@ -966,8 +978,16 @@ fn resource_timing_evidence_probe_distinguishes_absent_and_present_phase_hints()
         present_evidence.attribution_scope,
         "url_lifecycle_span_with_phase_hints"
     );
-    assert_eq!(present_evidence.phase_breakdown, "phase_hints_present");
+    assert_eq!(
+        present_evidence.phase_breakdown,
+        "heuristic_phase_hints_present"
+    );
     assert!(present_evidence.phase_breakdown_available);
+    assert_eq!(
+        present_evidence.phase_breakdown_signal,
+        "slice_or_arg_name_glob_match"
+    );
+    assert!(present_evidence.phase_breakdown_is_heuristic);
     assert!(present_evidence.unsafe_inferences.contains(&"ttfb"));
     assert_eq!(present_evidence.network_phase_slice_count, 3);
     assert_eq!(present_evidence.network_phase_arg_count, 1);
