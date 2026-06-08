@@ -311,6 +311,48 @@ fn e2e_chrome_page_load_resource_summary_synthetic_ambiguous_window_against_fixt
             .query(&sql)
             .await
             .expect("chrome page-load resource summary query must succeed");
+        assert!(
+            !table.is_empty(),
+            "explicit page-load resource summary should produce rows in page_loads fixture",
+        );
+        let mut saw_target_renderer_row = false;
+        for i in 0..table.len() {
+            assert_eq!(
+                table.cell(i, "target_renderer_upids").and_then(|v| v.as_str()),
+                Some("3"),
+                "fixture page-load rows should derive target renderer upid from Renderer URL slices",
+            );
+            assert_eq!(
+                table
+                    .cell(i, "target_renderer_source")
+                    .and_then(|v| v.as_str()),
+                Some("renderer_navigation_url_slice"),
+                "fixture page-load rows should expose the stronger target-renderer source",
+            );
+            if table.cell(i, "renderer_relation").and_then(|v| v.as_str())
+                == Some("target_renderer")
+            {
+                saw_target_renderer_row = true;
+                assert_eq!(
+                    table
+                        .cell(i, "renderer_relation_confidence")
+                        .and_then(|v| v.as_str()),
+                    Some("high"),
+                    "direct Renderer navigation URL evidence should make target rows high confidence",
+                );
+                assert_eq!(
+                    table
+                        .cell(i, "renderer_relation_source")
+                        .and_then(|v| v.as_str()),
+                    Some("navigation_url_renderer_slice_upid_match"),
+                    "target rows should cite Renderer navigation URL slice evidence",
+                );
+            }
+        }
+        assert!(
+            saw_target_renderer_row,
+            "fixture should include at least one resource row from the target renderer",
+        );
         let ambiguous_window = client
             .query(
                 "INCLUDE PERFETTO MODULE chrome.page_loads; \

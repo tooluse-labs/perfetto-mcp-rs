@@ -358,18 +358,73 @@ pub fn chrome_page_load_resource_summary_sql(
         "COALESCE((SELECT nav_url FROM navigation_context), '')",
         url_grouping,
     );
+    let renderer_url_arg_priority_expr = chrome_url_arg_priority_expr("a");
 
     sql.push_str(&format!(
-        ", navigation_context AS ( \
+        ", navigation_context_base AS ( \
            SELECT \
              {nav_url_expr} AS nav_url, \
              {navigation_match_count_expr} AS navigation_match_count, \
-             {navigation_context_status_expr} AS navigation_context_status, \
-             GROUP_CONCAT(DISTINCT CASE \
-               WHEN process_name = 'Renderer' THEN upid \
-             END) AS target_renderer_upids \
-           FROM resource_candidates \
-           WHERE url = {nav_url_expr} \
+             {navigation_context_status_expr} AS navigation_context_status \
+         ), \
+         renderer_navigation_candidates AS ( \
+           SELECT DISTINCT p.upid \
+           FROM navigation_context_base n \
+           CROSS JOIN slice s \
+           JOIN args a ON s.arg_set_id = a.arg_set_id \
+           JOIN thread_track tt ON s.track_id = tt.id \
+           JOIN thread t ON tt.utid = t.utid \
+           JOIN process p ON t.upid = p.upid "
+    ));
+    if page_window.phase.is_some() {
+        sql.push_str("CROSS JOIN resource_window rw ");
+    }
+    sql.push_str(&format!(
+        "WHERE n.navigation_context_status NOT IN ('none', 'ambiguous') \
+           AND n.nav_url IS NOT NULL \
+           AND p.name = 'Renderer' \
+           AND a.display_value = n.nav_url \
+           AND {renderer_url_arg_priority_expr} < 99"
+    ));
+    if let Some(bound) = &exprs.start_bound {
+        sql.push_str(&format!(
+            " AND CASE WHEN s.dur >= 0 THEN s.ts + s.dur ELSE trace_end() END > {bound}"
+        ));
+    }
+    if let Some(bound) = &exprs.end_bound {
+        sql.push_str(&format!(" AND s.ts < {bound}"));
+    }
+    if page_window.phase.is_some() {
+        sql.push_str(" AND rw.start_ts IS NOT NULL AND rw.end_ts IS NOT NULL");
+    }
+    if let (Some(start), Some(end)) = (&exprs.start_bound, &exprs.end_bound) {
+        sql.push_str(&format!(" AND {end} > {start}"));
+    }
+    sql.push_str(&format!(
+        "), \
+         fallback_target_renderer_candidates AS ( \
+           SELECT DISTINCT rc.upid \
+           FROM navigation_context_base n \
+           JOIN resource_candidates rc ON rc.url = n.nav_url \
+           WHERE n.navigation_context_status NOT IN ('none', 'ambiguous') \
+             AND rc.process_name = 'Renderer' \
+         ), \
+         navigation_context AS ( \
+           SELECT \
+             n.nav_url, \
+             n.navigation_match_count, \
+             n.navigation_context_status, \
+             COALESCE( \
+               (SELECT GROUP_CONCAT(DISTINCT upid) FROM renderer_navigation_candidates), \
+               (SELECT GROUP_CONCAT(DISTINCT upid) FROM fallback_target_renderer_candidates) \
+             ) AS target_renderer_upids, \
+             CASE \
+               WHEN EXISTS(SELECT 1 FROM renderer_navigation_candidates) \
+                 THEN 'renderer_navigation_url_slice' \
+               WHEN EXISTS(SELECT 1 FROM fallback_target_renderer_candidates) \
+                 THEN 'resource_candidate_url_slice' \
+             END AS target_renderer_source \
+           FROM navigation_context_base n \
          ), \
          resource_rows AS ( \
             SELECT resource_candidates.*, {url_key_expr} AS url_key \
@@ -421,6 +476,12 @@ pub fn chrome_page_load_resource_summary_sql(
                   ',' || (SELECT target_renderer_upids FROM navigation_context) || ',', \
                   ',' || rr.upid || ',' \
                 ) > 0 THEN 1 ELSE 0 END) = 1 \
+                AND (SELECT target_renderer_source FROM navigation_context) = 'renderer_navigation_url_slice' \
+                THEN 'high' \
+              WHEN MAX(CASE WHEN INSTR( \
+                  ',' || (SELECT target_renderer_upids FROM navigation_context) || ',', \
+                  ',' || rr.upid || ',' \
+                ) > 0 THEN 1 ELSE 0 END) = 1 \
                 THEN 'medium' \
               WHEN MAX(CASE WHEN rr.process_name = 'Renderer' THEN 1 ELSE 0 END) = 1 \
                 THEN 'medium' \
@@ -437,12 +498,19 @@ pub fn chrome_page_load_resource_summary_sql(
                   ',' || (SELECT target_renderer_upids FROM navigation_context) || ',', \
                   ',' || rr.upid || ',' \
                 ) > 0 THEN 1 ELSE 0 END) = 1 \
-                THEN 'navigation_url_renderer_candidate_upid_match' \
+                AND (SELECT target_renderer_source FROM navigation_context) = 'renderer_navigation_url_slice' \
+                THEN 'navigation_url_renderer_slice_upid_match' \
+              WHEN MAX(CASE WHEN INSTR( \
+                  ',' || (SELECT target_renderer_upids FROM navigation_context) || ',', \
+                  ',' || rr.upid || ',' \
+                ) > 0 THEN 1 ELSE 0 END) = 1 \
+                THEN 'navigation_url_resource_candidate_upid_match' \
               WHEN MAX(CASE WHEN rr.process_name = 'Renderer' THEN 1 ELSE 0 END) = 1 \
                 THEN 'renderer_process_without_navigation_match' \
               ELSE 'browser_or_service_only' \
             END AS renderer_relation_source, \
             (SELECT target_renderer_upids FROM navigation_context) AS target_renderer_upids, \
+            (SELECT target_renderer_source FROM navigation_context) AS target_renderer_source, \
             COUNT(*) AS slice_count, \
             SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END) \
               AS incomplete_duration_slice_count, \

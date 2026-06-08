@@ -3489,8 +3489,21 @@ fn chrome_page_load_resource_summary_sql_groups_by_url() {
     );
     assert!(
         sql.contains("AS renderer_relation_confidence")
-            && sql.contains("AS renderer_relation_source"),
+            && sql.contains("AS renderer_relation_source")
+            && sql.contains("AS target_renderer_source"),
         "summary must expose renderer relation confidence/source, got: {sql}",
+    );
+    assert!(
+        sql.contains("renderer_navigation_candidates AS")
+            && sql.contains("p.name = 'Renderer'")
+            && sql.contains("a.display_value = n.nav_url")
+            && sql.contains("renderer_navigation_url_slice"),
+        "summary must derive target renderer from renderer navigation URL slices, got: {sql}",
+    );
+    assert!(
+        sql.contains("navigation_url_renderer_slice_upid_match")
+            && sql.contains("navigation_url_resource_candidate_upid_match"),
+        "summary must distinguish renderer navigation-slice evidence from fallback resource evidence, got: {sql}",
     );
     assert!(
         sql.contains("AS primary_slice_name"),

@@ -849,8 +849,9 @@ impl PerfettoMcpServer {
         name = "chrome_page_load_resource_summary",
         description = "URL-level Chrome resource/request summary for a page-load/raw \
                        window. Returns URL key, process/priority sets, span, \
-                       max/summed overlap, navigation/renderer relation evidence, \
-                       example_slice_id, incomplete_duration_slice_count. Use before \
+                       max/summed overlap, navigation/renderer relation evidence \
+                       including `target_renderer_source`, example_slice_id, \
+                       incomplete_duration_slice_count. Use before \
                        `chrome_page_load_resource_hotspots`; rank by max overlap.",
         annotations(
             read_only_hint = true,
