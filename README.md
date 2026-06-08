@@ -68,6 +68,9 @@ guided flow automatically.
 Switching traces means re-calling `load_trace` — there is no `path` argument on
 the other tools; they all act on the most recently loaded trace.
 
+MCP tool annotations are client-facing intent and safety hints, not server-side
+authorization or execution boundaries.
+
 **Essential**
 
 | Tool | Purpose |

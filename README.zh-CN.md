@@ -64,6 +64,9 @@ agentic 客户端虽然也能看到全部工具和错误提示，但不会自动
 切换 trace 只需重新调 `load_trace`——其它工具都没有 `path` 参数，一律作用于
 最近一次加载的 trace。
 
+MCP tool annotations 只是给客户端展示/路由用的意图与安全提示，不是服务端授权
+或执行边界。
+
 **核心（Essential）**
 
 | 工具 | 用途 |
