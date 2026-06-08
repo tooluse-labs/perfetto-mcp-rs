@@ -4,6 +4,13 @@
 
 ### Unreleased
 
+### [0.16.0](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.0) (June 8, 2026)
+
+- **Accuracy-focused trace analysis hardening.** `execute_sql` now rejects multiple output statements instead of silently returning only the last result, clamps oversized output-shaping requests to the supported row cap, preserves BLOB cells as hex, reports stricter decoder errors for incomplete rows, and gives targeted hints for missing modules/functions and ambiguous columns.
+- **Chrome metrics now avoid several plausible-looking wrong numbers.** Main-thread/resource/script windows use overlap semantics more consistently, INP-style interactions rank by total interaction duration, script/style/layout descendant accounting avoids nested-root double counting, CPU estimates are capped to the selected overlap window, incomplete `dur=-1` resource slices are surfaced with explicit status/count metadata, and probed tools report exact `row_count` / `truncated` signals.
+- **Resource attribution, redaction, and trace identity are safer for LLM consumers.** Chrome resource tools derive target renderers from navigation-related renderer slices, mark ambiguous navigation contexts more conservatively, expose optional `machine_id` filters where supported, preserve URL route structure during redaction, reduce redaction hash collisions, and strengthen trace fingerprints so overwritten traces are less likely to reuse stale trace-processor state.
+- **MCP surface polish from the context-efficiency epic.** Tool annotations, stdlib quickref resources, filtered stdlib module discovery, compressed tool descriptions, context-budget tests, structured tracing spans, and README guidance for annotation boundaries are now in place.
+
 ### [0.15.14](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.15.14) (June 6, 2026)
 
 - **`execute_sql` now shapes large responses without materializing rows it will not return.** The protobuf decoder counts the full decoded result set from trace processor cell metadata while only building row values needed by `summary`, `head`, `limit`, or `columns_only`, so `row_count_known=true` remains an exact post-SQL count and response shaping does not rewrite caller SQL.
