@@ -16,18 +16,26 @@ pub(super) const DEFAULT_TOOL_MAX_STRING_LEN: Option<usize> = None;
 pub(super) const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 pub(super) const EXECUTE_SQL_SHAPING_NOTE: &str =
     "row_count is exact post-SQL decoded rows when row_count_known=true; \
-     head/limit only trims returned tool rows and does not rewrite SQL.";
+     head/limit only trims returned tool rows, is capped at 5000, and does not rewrite SQL.";
 pub(super) const CHROME_TOOL_SHAPING_NOTE: &str =
     "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened.";
+pub(super) const CHROME_TOOL_KNOWN_ROW_COUNT_NOTE: &str =
+    "row_count is exact for the tool query; truncated=true means more rows exist than returned; string_truncated=cell text shortened.";
 pub(super) const SLICE_DESCENDANTS_BREAKDOWN_SCOPE: &str = "descendants only; root slices excluded";
 pub(super) const SLICE_DESCENDANTS_SHAPING_NOTE: &str =
-    "slice_count and total_ms include only descendants matching min_dur_ms within max_depth; \
-     limit caps returned groups; example_slice_id is the longest-duration descendant per group \
-     (ties broken by smallest id); first_ts_ns is raw nanoseconds; missing_root_ids lists \
-     requested slice_ids that do not exist in the loaded trace; example_args, when present, \
-     comes only from example_slice_id.";
+    "slice_count, inclusive_total_ms, self_ms, and max_ms include only descendants matching \
+     min_dur_ms within max_depth; inclusive_total_ms is inclusive wall time and overlaps \
+     across depths, so do not sum it across rows/depths; self_ms subtracts direct child \
+     inclusive durations per descendant slice and is clamped at zero; limit caps returned \
+     groups; example_slice_id is the longest-duration descendant per group (ties broken by \
+     smallest id); first_ts_ns is raw nanoseconds; missing_root_ids lists requested slice_ids \
+     that do not exist in the loaded trace; example_args, when present, comes only from \
+     example_slice_id.";
 pub(super) const REDACTION_POLICY_NOTE: &str =
     "execute_sql and Chrome dedicated-tool string cells may contain <redacted>; this is server-side policy, not a tool parameter.";
+pub(super) const LIST_THREADS_LIMIT: usize = 2000;
+pub(super) const LIST_THREADS_SHAPING_NOTE: &str =
+    "row_count is exact for the selected process set; truncated=true means the 2000-row cap was hit. Use upid for one process or execute_sql for custom pagination.";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(super) struct RedactionPolicy {
@@ -144,6 +152,17 @@ pub(super) struct ChromeToolRowsResponse {
     pub(super) rows: Vec<Vec<serde_json::Value>>,
 }
 
+#[derive(Debug, Serialize)]
+pub(super) struct ListThreadsRowsResponse {
+    pub(super) columns: Vec<String>,
+    pub(super) row_count: usize,
+    pub(super) returned_rows: usize,
+    pub(super) truncated: bool,
+    pub(super) row_count_known: bool,
+    pub(super) note: &'static str,
+    pub(super) rows: Vec<Vec<serde_json::Value>>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(super) struct ChromeResourceTimingEvidence {
     pub(super) attribution_scope: &'static str,
@@ -215,6 +234,18 @@ pub(super) fn chrome_hotspots_effective_limit_with_default(
     }
 }
 
+pub(super) fn bounded_tool_limit(
+    limit: Option<u32>,
+    default_limit: usize,
+) -> Result<usize, String> {
+    match limit {
+        Some(0) => Err("`limit` must be > 0 when set.".to_owned()),
+        Some(n) if (n as usize) > MAX_ROWS => Ok(MAX_ROWS),
+        Some(n) => Ok(n as usize),
+        None => Ok(default_limit),
+    }
+}
+
 pub(super) fn tool_max_string_len(max_string_len: Option<u32>) -> Result<Option<usize>, String> {
     match max_string_len {
         Some(0) => Err("`max_string_len` must be > 0 when set.".to_owned()),
@@ -273,6 +304,77 @@ pub(super) fn format_chrome_tool_response_with_redaction(
         redacted,
         note: CHROME_TOOL_SHAPING_NOTE,
         rows,
+    })
+    .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+pub(super) fn format_chrome_tool_response_with_known_row_count(
+    table: DecodedTable,
+    row_count: usize,
+    max_string_len: Option<u32>,
+) -> Result<String, String> {
+    format_chrome_tool_response_with_known_row_count_and_redaction(
+        table,
+        row_count,
+        tool_max_string_len(max_string_len)?,
+        default_redact_strings(),
+    )
+}
+
+pub(super) fn format_chrome_tool_response_with_known_row_count_and_redaction(
+    table: DecodedTable,
+    row_count: usize,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+) -> Result<String, String> {
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "chrome_rows",
+        row_count,
+        returned_rows = table.rows.len(),
+        max_string_len_set = max_string_len.is_some(),
+        redact_strings,
+        string_truncated = tracing::field::Empty,
+        redacted = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let shape = ExecuteSqlOutputShape {
+        mode: ExecuteSqlOutputMode::FullRows,
+        active: true,
+        max_string_len,
+        redact_strings,
+    };
+    let returned_rows = table.rows.len();
+    let (rows, string_truncated, redacted) = transform_rows(table.rows.iter(), shape);
+    tracing::Span::current().record("string_truncated", string_truncated);
+    tracing::Span::current().record("redacted", redacted);
+    serde_json::to_string(&ChromeToolRowsResponse {
+        columns: table.columns,
+        row_count: Some(row_count),
+        returned_rows,
+        truncated: row_count > returned_rows,
+        row_count_known: true,
+        string_truncated,
+        redacted,
+        note: CHROME_TOOL_KNOWN_ROW_COUNT_NOTE,
+        rows,
+    })
+    .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+pub(super) fn format_list_threads_response(
+    table: DecodedTable,
+    row_count: usize,
+) -> Result<String, String> {
+    let returned_rows = table.rows.len();
+    serde_json::to_string(&ListThreadsRowsResponse {
+        columns: table.columns,
+        row_count,
+        returned_rows,
+        truncated: row_count > returned_rows,
+        row_count_known: true,
+        note: LIST_THREADS_SHAPING_NOTE,
+        rows: table.rows,
     })
     .map_err(|e| format!("Failed to serialize results: {e}"))
 }
@@ -667,8 +769,8 @@ pub(super) fn execute_sql_output_shape(
     if params.head.is_some() && params.limit.is_some() {
         return Err("`head` and `limit` are aliases; provide only one.".to_owned());
     }
-    let row_limit = params.head.or(params.limit);
-    if row_limit == Some(0) {
+    let requested_row_limit = params.head.or(params.limit);
+    if requested_row_limit == Some(0) {
         return Err("`head` / `limit` must be > 0 when set.".to_owned());
     }
     if params.max_string_len == Some(0) {
@@ -677,27 +779,24 @@ pub(super) fn execute_sql_output_shape(
     if params.columns_only && params.summary {
         return Err("`columns_only` and `summary` are mutually exclusive.".to_owned());
     }
-    if params.columns_only && row_limit.is_some() {
+    if params.columns_only && requested_row_limit.is_some() {
         return Err("`columns_only` cannot be combined with `head` or `limit`.".to_owned());
     }
 
+    let row_limit = requested_row_limit.map(|n| (n as usize).min(MAX_ROWS));
     let max_string_len = params.max_string_len.map(|n| n as usize);
     let active = params.columns_only
         || params.summary
-        || row_limit.is_some()
+        || requested_row_limit.is_some()
         || params.include_row_count
         || max_string_len.is_some()
         || redact_strings;
     let mode = if params.columns_only {
         ExecuteSqlOutputMode::ColumnsOnly
     } else if params.summary {
-        ExecuteSqlOutputMode::Summary(
-            row_limit
-                .map(|n| n as usize)
-                .unwrap_or(DEFAULT_EXECUTE_SQL_SUMMARY_ROWS),
-        )
+        ExecuteSqlOutputMode::Summary(row_limit.unwrap_or(DEFAULT_EXECUTE_SQL_SUMMARY_ROWS))
     } else if let Some(limit) = row_limit {
-        ExecuteSqlOutputMode::LimitedRows(limit as usize)
+        ExecuteSqlOutputMode::LimitedRows(limit)
     } else {
         ExecuteSqlOutputMode::FullRows
     };

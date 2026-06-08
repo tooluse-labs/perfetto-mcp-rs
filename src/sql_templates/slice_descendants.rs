@@ -19,6 +19,11 @@ pub const MAX_SLICE_DESCENDANTS_ROOTS: usize = 100;
 /// nanoseconds because `slice.ts` is a wall-clock-ish nanosecond stamp; the
 /// other duration columns are in ms, so the unit suffix makes the difference
 /// visible to callers.
+///
+/// `inclusive_total_ms` sums Perfetto's inclusive slice durations and must not
+/// be summed across depths. `self_ms` subtracts direct child inclusive durations
+/// per descendant slice before grouping, clamped at zero, so it is the safer
+/// first column for "where is the work" attribution.
 pub fn slice_descendants_breakdown_sql(
     filters: SliceDescendantsBreakdownFilters<'_>,
 ) -> Result<String, PerfettoError> {
@@ -130,6 +135,15 @@ pub fn slice_descendants_breakdown_sql(
                s.name AS name, \
                s.id AS slice_id, \
                s.dur AS dur, \
+               MAX( \
+                 s.dur - COALESCE(( \
+                   SELECT SUM(child.dur) \
+                   FROM slice child \
+                   WHERE child.parent_id = s.id \
+                     AND child.dur > 0 \
+                 ), 0), \
+                 0 \
+               ) AS self_dur, \
                s.ts AS ts, \
                ROW_NUMBER() OVER ( \
                  PARTITION BY d.root_id, d.depth, s.name \
@@ -146,7 +160,8 @@ pub fn slice_descendants_breakdown_sql(
                depth, \
                name, \
                COUNT(*) AS slice_count, \
-               SUM(dur) / 1e6 AS total_ms, \
+               SUM(dur) / 1e6 AS inclusive_total_ms, \
+               SUM(self_dur) / 1e6 AS self_ms, \
                MAX(dur) / 1e6 AS max_ms, \
                MIN(ts) AS first_ts_ns, \
                MAX(CASE WHEN rn = 1 THEN slice_id END) AS example_slice_id \
@@ -158,12 +173,13 @@ pub fn slice_descendants_breakdown_sql(
            grouped.depth, \
            grouped.name, \
            grouped.slice_count, \
-           ROUND(grouped.total_ms, 3) AS total_ms, \
+           ROUND(grouped.inclusive_total_ms, 3) AS inclusive_total_ms, \
+           ROUND(grouped.self_ms, 3) AS self_ms, \
            ROUND(grouped.max_ms, 3) AS max_ms, \
            grouped.first_ts_ns, \
            grouped.example_slice_id{args_column} \
          FROM grouped \
-         ORDER BY grouped.total_ms DESC, grouped.max_ms DESC, \
+         ORDER BY grouped.inclusive_total_ms DESC, grouped.max_ms DESC, \
                   grouped.slice_count DESC, grouped.root_id, grouped.depth, grouped.name \
          LIMIT {row_limit}"
     ))

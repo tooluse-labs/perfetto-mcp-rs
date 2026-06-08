@@ -44,6 +44,34 @@ pub fn chrome_main_thread_hotspots_sql(
     let min_dur_ns = duration_ms_to_ns("min_dur_ms", min_dur_ms, 16_000_000)?;
     let row_limit = chrome_tool_row_limit(limit)?;
     let effective_phase = page_window.phase;
+    let start_bound = match (effective_phase.is_some(), page_window.start_ts_ns) {
+        (true, Some(ts)) => Some(format!("MAX(hw.start_ts, {ts})")),
+        (true, None) => Some("hw.start_ts".to_owned()),
+        (false, Some(ts)) => Some(ts.to_string()),
+        (false, None) => None,
+    };
+    let end_bound = match (effective_phase.is_some(), page_window.end_ts_ns) {
+        (true, Some(ts)) => Some(format!("MIN(hw.end_ts, {ts})")),
+        (true, None) => Some("hw.end_ts".to_owned()),
+        (false, Some(ts)) => Some(ts.to_string()),
+        (false, None) => None,
+    };
+    let overlap_start_expr = match &start_bound {
+        Some(bound) => format!("MAX(ct.ts, {bound})"),
+        None => "ct.ts".to_owned(),
+    };
+    let overlap_end_expr = match &end_bound {
+        Some(bound) => format!("MIN(ct.ts + ct.dur, {bound})"),
+        None => "ct.ts + ct.dur".to_owned(),
+    };
+    let overlap_dur_expr = match (&start_bound, &end_bound) {
+        (None, None) => "ct.dur".to_owned(),
+        _ => format!("({overlap_end_expr} - {overlap_start_expr})"),
+    };
+    let order_expr = match (&start_bound, &end_bound) {
+        (None, None) => "ct.dur DESC".to_owned(),
+        _ => format!("{overlap_dur_expr} DESC, ct.dur DESC"),
+    };
     let mut sql = String::from("INCLUDE PERFETTO MODULE chrome.tasks; ");
     append_chrome_page_load_window_cte(
         &mut sql,
@@ -51,7 +79,7 @@ pub fn chrome_main_thread_hotspots_sql(
         page_window_filters,
         page_window,
     );
-    sql.push_str(
+    sql.push_str(&format!(
         "SELECT \
            ct.id, \
            ct.ts, \
@@ -62,34 +90,39 @@ pub fn chrome_main_thread_hotspots_sql(
            ct.upid, \
            p.pid, \
            ct.dur / 1e6 AS dur_ms, \
+           ROUND({overlap_dur_expr} / 1e6, 3) AS overlap_dur_ms, \
            CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
                 THEN ROUND(ct.thread_dur * 100.0 / ct.dur, 1) \
            END AS cpu_pct, \
-           ct.thread_dur / 1e6 AS thread_dur_ms \
+           ct.thread_dur / 1e6 AS thread_dur_ms, \
+           CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
+                THEN ROUND(ct.thread_dur * {overlap_dur_expr} * 1.0 / ct.dur / 1e6, 3) \
+           END AS overlap_thread_dur_ms \
          FROM chrome_tasks ct \
          LEFT JOIN thread t ON ct.utid = t.utid \
          LEFT JOIN process p ON ct.upid = p.upid ",
-    );
+    ));
     if effective_phase.is_some() {
         sql.push_str("CROSS JOIN hotspot_window hw ");
     }
     sql.push_str(&format!(
         "WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main') \
-           AND ct.dur > {min_dur_ns}"
+           AND {overlap_dur_expr} > {min_dur_ns}"
     ));
     if effective_phase.is_some() {
         sql.push_str(
             " AND hw.start_ts IS NOT NULL \
-              AND hw.end_ts IS NOT NULL \
-              AND ct.ts >= hw.start_ts \
-              AND ct.ts < hw.end_ts",
+              AND hw.end_ts IS NOT NULL",
         );
     }
-    if let Some(start) = page_window.start_ts_ns {
-        sql.push_str(&format!(" AND ct.ts >= {start}"));
+    if let Some(bound) = &start_bound {
+        sql.push_str(&format!(" AND ct.ts + ct.dur > {bound}"));
     }
-    if let Some(end) = page_window.end_ts_ns {
-        sql.push_str(&format!(" AND ct.ts < {end}"));
+    if let Some(bound) = &end_bound {
+        sql.push_str(&format!(" AND ct.ts < {bound}"));
+    }
+    if let (Some(start), Some(end)) = (&start_bound, &end_bound) {
+        sql.push_str(&format!(" AND {end} > {start}"));
     }
     if let Some(name) = process_name {
         let lit = sql_string_literal(name)?;
@@ -101,6 +134,6 @@ pub fn chrome_main_thread_hotspots_sql(
     if let Some(upid) = upid {
         sql.push_str(&format!(" AND p.upid = {upid}"));
     }
-    sql.push_str(&format!(" ORDER BY ct.dur DESC LIMIT {row_limit}"));
+    sql.push_str(&format!(" ORDER BY {order_expr} LIMIT {row_limit}"));
     Ok(sql)
 }

@@ -26,6 +26,25 @@ pub(super) fn format_execute_sql_error(err: PerfettoError) -> String {
              (`slice`, `thread`, `process`, ...) have fixed schemas — avoid \
              inferring column names by analogy."
         ),
+        PerfettoError::QueryError {
+            kind: QueryErrorKind::MissingModule,
+            message,
+        } => format!(
+            "SQL error: {message}\n\nHint: the stdlib module name is not available \
+             in this trace_processor_shell. Check the module spelling with \
+             `list_stdlib_modules` or `resource://perfetto-mcp/stdlib-quickref`. \
+             If PERFETTO_TP_PATH is set, it may point at a binary with a different \
+             stdlib set."
+        ),
+        PerfettoError::QueryError {
+            kind: QueryErrorKind::MultipleOutputStatements,
+            message,
+        } => format!(
+            "SQL error: {message}\n\nHint: `execute_sql` accepts multiple SQL \
+             statements only when at most one statement produces rows. Keep \
+             `INCLUDE PERFETTO MODULE ...; SELECT ...` in one call, but do not \
+             send two SELECT/result-returning statements together."
+        ),
         PerfettoError::QueryError { message, .. } => format!("SQL error: {message}"),
         PerfettoError::TooManyRows => format!(
             "Query returned more than {MAX_ROWS} rows. Results should be aggregates \

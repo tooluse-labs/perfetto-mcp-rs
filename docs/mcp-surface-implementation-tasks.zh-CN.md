@@ -120,7 +120,7 @@
   - `include_args`: 是否返回匹配子树中的 args 摘要，默认 false。
   - `limit`: 返回行数上限。
 - **输出（已落地）：**
-  - 按 `root_id`、`depth`、`slice.name` 聚合的 `count`、`total_ms`、`max_ms`。
+  - 按 `root_id`、`depth`、`slice.name` 聚合的 `count`、`inclusive_total_ms`、`self_ms`、`max_ms`。
   - 可选 args 摘要使用字符串截断 / 脱敏策略，返回代表性 slice 的
     `example_args`。
   - 响应回显 `summary_scope` 和 `applied_filters`，避免 LLM 把 bounded

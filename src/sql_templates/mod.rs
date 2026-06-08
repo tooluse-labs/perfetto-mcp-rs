@@ -78,6 +78,10 @@ pub const CHROME_SCROLL_JANK_SUMMARY_SQL: &str =
      ORDER BY delay_since_last_frame DESC \
      LIMIT 100";
 
+pub const CHROME_SCROLL_JANK_SUMMARY_COUNT_SQL: &str =
+    "INCLUDE PERFETTO MODULE chrome.scroll_jank.scroll_jank_v3; \
+     SELECT COUNT(*) AS row_count FROM chrome_janky_frames";
+
 /// SQL for chrome_page_load_summary. Exported for integration tests.
 pub const CHROME_PAGE_LOAD_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.page_loads; \
      SELECT \
@@ -100,6 +104,9 @@ pub const CHROME_PAGE_LOAD_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.p
      ORDER BY navigation_start_ts DESC \
      LIMIT 100";
 
+pub const CHROME_PAGE_LOAD_SUMMARY_COUNT_SQL: &str = "INCLUDE PERFETTO MODULE chrome.page_loads; \
+     SELECT COUNT(*) AS row_count FROM chrome_page_loads";
+
 /// SQL for chrome_web_content_interactions. Exported for integration tests.
 pub const CHROME_WEB_CONTENT_INTERACTIONS_SQL: &str =
     "INCLUDE PERFETTO MODULE chrome.web_content_interactions; \
@@ -112,6 +119,10 @@ pub const CHROME_WEB_CONTENT_INTERACTIONS_SQL: &str =
      FROM chrome_web_content_interactions \
      ORDER BY dur DESC \
      LIMIT 100";
+
+pub const CHROME_WEB_CONTENT_INTERACTIONS_COUNT_SQL: &str =
+    "INCLUDE PERFETTO MODULE chrome.web_content_interactions; \
+     SELECT COUNT(*) AS row_count FROM chrome_web_content_interactions";
 
 /// SQL for chrome_startup_summary. Exported for integration tests.
 pub const CHROME_STARTUP_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.startups; \
@@ -126,6 +137,25 @@ pub const CHROME_STARTUP_SUMMARY_SQL: &str = "INCLUDE PERFETTO MODULE chrome.sta
      FROM chrome_startups \
      ORDER BY startup_begin_ts DESC \
      LIMIT 100";
+
+pub const CHROME_STARTUP_SUMMARY_COUNT_SQL: &str = "INCLUDE PERFETTO MODULE chrome.startups; \
+     SELECT COUNT(*) AS row_count FROM chrome_startups";
+
+pub fn chrome_scroll_jank_summary_sql(row_limit: usize) -> String {
+    CHROME_SCROLL_JANK_SUMMARY_SQL.replace("LIMIT 100", &format!("LIMIT {row_limit}"))
+}
+
+pub fn chrome_page_load_summary_sql(row_limit: usize) -> String {
+    CHROME_PAGE_LOAD_SUMMARY_SQL.replace("LIMIT 100", &format!("LIMIT {row_limit}"))
+}
+
+pub fn chrome_web_content_interactions_sql(row_limit: usize) -> String {
+    CHROME_WEB_CONTENT_INTERACTIONS_SQL.replace("LIMIT 100", &format!("LIMIT {row_limit}"))
+}
+
+pub fn chrome_startup_summary_sql(row_limit: usize) -> String {
+    CHROME_STARTUP_SUMMARY_SQL.replace("LIMIT 100", &format!("LIMIT {row_limit}"))
+}
 
 /// Preflight SQL for chrome_* tools — checks for the `chrome.process_type`
 /// track-descriptor arg that Chromium emits for every Chrome-family

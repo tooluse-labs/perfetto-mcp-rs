@@ -15,22 +15,28 @@ pub enum QueryErrorKind {
     MissingTable,
     MissingModule,
     MissingColumn,
+    MultipleOutputStatements,
     Other,
 }
 
 impl QueryErrorKind {
     /// Bucket a raw `trace_processor_shell` error message into a
-    /// `QueryErrorKind`. The classifier preserves upstream casing — SQLite
-    /// emits `"no such table: ..."` (lowercase, with colon) while Perfetto's
-    /// stdlib loader emits `"Module not found: ..."` (capital M). Don't
-    /// `to_lowercase()` the message; the casing is the discriminant.
+    /// `QueryErrorKind`. SQLite emits `"no such table: ..."` and
+    /// `"no such column: ..."` in lower case. Perfetto stdlib module wording
+    /// has drifted across versions, so keep both the older and v54.0 forms.
     pub(crate) fn classify(message: &str) -> Self {
         if message.contains("no such table:") {
             QueryErrorKind::MissingTable
-        } else if message.contains("Module not found:") {
+        } else if message.contains("Module not found:")
+            || message.contains("INCLUDE: unknown module")
+        {
             QueryErrorKind::MissingModule
         } else if message.contains("no such column:") {
             QueryErrorKind::MissingColumn
+        } else if message.contains("Result rows were returned for multiples queries")
+            || message.contains("multiple output statements")
+        {
+            QueryErrorKind::MultipleOutputStatements
         } else {
             QueryErrorKind::Other
         }
@@ -82,10 +88,26 @@ mod tests {
     }
 
     #[test]
+    fn classify_recognizes_v54_missing_module() {
+        assert_eq!(
+            QueryErrorKind::classify("INCLUDE: unknown module 'chrome.page_load'"),
+            QueryErrorKind::MissingModule,
+        );
+    }
+
+    #[test]
     fn classify_recognizes_missing_column() {
         assert_eq!(
             QueryErrorKind::classify("no such column: navigation_id"),
             QueryErrorKind::MissingColumn,
+        );
+    }
+
+    #[test]
+    fn classify_recognizes_multiple_output_statements() {
+        assert_eq!(
+            QueryErrorKind::classify("multiple output statements are not supported"),
+            QueryErrorKind::MultipleOutputStatements,
         );
     }
 

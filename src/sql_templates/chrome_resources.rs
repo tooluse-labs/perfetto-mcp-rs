@@ -678,6 +678,9 @@ pub fn chrome_page_load_resource_pipeline_sql(
               SUM(CASE WHEN d.depth > 0 AND ( \
                 child.name GLOB '*Style*' OR \
                 child.name = 'Blink.Style.UpdateTime' \
+              ) AND NOT ( \
+                child.name GLOB '*ForcedStyle*' OR \
+                child.name = 'Blink.ForcedStyleAndLayout.UpdateTime' \
               ) THEN CASE WHEN child.ts + child.dur > ss.overlap_start_ts \
                             AND child.ts < ss.overlap_end_ts \
                           THEN MIN(child.ts + child.dur, ss.overlap_end_ts) \
@@ -688,6 +691,12 @@ pub fn chrome_page_load_resource_pipeline_sql(
                 child.name GLOB '*Layout*' OR \
                 child.name = 'Blink.Layout.UpdateTime' OR \
                 child.name = 'Layout' \
+              ) AND NOT ( \
+                child.name GLOB '*ForcedStyle*' OR \
+                child.name = 'Blink.ForcedStyleAndLayout.UpdateTime' \
+              ) AND NOT ( \
+                child.name GLOB '*Style*' OR \
+                child.name = 'Blink.Style.UpdateTime' \
               ) THEN CASE WHEN child.ts + child.dur > ss.overlap_start_ts \
                             AND child.ts < ss.overlap_end_ts \
                           THEN MIN(child.ts + child.dur, ss.overlap_end_ts) \

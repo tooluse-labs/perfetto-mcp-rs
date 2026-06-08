@@ -20,7 +20,9 @@ use tokio::sync::Mutex;
 use crate::params::*;
 use crate::sql_templates::*;
 use crate::stdlib_catalog::{STDLIB_QUICKREF, STDLIB_QUICKREF_MIME_TYPE, STDLIB_QUICKREF_URI};
-use crate::tp_manager::TraceProcessorManager;
+use crate::tp_manager::{
+    trace_file_platform_fingerprint, trace_file_sample_sha256, TraceProcessorManager,
+};
 
 #[cfg(test)]
 use crate::error::{PerfettoError, QueryErrorKind, MAX_ROWS};
@@ -65,6 +67,8 @@ struct SchemaCacheTraceKey {
     canonical_path: PathBuf,
     size_bytes: u64,
     modified: Option<SystemTime>,
+    platform: Option<String>,
+    sample_sha256: String,
 }
 
 #[derive(Debug, Default)]
@@ -175,6 +179,12 @@ impl ServerHandler for PerfettoMcpServer {
     }
 }
 
+fn decoded_row_count(table: &crate::query::DecodedTable, tool_name: &str) -> Result<usize, String> {
+    decoded_table_i64_cell(table, "row_count")
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| format!("{tool_name} count query did not return a valid row_count"))
+}
+
 #[tool_router(router = tool_router)]
 impl PerfettoMcpServer {
     #[tool(
@@ -195,7 +205,7 @@ impl PerfettoMcpServer {
                        trace_processor accepts — content-sniffed, not by extension). \
                        Calling again with a new path replaces the active \
                        trace; cached `trace_processor_shell` instances make repeat loads \
-                       near-zero-cost unless the same path's file size or modified time \
+                       near-zero-cost unless the same path's metadata/content fingerprint \
                        changed since it was loaded.\n\
                        \n\
                        Errors when: the file doesn't exist, isn't a valid Perfetto \
@@ -568,6 +578,9 @@ impl PerfettoMcpServer {
                        prefer when multiple processes share a name like 'Renderer') or \
                        `process_name` (exact match). `upid` wins when both are set.\n\
                        \n\
+                       Output includes exact `row_count`, `returned_rows`, and \
+                       `truncated`; truncated rows are first 2000 by pid/tid.\n\
+                       \n\
                        Empty result: returned as an error pointing at `list_processes` \
                        for available candidates.\n\
                        \n\
@@ -603,14 +616,11 @@ impl PerfettoMcpServer {
         // LIMIT keeps us clear of the 5000-row hard cap on Chrome renderer-fork
         // and Android system_server traces where a single process name can
         // fan out to thousands of threads.
-        let (sql, selector_for_error) = match (params.upid, &params.process_name) {
+        let (from_where, selector_for_error) = match (params.upid, &params.process_name) {
             (Some(upid), _) => (
                 format!(
-                    "SELECT t.tid, t.name AS thread_name, p.pid, p.upid \
-                     FROM thread t JOIN process p ON t.upid = p.upid \
-                     WHERE p.upid = {upid} \
-                     ORDER BY p.pid, t.tid \
-                     LIMIT 2000"
+                    "FROM thread t JOIN process p ON t.upid = p.upid \
+                     WHERE p.upid = {upid}"
                 ),
                 format!("upid {upid}"),
             ),
@@ -618,11 +628,8 @@ impl PerfettoMcpServer {
                 let name_lit = sql_string_literal(name).map_err(|e| e.to_string())?;
                 (
                     format!(
-                        "SELECT t.tid, t.name AS thread_name, p.pid, p.upid \
-                         FROM thread t JOIN process p ON t.upid = p.upid \
-                         WHERE p.name = {name_lit} \
-                         ORDER BY p.pid, t.tid \
-                         LIMIT 2000"
+                        "FROM thread t JOIN process p ON t.upid = p.upid \
+                         WHERE p.name = {name_lit}"
                     ),
                     format!("process name {name:?}"),
                 )
@@ -632,17 +639,31 @@ impl PerfettoMcpServer {
             }
         };
         let client = self.client_for_current().await?;
-        let table = client
-            .query(&sql)
+        let count_sql = format!("SELECT COUNT(*) AS row_count {from_where}");
+        let count_table = client
+            .query(&count_sql)
             .await
-            .map_err(|e| format!("Failed to list threads: {e}"))?;
-        if table.is_empty() {
+            .map_err(|e| format!("Failed to count threads: {e}"))?;
+        let row_count = decoded_table_i64_cell(&count_table, "row_count")
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0);
+        if row_count == 0 {
             return Err(format!(
                 "No threads found for {selector_for_error}. Call list_processes \
                  to see available processes."
             ));
         }
-        serde_json::to_string(&table).map_err(|e| format!("Failed to serialize results: {e}"))
+        let sql = format!(
+            "SELECT t.tid, t.name AS thread_name, p.pid, p.upid \
+             {from_where} \
+             ORDER BY p.pid, t.tid \
+             LIMIT {LIST_THREADS_LIMIT}"
+        );
+        let table = client
+            .query(&sql)
+            .await
+            .map_err(|e| format!("Failed to list threads: {e}"))?;
+        format_list_threads_response(table, row_count)
     }
 
     #[tool(
@@ -650,24 +671,22 @@ impl PerfettoMcpServer {
         description = "Summarize the worst scroll jank frames in a Chrome trace: \
                        cause_of_jank, sub_cause_of_jank, delay_since_last_frame, \
                        event_latency_id, scroll_id, vsync_interval. One row per janky \
-                       frame, sorted by delay_since_last_frame DESC, limit 100. \
+                       frame, sorted by delay_since_last_frame DESC. \
                        Read-only.\n\
                        \n\
                        Use when: investigating jank reports, finding scroll regressions, \
                        ranking jank causes. Prefer over hand-rolling SQL on \
                        `chrome.scroll_jank.scroll_jank_v3` — same data, less code.\n\
                        \n\
-                       Don't use for: non-Chrome traces (will error). For per-frame \
-                       causes outside the top 100, drop to `execute_sql` against the \
-                       same view.\n\
+                       Don't use for: non-Chrome traces (will error). For custom \
+                       filters, use `execute_sql` against the same view.\n\
                        \n\
-                       Parameters: optional `max_string_len` caps returned string \
-                       cells. Unset preserves full strings for precision. Operates \
-                       on the loaded trace.\n\
+                       Parameters: optional `limit` (default 100, capped at 5000) and \
+                       `max_string_len`. Operates on the loaded trace.\n\
                        \n\
-                       Output: metadata-first JSON preserving `columns` / \
-                       `rows`; `truncated=true` means the row cap was reached; \
-                       `string_truncated=true` means cell text was shortened.\n\
+                       Output: metadata-first JSON; `row_count` exact; \
+                       `truncated=true` means more rows exist; \
+                       `string_truncated=true` means shortened text.\n\
                        \n\
                        Empty result: no janky frames detected (clean trace) or no \
                        scrolls occurred during capture.",
@@ -689,17 +708,24 @@ impl PerfettoMcpServer {
         Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
         self.record_tool_span(format!(
-            "max_string_len_set={}",
+            "limit_set={},max_string_len_set={}",
+            params.limit.is_some(),
             params.max_string_len.is_some()
         ))
         .await;
+        let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome scroll jank summary").await?;
         let table = client
-            .query(CHROME_SCROLL_JANK_SUMMARY_SQL)
+            .query(&chrome_scroll_jank_summary_sql(effective_limit))
             .await
             .map_err(|e| format_chrome_tool_error("Chrome scroll jank summary", e))?;
-        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
+        let count_table = client
+            .query(CHROME_SCROLL_JANK_SUMMARY_COUNT_SQL)
+            .await
+            .map_err(|e| format_chrome_tool_error("Chrome scroll jank summary count", e))?;
+        let row_count = decoded_row_count(&count_table, "Chrome scroll jank summary")?;
+        format_chrome_tool_response_with_known_row_count(table, row_count, params.max_string_len)
     }
 
     #[tool(
@@ -716,13 +742,12 @@ impl PerfettoMcpServer {
                        timings inside one navigation, drop to `execute_sql` against the \
                        `chrome.page_loads` module.\n\
                        \n\
-                       Parameters: optional `max_string_len` caps returned string \
-                       cells. Unset preserves full strings for precision. Operates \
-                       on the loaded trace.\n\
+                       Parameters: optional `limit` (default 100, capped at 5000) and \
+                       `max_string_len`. Operates on the loaded trace.\n\
                        \n\
-                       Output: metadata-first JSON preserving `columns` / \
-                       `rows`; `truncated=true` means the row cap was reached; \
-                       `string_truncated=true` means cell text was shortened.\n\
+                       Output: metadata-first JSON; `row_count` exact; \
+                       `truncated=true` means more rows exist; \
+                       `string_truncated=true` means shortened text.\n\
                        \n\
                        Empty result: no navigations occurred during capture (e.g. trace \
                        started after the page was already loaded).",
@@ -744,17 +769,24 @@ impl PerfettoMcpServer {
         Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
         self.record_tool_span(format!(
-            "max_string_len_set={}",
+            "limit_set={},max_string_len_set={}",
+            params.limit.is_some(),
             params.max_string_len.is_some()
         ))
         .await;
+        let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page load summary").await?;
         let table = client
-            .query(CHROME_PAGE_LOAD_SUMMARY_SQL)
+            .query(&chrome_page_load_summary_sql(effective_limit))
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page load summary", e))?;
-        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
+        let count_table = client
+            .query(CHROME_PAGE_LOAD_SUMMARY_COUNT_SQL)
+            .await
+            .map_err(|e| format_chrome_tool_error("Chrome page load summary count", e))?;
+        let row_count = decoded_row_count(&count_table, "Chrome page load summary")?;
+        format_chrome_tool_response_with_known_row_count(table, row_count, params.max_string_len)
     }
 
     #[tool(
@@ -1039,7 +1071,8 @@ impl PerfettoMcpServer {
         name = "chrome_main_thread_hotspots",
         description = "Top Chrome main-thread tasks by wall duration: id, ts, \
                        name, task_type, thread_name, process_name, upid, pid, \
-                       dur_ms, cpu_pct (thread_dur/dur), thread_dur_ms. Uses `chrome.tasks`, \
+                       dur_ms, overlap_dur_ms, cpu_pct, thread_dur_ms, \
+                       overlap_thread_dur_ms. Uses `chrome.tasks`, \
                        `thread.is_main_thread = 1` when available, and Chrome's \
                        `Cr*Main` thread-name convention as a fallback for traces \
                        where thread metadata is incomplete or incorrect. Pass a returned \
@@ -1066,7 +1099,8 @@ impl PerfettoMcpServer {
                          the latest page load.\n\
                        - `start_ts_ns` / `end_ts_ns`: raw trace timestamp bounds \
                          in nanoseconds (`end_ts_ns` exclusive); aliases `start_ts` \
-                         / `end_ts` are accepted. These AND with any page-load window.\n\
+                         / `end_ts` are accepted; intersect page-load windows. \
+                         `overlap_dur_ms` is clipped to that window.\n\
                        - `min_dur_ms`: minimum task duration. Defaults to 16 (one \
                          60 Hz frame). Pass 0 for ALL tasks; raise to 33 (30 Hz) or \
                          100 to focus on bigger stutters.\n\
@@ -1141,19 +1175,19 @@ impl PerfettoMcpServer {
     #[tool(
         name = "slice_descendants_breakdown",
         description = "Recursive child-slice expansion under known `slice.id` roots, \
-                       aggregated as a bounded breakdown (slice_count / total_ms / \
-                       max_ms per (depth, name) group). Use to drill into a long task \
-                       — after `chrome_main_thread_hotspots` or `execute_sql` returns \
-                       a slice id — without hand-writing `WITH RECURSIVE` CTEs over \
-                       `slice.parent_id`. Required: `slice_ids`. Optional bounds: \
-                       `min_dur_ms`, `max_depth`, `limit`, `include_args`, \
-                       `max_string_len`. The response echoes `summary_scope`, \
-                       `applied_filters`, and `missing_root_ids` (root slice ids \
-                       not present in the loaded trace — usually stale ids). \
-                       Returned columns: `root_id`, `depth`, `name`, `slice_count`, \
-                       `total_ms`, `max_ms`, `first_ts_ns` (raw nanoseconds, not ms), \
-                       `example_slice_id` (longest-duration descendant per group), \
-                       and optionally `example_args`.",
+                       aggregated as a bounded breakdown per (depth, name) group. \
+                       Use to drill into a long task — after `chrome_main_thread_hotspots` \
+                       or `execute_sql` returns a slice id — without hand-writing \
+                       `WITH RECURSIVE` CTEs over `slice.parent_id`. Required: \
+                       `slice_ids`. Optional bounds: `min_dur_ms`, `max_depth`, \
+                       `limit`, `include_args`, `max_string_len`. The response echoes \
+                       `summary_scope`, `applied_filters`, and `missing_root_ids` \
+                       (missing root slice ids). Returned columns: `root_id`, `depth`, `name`, \
+                       `slice_count`, `inclusive_total_ms` (do not sum across depths), \
+                       `self_ms` (direct-child time subtracted, clamped at zero), \
+                       `max_ms`, `first_ts_ns` (raw \
+                       nanoseconds, not ms), `example_slice_id` (longest-duration \
+                       descendant per group), and optionally `example_args`.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1243,13 +1277,12 @@ impl PerfettoMcpServer {
                        work during steady state is covered by \
                        `chrome_main_thread_hotspots`.\n\
                        \n\
-                       Parameters: optional `max_string_len` caps returned string \
-                       cells. Unset preserves full strings for precision. Operates \
-                       on the loaded trace.\n\
+                       Parameters: optional `limit` (default 100, capped at 5000) and \
+                       `max_string_len`. Operates on the loaded trace.\n\
                        \n\
-                       Output: metadata-first JSON preserving `columns` / \
-                       `rows`; `truncated=true` means the row cap was reached; \
-                       `string_truncated=true` means cell text was shortened.\n\
+                       Output: metadata-first JSON; `row_count` exact; \
+                       `truncated=true` means more rows exist; \
+                       `string_truncated=true` means shortened text.\n\
                        \n\
                        Empty result: trace started after the browser was already \
                        running (most cases — startup is captured only when tracing \
@@ -1272,39 +1305,45 @@ impl PerfettoMcpServer {
         Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
         self.record_tool_span(format!(
-            "max_string_len_set={}",
+            "limit_set={},max_string_len_set={}",
+            params.limit.is_some(),
             params.max_string_len.is_some()
         ))
         .await;
+        let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome startup summary").await?;
         let table = client
-            .query(CHROME_STARTUP_SUMMARY_SQL)
+            .query(&chrome_startup_summary_sql(effective_limit))
             .await
             .map_err(|e| format_chrome_tool_error("Chrome startup summary", e))?;
-        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
+        let count_table = client
+            .query(CHROME_STARTUP_SUMMARY_COUNT_SQL)
+            .await
+            .map_err(|e| format_chrome_tool_error("Chrome startup summary count", e))?;
+        let row_count = decoded_row_count(&count_table, "Chrome startup summary")?;
+        format_chrome_tool_response_with_known_row_count(table, row_count, params.max_string_len)
     }
 
     #[tool(
         name = "chrome_web_content_interactions",
         description = "Rank web content interactions in a Chrome trace by duration: id, \
                        ts, dur_ms, interaction_type, renderer_upid. Sorted by dur_ms \
-                       DESC, limit 100. Read-only.\n\
+                       DESC. Read-only.\n\
                        \n\
                        Use when: INP (Interaction to Next Paint) analysis, reproducing \
                        user-felt latency, finding slow click/tap/keyboard handlers.\n\
                        \n\
                        Don't use for: non-Chrome traces (will error). For interactions \
-                       outside the top 100 or filtered by `interaction_type`, drop to \
+                       filtered by `interaction_type`, drop to \
                        `execute_sql` against `chrome.web_content_interactions`.\n\
                        \n\
-                       Parameters: optional `max_string_len` caps returned string \
-                       cells. Unset preserves full strings for precision. Operates \
-                       on the loaded trace.\n\
+                       Parameters: optional `limit` (default 100, capped at 5000) and \
+                       `max_string_len`. Operates on the loaded trace.\n\
                        \n\
-                       Output: metadata-first JSON preserving `columns` / \
-                       `rows`; `truncated=true` means the row cap was reached; \
-                       `string_truncated=true` means cell text was shortened.\n\
+                       Output: metadata-first JSON; `row_count` exact; \
+                       `truncated=true` means more rows exist; \
+                       `string_truncated=true` means shortened text.\n\
                        \n\
                        Empty result: no interactions captured (trace started before \
                        user input or interaction tracking was disabled in tracing \
@@ -1327,17 +1366,24 @@ impl PerfettoMcpServer {
         Parameters(params): Parameters<ChromeTraceParams>,
     ) -> Result<String, String> {
         self.record_tool_span(format!(
-            "max_string_len_set={}",
+            "limit_set={},max_string_len_set={}",
+            params.limit.is_some(),
             params.max_string_len.is_some()
         ))
         .await;
+        let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome web content interactions").await?;
         let table = client
-            .query(CHROME_WEB_CONTENT_INTERACTIONS_SQL)
+            .query(&chrome_web_content_interactions_sql(effective_limit))
             .await
             .map_err(|e| format_chrome_tool_error("Chrome web content interactions", e))?;
-        format_chrome_tool_response(table, DEFAULT_CHROME_TOOL_ROWS, params.max_string_len)
+        let count_table = client
+            .query(CHROME_WEB_CONTENT_INTERACTIONS_COUNT_SQL)
+            .await
+            .map_err(|e| format_chrome_tool_error("Chrome web content interactions count", e))?;
+        let row_count = decoded_row_count(&count_table, "Chrome web content interactions")?;
+        format_chrome_tool_response_with_known_row_count(table, row_count, params.max_string_len)
     }
 
     #[tool(
@@ -1439,10 +1485,18 @@ fn trace_schema_cache_key(trace_path: &str) -> Result<SchemaCacheTraceKey, Strin
         .map_err(|e| format!("Failed to stat current trace {trace_path:?}: {e}"))?;
     let metadata = std::fs::metadata(&canonical_path)
         .map_err(|e| format!("Failed to stat current trace {:?}: {e}", canonical_path))?;
+    let sample_sha256 = trace_file_sample_sha256(&canonical_path, metadata.len()).map_err(|e| {
+        format!(
+            "Failed to fingerprint current trace {:?}: {e}",
+            canonical_path
+        )
+    })?;
     Ok(SchemaCacheTraceKey {
         canonical_path,
         size_bytes: metadata.len(),
         modified: metadata.modified().ok(),
+        platform: trace_file_platform_fingerprint(&metadata),
+        sample_sha256,
     })
 }
 

@@ -167,19 +167,36 @@ pub fn chrome_page_load_script_hotspots_sql(
                               - MAX(d.ts, root.overlap_start_ts) \
                          ELSE 0 END \
                ELSE 0 END) AS forced_style_layout_ns, \
-             SUM(CASE WHEN \
+             SUM(CASE WHEN ( \
                d.name GLOB '*Recalculate*Style*' OR \
                d.name GLOB '*UpdateStyle*' OR \
                d.name GLOB '*StyleRecalc*' \
+             ) \
+               AND NOT ( \
+                 d.name GLOB '*Forced*Layout*' OR \
+                 d.name GLOB '*Forced*Style*' OR \
+                 d.name GLOB '*UpdateStyleAndLayout*' \
+               ) \
                THEN CASE WHEN d.ts + d.dur > root.overlap_start_ts \
                            AND d.ts < root.overlap_end_ts \
                          THEN MIN(d.ts + d.dur, root.overlap_end_ts) \
                               - MAX(d.ts, root.overlap_start_ts) \
                          ELSE 0 END \
                ELSE 0 END) AS style_recalc_ns, \
-             SUM(CASE WHEN \
+             SUM(CASE WHEN ( \
                d.name GLOB '*Layout*' OR \
                d.name GLOB '*UpdateLayout*' \
+             ) \
+               AND NOT ( \
+                 d.name GLOB '*Forced*Layout*' OR \
+                 d.name GLOB '*Forced*Style*' OR \
+                 d.name GLOB '*UpdateStyleAndLayout*' \
+               ) \
+               AND NOT ( \
+                 d.name GLOB '*Recalculate*Style*' OR \
+                 d.name GLOB '*UpdateStyle*' OR \
+                 d.name GLOB '*StyleRecalc*' \
+               ) \
                THEN CASE WHEN d.ts + d.dur > root.overlap_start_ts \
                            AND d.ts < root.overlap_end_ts \
                          THEN MIN(d.ts + d.dur, root.overlap_end_ts) \

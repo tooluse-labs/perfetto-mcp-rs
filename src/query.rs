@@ -93,6 +93,20 @@ pub fn decode_query_result_with_options(
         }
     }
 
+    if result.statement_with_output_count.unwrap_or(0) > 1 {
+        let output_count = result.statement_with_output_count.unwrap_or(0);
+        let statement_count = result.statement_count.unwrap_or(0);
+        return Err(PerfettoError::QueryError {
+            kind: QueryErrorKind::MultipleOutputStatements,
+            message: format!(
+                "SQL returned rows from {output_count} output statements \
+                 (statement_count={statement_count}). execute_sql supports at \
+                 most one output-producing statement per call; keep INCLUDE and \
+                 setup statements, but make only one SELECT return rows."
+            ),
+        });
+    }
+
     let columns: Vec<String> = result.column_names.clone();
     let num_cols = columns.len();
     if num_cols == 0 {
@@ -150,7 +164,7 @@ pub fn decode_query_result_with_options(
                 }
                 Ok(CellType::CellBlob) => {
                     let b = blob_iter.next().map(Vec::as_slice).unwrap_or(&[]);
-                    Value::String(format!("<blob {} bytes>", b.len()))
+                    Value::String(format!("blob:hex:{}", hex::encode(b)))
                 }
                 Err(_) => Value::Null,
             };
@@ -300,6 +314,52 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_multiple_output_statements() {
+        let batch = CellsBatch {
+            cells: vec![CellType::CellVarint as i32],
+            varint_cells: vec![2],
+            float64_cells: vec![],
+            blob_cells: vec![],
+            string_cells: None,
+            is_last_batch: Some(true),
+        };
+        let mut result = make_result(vec!["b"], vec![batch]);
+        result.statement_count = Some(2);
+        result.statement_with_output_count = Some(2);
+        result.last_statement_sql = Some("SELECT 2 AS b".to_owned());
+
+        let err = decode_query_result(&result).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PerfettoError::QueryError {
+                    kind: QueryErrorKind::MultipleOutputStatements,
+                    ref message,
+                } if message.contains("at most one output-producing statement")
+            ),
+            "expected MultipleOutputStatements QueryError, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn decode_allows_include_plus_single_output_statement() {
+        let batch = CellsBatch {
+            cells: vec![CellType::CellVarint as i32],
+            varint_cells: vec![7],
+            float64_cells: vec![],
+            blob_cells: vec![],
+            string_cells: None,
+            is_last_batch: Some(true),
+        };
+        let mut result = make_result(vec!["n"], vec![batch]);
+        result.statement_count = Some(2);
+        result.statement_with_output_count = Some(1);
+
+        let table = decode_query_result(&result).unwrap();
+        assert_eq!(table.rows, vec![vec![Value::from(7)]]);
+    }
+
+    #[test]
     fn decode_exceeds_row_limit() {
         // Build a batch with MAX_ROWS + 1 rows, 1 column each.
         let row_count = MAX_ROWS + 1;
@@ -349,6 +409,28 @@ mod tests {
         assert_eq!(
             decoded.table.rows,
             vec![vec![Value::from(1), Value::from("a")]]
+        );
+    }
+
+    #[test]
+    fn decode_blob_cells_as_lossless_hex_with_type_prefix() {
+        let batch = CellsBatch {
+            cells: vec![CellType::CellBlob as i32, CellType::CellBlob as i32],
+            varint_cells: vec![],
+            float64_cells: vec![],
+            blob_cells: vec![vec![0x00, 0xab, 0xff], Vec::new()],
+            string_cells: None,
+            is_last_batch: Some(true),
+        };
+        let result = make_result(vec!["payload"], vec![batch]);
+        let table = decode_query_result(&result).unwrap();
+
+        assert_eq!(
+            table.rows,
+            vec![
+                vec![Value::from("blob:hex:00abff")],
+                vec![Value::from("blob:hex:")]
+            ]
         );
     }
 

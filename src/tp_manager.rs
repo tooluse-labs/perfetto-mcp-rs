@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use lru::LruCache;
+use sha2::{Digest, Sha256};
+use std::io::{Read, Seek, SeekFrom};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex, OnceCell};
@@ -20,6 +22,7 @@ const STDERR_TAIL_CAPACITY: usize = 100;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const STATUS_FALLBACK_DELAY: Duration = Duration::from_millis(500);
 const STATUS_FALLBACK_STABILITY: Duration = Duration::from_millis(300);
+const TRACE_FINGERPRINT_SAMPLE_BYTES: u64 = 64 * 1024;
 
 type SharedStderrTail = Arc<StdMutex<std::collections::VecDeque<String>>>;
 
@@ -70,6 +73,8 @@ struct TraceProcessorInstance {
 struct TraceFileFingerprint {
     size_bytes: u64,
     modified: Option<SystemTime>,
+    platform: Option<String>,
+    sample_sha256: String,
 }
 
 impl TraceFileFingerprint {
@@ -79,8 +84,69 @@ impl TraceFileFingerprint {
         Ok(Self {
             size_bytes: metadata.len(),
             modified: metadata.modified().ok(),
+            platform: trace_file_platform_fingerprint(&metadata),
+            sample_sha256: trace_file_sample_sha256(path, metadata.len())?,
         })
     }
+}
+
+pub(crate) fn trace_file_platform_fingerprint(metadata: &std::fs::Metadata) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!(
+            "unix:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+pub(crate) fn trace_file_sample_sha256(path: &Path, size_bytes: u64) -> Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open trace file for fingerprint: {}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+
+    if size_bytes <= TRACE_FINGERPRINT_SAMPLE_BYTES * 2 {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).with_context(|| {
+            format!(
+                "failed to read trace fingerprint sample: {}",
+                path.display()
+            )
+        })?;
+        hasher.update(&buf);
+    } else {
+        let mut first = vec![0_u8; TRACE_FINGERPRINT_SAMPLE_BYTES as usize];
+        file.read_exact(&mut first).with_context(|| {
+            format!("failed to read trace fingerprint head: {}", path.display())
+        })?;
+        hasher.update(&first);
+
+        let mut last = vec![0_u8; TRACE_FINGERPRINT_SAMPLE_BYTES as usize];
+        file.seek(SeekFrom::End(-(TRACE_FINGERPRINT_SAMPLE_BYTES as i64)))
+            .with_context(|| {
+                format!("failed to seek trace fingerprint tail: {}", path.display())
+            })?;
+        file.read_exact(&mut last).with_context(|| {
+            format!("failed to read trace fingerprint tail: {}", path.display())
+        })?;
+        hasher.update(&last);
+    }
+
+    Ok(hex::encode(hasher.finalize()))
 }
 
 struct CachedTraceProcessorInstance {
@@ -266,7 +332,7 @@ impl Drop for TraceProcessorInstance {
 
 /// Manages a pool of trace_processor_shell instances, one per trace file,
 /// with LRU eviction when the pool exceeds `max_instances`. Instances are
-/// keyed by canonical path and invalidated when that file's size/mtime
+/// keyed by canonical path and invalidated when that file's metadata/content
 /// fingerprint changes.
 pub struct TraceProcessorManager {
     inner: Mutex<ManagerInner>,
@@ -1640,6 +1706,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_or_spawn_instance_respawns_when_sample_hash_changes_with_same_size_mtime() {
+        let manager = Arc::new(TraceProcessorManager::new(2));
+        let canonical = PathBuf::from("/tmp/same-metadata-changed-content.perfetto-trace");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let old_fingerprint = test_fingerprint_with_sample(1, "old-sample");
+        let new_fingerprint = test_fingerprint_with_sample(1, "new-sample");
+        assert_eq!(old_fingerprint.size_bytes, new_fingerprint.size_bytes);
+        assert_eq!(old_fingerprint.modified, new_fingerprint.modified);
+        assert_ne!(old_fingerprint, new_fingerprint);
+
+        {
+            let counter = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    canonical.clone(),
+                    old_fingerprint,
+                    move |port, _| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("initial spawn");
+        }
+
+        {
+            let counter = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(canonical, new_fingerprint, move |port, _| async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(fake_instance(port))
+                })
+                .await
+                .expect("respawn changed sample hash");
+        }
+
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            2,
+            "same path with same size/mtime but changed content sample must respawn",
+        );
+    }
+
+    #[tokio::test]
     async fn same_canonical_path_respawns_after_real_file_metadata_changes() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let trace = tmp.path().join("same-name.perfetto-trace");
@@ -1730,6 +1840,24 @@ mod tests {
             spawn_count.load(Ordering::SeqCst),
             2,
             "same canonical path with changed real file metadata must respawn",
+        );
+    }
+
+    #[test]
+    fn trace_file_sample_hash_detects_same_size_content_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let trace = tmp.path().join("same-size.perfetto-trace");
+        std::fs::write(&trace, b"abcdef").expect("write first content");
+        let first =
+            trace_file_sample_sha256(&trace, 6).expect("hash first same-size trace content");
+
+        std::fs::write(&trace, b"abcdeg").expect("write second content");
+        let second =
+            trace_file_sample_sha256(&trace, 6).expect("hash second same-size trace content");
+
+        assert_ne!(
+            first, second,
+            "same-size content changes must alter the trace fingerprint sample",
         );
     }
 
@@ -1952,9 +2080,15 @@ mod tests {
     }
 
     fn test_fingerprint(version: u64) -> TraceFileFingerprint {
+        test_fingerprint_with_sample(version, &format!("sample-{version}"))
+    }
+
+    fn test_fingerprint_with_sample(version: u64, sample_sha256: &str) -> TraceFileFingerprint {
         TraceFileFingerprint {
             size_bytes: 42,
             modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(version)),
+            platform: Some(format!("test-platform-{version}")),
+            sample_sha256: sample_sha256.to_owned(),
         }
     }
 

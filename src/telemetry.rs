@@ -53,6 +53,7 @@ pub(crate) fn perfetto_error_span_kind(err: &PerfettoError) -> &'static str {
             QueryErrorKind::MissingTable => "query_missing_table",
             QueryErrorKind::MissingModule => "query_missing_module",
             QueryErrorKind::MissingColumn => "query_missing_column",
+            QueryErrorKind::MultipleOutputStatements => "query_multiple_output_statements",
             QueryErrorKind::Other => "query_other",
         },
         PerfettoError::TooManyRows => "too_many_rows",

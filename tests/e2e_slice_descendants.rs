@@ -66,7 +66,8 @@ fn e2e_slice_descendants_breakdown_against_fixture() {
             "depth",
             "name",
             "slice_count",
-            "total_ms",
+            "inclusive_total_ms",
+            "self_ms",
             "max_ms",
             "first_ts_ns",
             "example_slice_id",
@@ -80,7 +81,14 @@ fn e2e_slice_descendants_breakdown_against_fixture() {
             );
         }
         for i in 0..table.len() {
-            for col in ["root_id", "depth", "name", "slice_count", "total_ms"] {
+            for col in [
+                "root_id",
+                "depth",
+                "name",
+                "slice_count",
+                "inclusive_total_ms",
+                "self_ms",
+            ] {
                 let cell = table
                     .cell(i, col)
                     .unwrap_or_else(|| panic!("row {i} missing {col}"));

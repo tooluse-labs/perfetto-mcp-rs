@@ -2,6 +2,10 @@ use super::*;
 use serde_json::json;
 use std::path::PathBuf;
 
+fn compact_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[test]
 fn format_loaded_trace_display_shows_only_path_when_name_matches() {
     assert_eq!(
@@ -263,11 +267,15 @@ fn schema_cache_is_scoped_to_trace_fingerprint() {
         canonical_path: PathBuf::from("/tmp/a.perfetto-trace"),
         size_bytes: 1,
         modified: None,
+        platform: Some("same-platform".to_owned()),
+        sample_sha256: "old".to_owned(),
     };
     let key_b = SchemaCacheTraceKey {
         canonical_path: PathBuf::from("/tmp/a.perfetto-trace"),
-        size_bytes: 2,
+        size_bytes: 1,
         modified: None,
+        platform: Some("same-platform".to_owned()),
+        sample_sha256: "new".to_owned(),
     };
     let mut cache = SchemaCache::default();
 
@@ -402,6 +410,38 @@ fn execute_sql_hint_skips_unrelated_query_errors() {
 }
 
 #[test]
+fn execute_sql_hint_fires_on_missing_module() {
+    let formatted = format_execute_sql_error(PerfettoError::QueryError {
+        kind: QueryErrorKind::MissingModule,
+        message: "INCLUDE: unknown module 'chrome.page_load'".to_owned(),
+    });
+    assert!(
+        formatted.contains("list_stdlib_modules"),
+        "missing-module errors must point at stdlib discovery, got: {formatted}",
+    );
+    assert!(
+        formatted.contains("PERFETTO_TP_PATH"),
+        "missing-module hint must mention binary-version drift, got: {formatted}",
+    );
+}
+
+#[test]
+fn execute_sql_hint_fires_on_multiple_output_statements() {
+    let formatted = format_execute_sql_error(PerfettoError::QueryError {
+        kind: QueryErrorKind::MultipleOutputStatements,
+        message: "SQL returned rows from 2 output statements".to_owned(),
+    });
+    assert!(
+        formatted.contains("at most one statement produces rows"),
+        "multi-output hint must explain the one-output contract, got: {formatted}",
+    );
+    assert!(
+        formatted.contains("INCLUDE PERFETTO MODULE"),
+        "multi-output hint must preserve INCLUDE+SELECT as valid, got: {formatted}",
+    );
+}
+
+#[test]
 fn execute_sql_too_many_rows_message_explains_aggregation() {
     let formatted = format_execute_sql_error(PerfettoError::TooManyRows);
     assert!(
@@ -462,6 +502,75 @@ fn chrome_tool_response_adds_metadata_before_rows_without_dropping_rows() {
             .expect("note string")
             .contains("row_count unknown"),
         "note must explain Chrome tool completeness metadata: {parsed}",
+    );
+}
+
+#[test]
+fn chrome_tool_response_with_known_row_count_only_truncates_when_more_rows_exist() {
+    let table = decoded_table(&["id"], vec![vec![json!(1)], vec![json!(2)]]);
+
+    let response = format_chrome_tool_response_with_known_row_count_and_redaction(
+        table,
+        2,
+        DEFAULT_TOOL_MAX_STRING_LEN,
+        false,
+    )
+    .expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    assert_json_key_order(&response, "\"truncated\":", "\"rows\":");
+    assert_eq!(parsed["row_count"], json!(2));
+    assert_eq!(parsed["returned_rows"], json!(2));
+    assert_eq!(parsed["truncated"], json!(false));
+    assert_eq!(parsed["row_count_known"], json!(true));
+    assert!(
+        parsed["note"]
+            .as_str()
+            .expect("note string")
+            .contains("more rows exist than returned"),
+        "note must explain exact truncation semantics: {parsed}",
+    );
+
+    let truncated_table = decoded_table(&["id"], vec![vec![json!(1)], vec![json!(2)]]);
+    let truncated_response = format_chrome_tool_response_with_known_row_count_and_redaction(
+        truncated_table,
+        3,
+        DEFAULT_TOOL_MAX_STRING_LEN,
+        false,
+    )
+    .expect("serialize");
+    let truncated: serde_json::Value = serde_json::from_str(&truncated_response).expect("json");
+    assert_eq!(truncated["row_count"], json!(3));
+    assert_eq!(truncated["returned_rows"], json!(2));
+    assert_eq!(truncated["truncated"], json!(true));
+}
+
+#[test]
+fn list_threads_response_exposes_exact_count_and_truncation() {
+    let table = decoded_table(
+        &["tid", "thread_name", "pid", "upid"],
+        vec![vec![
+            json!(10),
+            json!("CrRendererMain"),
+            json!(100),
+            json!(1),
+        ]],
+    );
+
+    let response = format_list_threads_response(table, 2).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    assert_json_key_order(&response, "\"truncated\":", "\"rows\":");
+    assert_eq!(parsed["row_count"], json!(2));
+    assert_eq!(parsed["returned_rows"], json!(1));
+    assert_eq!(parsed["truncated"], json!(true));
+    assert_eq!(parsed["row_count_known"], json!(true));
+    assert!(
+        parsed["note"]
+            .as_str()
+            .expect("note string")
+            .contains("2000-row cap"),
+        "note must explain list_threads truncation: {parsed}",
     );
 }
 
@@ -633,13 +742,21 @@ fn chrome_tool_response_rejects_zero_max_string_len() {
 #[test]
 fn slice_descendants_response_echoes_summary_bounds_before_rows() {
     let table = decoded_table(
-        &["root_id", "depth", "name", "slice_count", "total_ms"],
+        &[
+            "root_id",
+            "depth",
+            "name",
+            "slice_count",
+            "inclusive_total_ms",
+            "self_ms",
+        ],
         vec![vec![
             json!(10),
             json!(1),
             json!("child"),
             json!(2),
             json!(3.5),
+            json!(1.25),
         ]],
     );
     let applied_filters = SliceDescendantsAppliedFilters {
@@ -685,6 +802,13 @@ fn slice_descendants_response_echoes_summary_bounds_before_rows() {
             .expect("note string")
             .contains("matching min_dur_ms within max_depth"),
         "note must explain bounded summary semantics: {parsed}",
+    );
+    assert!(
+        parsed["note"]
+            .as_str()
+            .expect("note string")
+            .contains("do not sum it across rows/depths"),
+        "note must warn that inclusive totals overlap across depths: {parsed}",
     );
 }
 
@@ -806,6 +930,13 @@ fn execute_sql_head_limits_returned_rows_and_marks_truncation() {
             .contains("post-SQL decoded rows"),
         "note must prevent SQL-limit confusion: {parsed}",
     );
+    assert!(
+        parsed["note"]
+            .as_str()
+            .expect("note string")
+            .contains("capped at 5000"),
+        "note must explain the output row cap: {parsed}",
+    );
 }
 
 #[test]
@@ -821,6 +952,14 @@ fn execute_sql_decode_options_materialize_only_requested_rows() {
     assert_eq!(
         execute_sql_decode_options(&params).expect("valid head"),
         crate::query::DecodeQueryOptions { max_rows: Some(5) }
+    );
+
+    params.head = Some((MAX_ROWS + 99) as u32);
+    assert_eq!(
+        execute_sql_decode_options(&params).expect("oversized head clamps"),
+        crate::query::DecodeQueryOptions {
+            max_rows: Some(MAX_ROWS)
+        }
     );
 
     params.head = None;
@@ -860,6 +999,28 @@ fn execute_sql_decoded_response_uses_exact_count_from_limited_decoder() {
     assert_eq!(parsed["returned_rows"], json!(1));
     assert_eq!(parsed["truncated"], json!(true));
     assert_eq!(parsed["row_count_known"], json!(true));
+}
+
+#[test]
+fn execute_sql_output_shape_clamps_oversized_head_and_limit_to_max_rows() {
+    let mut params = execute_sql_params("SELECT n FROM nums");
+    params.head = Some((MAX_ROWS + 99) as u32);
+    assert_eq!(
+        execute_sql_output_shape(&params, false)
+            .expect("oversized head must clamp")
+            .mode,
+        ExecuteSqlOutputMode::LimitedRows(MAX_ROWS)
+    );
+
+    let mut params = execute_sql_params("SELECT n FROM nums");
+    params.summary = true;
+    params.limit = Some((MAX_ROWS + 99) as u32);
+    assert_eq!(
+        execute_sql_output_shape(&params, false)
+            .expect("oversized summary limit must clamp")
+            .mode,
+        ExecuteSqlOutputMode::Summary(MAX_ROWS)
+    );
 }
 
 #[test]
@@ -1491,6 +1652,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
 
         let r = server
             .chrome_scroll_jank_summary(Parameters(ChromeTraceParams {
+                limit: None,
                 max_string_len: None,
             }))
             .await;
@@ -1503,6 +1665,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
 
         let r = server
             .chrome_page_load_summary(Parameters(ChromeTraceParams {
+                limit: None,
                 max_string_len: None,
             }))
             .await;
@@ -1631,6 +1794,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
 
         let r = server
             .chrome_startup_summary(Parameters(ChromeTraceParams {
+                limit: None,
                 max_string_len: None,
             }))
             .await;
@@ -1643,6 +1807,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
 
         let r = server
             .chrome_web_content_interactions(Parameters(ChromeTraceParams {
+                limit: None,
                 max_string_len: None,
             }))
             .await;
@@ -1677,6 +1842,7 @@ fn list_tables_response_is_not_contaminated_by_previous_tool_call() {
 
         let page_load_response = server
             .chrome_page_load_summary(Parameters(ChromeTraceParams {
+                limit: None,
                 max_string_len: None,
             }))
             .await
@@ -1890,9 +2056,10 @@ fn chrome_main_thread_hotspots_params_accept_navigation_id() {
 }
 
 #[test]
-fn chrome_trace_params_accept_stringified_max_string_len() {
-    let p: ChromeTraceParams = serde_json::from_str(r#"{"max_string_len": "300"}"#)
-        .expect("stringified Chrome max_string_len must deserialize");
+fn chrome_trace_params_accept_stringified_numerics() {
+    let p: ChromeTraceParams = serde_json::from_str(r#"{"limit": "25", "max_string_len": "300"}"#)
+        .expect("stringified Chrome params must deserialize");
+    assert_eq!(p.limit, Some(25));
     assert_eq!(p.max_string_len, Some(300));
 }
 
@@ -2219,6 +2386,11 @@ fn chrome_main_thread_hotspots_sql_no_filter_runs_all_main_threads() {
     assert!(sql.contains("LEFT JOIN process p ON ct.upid = p.upid"));
     assert!(sql.contains("WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main')"));
     assert!(sql.contains("AND ct.dur > 16000000"));
+    assert!(
+        sql.contains("ct.dur / 1e6 AS dur_ms")
+            && sql.contains("ROUND(ct.dur / 1e6, 3) AS overlap_dur_ms"),
+        "no-window overlap duration should equal full task duration, got: {sql}",
+    );
     assert!(sql.contains("ORDER BY ct.dur DESC LIMIT 100"));
     assert!(
         !sql.contains("chrome.page_loads"),
@@ -2337,8 +2509,14 @@ fn chrome_main_thread_hotspots_sql_with_raw_window_emits_ts_filters() {
         ..Default::default()
     })
     .expect("raw-window builder must succeed");
-    assert!(sql.contains("AND ct.ts >= 1000"), "got: {sql}");
+    assert!(sql.contains("MAX(ct.ts, 1000)"), "got: {sql}");
+    assert!(sql.contains("MIN(ct.ts + ct.dur, 2000)"), "got: {sql}");
+    assert!(sql.contains("AND ct.ts + ct.dur > 1000"), "got: {sql}");
     assert!(sql.contains("AND ct.ts < 2000"), "got: {sql}");
+    assert!(
+        sql.contains("ORDER BY (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) DESC, ct.dur DESC"),
+        "windowed hotspots must rank by clipped overlap before full duration, got: {sql}",
+    );
     assert!(
         !sql.contains("hotspot_window"),
         "raw timestamp filters alone must not require page_loads, got: {sql}",
@@ -2369,8 +2547,19 @@ fn chrome_main_thread_hotspots_sql_with_page_load_defaults_to_nav_to_fcp() {
         "page_load_id must not also match navigation_id, got: {sql}",
     );
     assert!(sql.contains("CROSS JOIN hotspot_window hw"), "got: {sql}");
-    assert!(sql.contains("AND ct.ts >= hw.start_ts"), "got: {sql}");
+    assert!(sql.contains("MAX(ct.ts, hw.start_ts)"), "got: {sql}");
+    assert!(sql.contains("MIN(ct.ts + ct.dur, hw.end_ts)"), "got: {sql}");
+    assert!(
+        sql.contains("AND ct.ts + ct.dur > hw.start_ts"),
+        "got: {sql}"
+    );
     assert!(sql.contains("AND ct.ts < hw.end_ts"), "got: {sql}");
+    assert!(
+        sql.contains(
+            "ORDER BY (MIN(ct.ts + ct.dur, hw.end_ts) - MAX(ct.ts, hw.start_ts)) DESC, ct.dur DESC"
+        ),
+        "page-load windows must rank by clipped overlap, got: {sql}",
+    );
 }
 
 #[test]
@@ -2448,7 +2637,7 @@ fn chrome_main_thread_hotspots_sql_rejects_invalid_windows() {
     assert!(err.to_string().contains("end_ts_ns"), "got: {err}");
 }
 
-/// `min_dur_ms = 33.0` translates to `ct.dur > 33000000` ns. Default
+/// `min_dur_ms = 33.0` translates to an overlap-duration threshold. Default
 /// (`None`) preserves the legacy 16 ms threshold pinned by the no-filter
 /// test above.
 #[test]
@@ -2468,8 +2657,8 @@ fn chrome_main_thread_hotspots_sql_with_min_dur_ms_emits_threshold() {
     );
 }
 
-/// `min_dur_ms = 0.0` is the explicit "show me everything" path — emits
-/// `ct.dur > 0` so SQL still runs but only filters out zero-duration rows
+/// `min_dur_ms = 0.0` is the explicit "show me everything" path — emits a
+/// zero overlap-duration threshold so SQL still runs but only filters out zero-duration rows
 /// (which `chrome_tasks` shouldn't have anyway).
 #[test]
 fn chrome_main_thread_hotspots_sql_with_min_dur_ms_zero_emits_zero_threshold() {
@@ -3052,6 +3241,21 @@ fn chrome_page_load_resource_pipeline_sql_clips_script_metrics_to_window() {
         !sql.contains("THEN ss.dur ELSE 0 END) / 1e6, 3)"),
         "windowed script totals must not use full slice duration, got: {sql}",
     );
+    let compact = compact_sql(&sql);
+    assert!(
+        compact.contains(
+            "child.name GLOB '*Style*' OR child.name = 'Blink.Style.UpdateTime' ) AND NOT ( child.name GLOB '*ForcedStyle*'"
+        ),
+        "pipeline style bucket must exclude forced-style/layout slices, got: {sql}",
+    );
+    assert!(
+        compact.contains(
+            "child.name GLOB '*Layout*' OR child.name = 'Blink.Layout.UpdateTime' OR child.name = 'Layout' ) AND NOT ( child.name GLOB '*ForcedStyle*'"
+        ) && compact.contains(
+            "AND NOT ( child.name GLOB '*Style*' OR child.name = 'Blink.Style.UpdateTime' ) THEN CASE"
+        ),
+        "pipeline layout bucket must exclude forced and style buckets, got: {sql}",
+    );
 }
 
 #[test]
@@ -3161,6 +3365,21 @@ fn chrome_page_load_script_hotspots_sql_defaults_to_grouped_script_scan() {
     assert!(
         sql.contains("root.overlap_end_ts"),
         "descendant style/layout duration must be clipped to root overlap end, got: {sql}",
+    );
+    let compact = compact_sql(&sql);
+    assert!(
+        compact.contains(
+            "d.name GLOB '*Recalculate*Style*' OR d.name GLOB '*UpdateStyle*' OR d.name GLOB '*StyleRecalc*' ) AND NOT ( d.name GLOB '*Forced*Layout*'"
+        ),
+        "script style bucket must exclude forced-style/layout slices, got: {sql}",
+    );
+    assert!(
+        compact.contains(
+            "d.name GLOB '*Layout*' OR d.name GLOB '*UpdateLayout*' ) AND NOT ( d.name GLOB '*Forced*Layout*'"
+        ) && compact.contains(
+            "AND NOT ( d.name GLOB '*Recalculate*Style*' OR d.name GLOB '*UpdateStyle*' OR d.name GLOB '*StyleRecalc*' ) THEN CASE"
+        ),
+        "script layout bucket must exclude forced and style buckets, got: {sql}",
     );
     assert!(
         sql.contains("HAVING SUM(ss.overlap_dur) >= 20000000"),

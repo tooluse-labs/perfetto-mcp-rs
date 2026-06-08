@@ -244,6 +244,10 @@ pub struct SliceDescendantsBreakdownParams {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChromeTraceParams {
+    /// Optional max rows to return. Defaults to 100 and is capped at 5000.
+    /// Must be > 0 when set; accepts both numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
     /// Optional per-string-cell character cap applied to returned Chrome-tool
     /// rows only. Unset preserves full strings for precision; accepts both
     /// numbers and numeric strings. Must be > 0 when set.
