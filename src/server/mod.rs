@@ -74,30 +74,10 @@ struct SchemaCacheTraceKey {
 #[derive(Debug, Default)]
 struct SchemaCache {
     trace_key: Option<SchemaCacheTraceKey>,
-    table_lists: HashMap<Option<String>, String>,
     table_structures: HashMap<String, String>,
 }
 
 impl SchemaCache {
-    fn table_list(
-        &mut self,
-        trace_key: &SchemaCacheTraceKey,
-        pattern: &Option<String>,
-    ) -> Option<String> {
-        self.ensure_trace(trace_key);
-        self.table_lists.get(pattern).cloned()
-    }
-
-    fn store_table_list(
-        &mut self,
-        trace_key: SchemaCacheTraceKey,
-        pattern: Option<String>,
-        response: String,
-    ) {
-        self.ensure_trace(&trace_key);
-        self.table_lists.insert(pattern, response);
-    }
-
     fn table_structure(
         &mut self,
         trace_key: &SchemaCacheTraceKey,
@@ -120,7 +100,6 @@ impl SchemaCache {
     fn ensure_trace(&mut self, trace_key: &SchemaCacheTraceKey) {
         if self.trace_key.as_ref() != Some(trace_key) {
             self.trace_key = Some(trace_key.clone());
-            self.table_lists.clear();
             self.table_structures.clear();
         }
     }
@@ -377,19 +356,10 @@ impl PerfettoMcpServer {
         self.record_tool_span(format!("pattern_set={}", params.pattern.is_some()))
             .await;
         let trace_path = self.current_trace_path().await?;
-        let trace_key = trace_schema_cache_key(&trace_path)?;
         let pattern_key = match &params.pattern {
             Some(pat) => Some(sanitize_glob_param(pat).map_err(|e| e.to_string())?),
             None => None,
         };
-        if let Some(cached) = self
-            .schema_cache
-            .lock()
-            .await
-            .table_list(&trace_key, &pattern_key)
-        {
-            return Ok(cached);
-        }
 
         let client = self.client_for(&trace_path).await?;
 
@@ -430,13 +400,8 @@ impl PerfettoMcpServer {
             })
             .collect::<Result<Vec<_>, String>>()?;
 
-        let response = serde_json::to_string(&TableList { names })
-            .map_err(|e| format!("Failed to serialize results: {e}"))?;
-        self.schema_cache
-            .lock()
-            .await
-            .store_table_list(trace_key, pattern_key, response.clone());
-        Ok(response)
+        serde_json::to_string(&TableList { names })
+            .map_err(|e| format!("Failed to serialize results: {e}"))
     }
 
     #[tool(
@@ -481,6 +446,7 @@ impl PerfettoMcpServer {
             .await;
         let trace_path = self.current_trace_path().await?;
         let trace_key = trace_schema_cache_key(&trace_path)?;
+        reject_table_structure_pattern(&params.table_name)?;
         let table_name = sanitize_glob_param(&params.table_name).map_err(|e| e.to_string())?;
         if let Some(cached) = self
             .schema_cache
@@ -821,11 +787,12 @@ impl PerfettoMcpServer {
     #[tool(
         name = "chrome_page_load_resource_hotspots",
         description = "Rank URL-bearing Chrome resource/request slices in a page-load/raw \
-                       window. Returns slice timing, overlap_ms/pct_of_window, \
-                       process/thread, URL. Use after `chrome_page_load_resource_summary` \
-                       to drill into the concrete Renderer/NetworkService/async slice \
-                       behind a slow URL. Filters: page_load_id/navigation_id/phase, raw \
-                       start/end ns, min_dur_ms default 50, limit, max_string_len.",
+                       window. Returns slice timing, overlap, process/thread, URL. \
+                       Use after `chrome_page_load_resource_summary` to drill into \
+                       slow URL slices. Filters: page_load/window, min_dur_ms default \
+                       50, limit, max_string_len. \
+                       `slice_duration_status='incomplete_duration'` means dur=-1; \
+                       overlap is measured to window end or trace_end().",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -881,14 +848,10 @@ impl PerfettoMcpServer {
     #[tool(
         name = "chrome_page_load_resource_summary",
         description = "URL-level Chrome resource/request summary for a page-load/raw \
-                       window. Returns URL key, slice/process/priority sets, \
-                       first/last/span, max_overlap_ms, summed_overlap_ms, \
-                       relation_to_navigation with navigation_context_status, \
-                       renderer_relation with confidence/source, example_slice_id, \
-                       and attribution evidence. \
-                       Use before `chrome_page_load_resource_hotspots` for slow \
-                       FCP/load; rank by max overlap because summed overlap can \
-                       double-count layered slices.",
+                       window. Returns URL key, process/priority sets, span, \
+                       max/summed overlap, navigation/renderer relation evidence, \
+                       example_slice_id, incomplete_duration_slice_count. Use before \
+                       `chrome_page_load_resource_hotspots`; rank by max overlap.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -962,11 +925,10 @@ impl PerfettoMcpServer {
                        style/layout signals. Use after \
                        `chrome_page_load_resource_summary` by passing \
                        `example_slice_id` or `url_substring` for a slow URL. \
-                       Returns request/resource timing facts plus an \
-                       explicit `matched_by`/`matched_url_seed` so callers can \
-                       verify why the row matched, plus an \
+                       Returns timing facts, `matched_by`/`matched_url_seed`, \
+                       `incomplete_duration_resource_slice_count` and an \
                        evidence_boundary reminding callers not to label \
-                       DNS/TLS/TTFB/download/cache without phase-specific rows. \
+                       DNS/TLS/TTFB/cache without phase-specific rows. \
                        Parameters: `url_substring` or `example_slice_id` required; \
                        optional page-load/window filters, `url_grouping`, `limit` \
                        default 30, `max_string_len`.",
@@ -1098,8 +1060,9 @@ impl PerfettoMcpServer {
         name = "chrome_main_thread_hotspots",
         description = "Top Chrome main-thread tasks by wall duration: id, ts, \
                        name, task_type, thread_name, process_name, upid, pid, \
-                       dur_ms, overlap_dur_ms, cpu_pct, thread_dur_ms, \
-                       overlap_thread_dur_ms (linear estimate). Uses `chrome.tasks`, \
+                       dur_ms, overlap_dur_ms, cpu_pct/thread_dur_ms (full-task), \
+                       overlap_cpu_pct/overlap_thread_dur_ms (window estimates). \
+                       Uses `chrome.tasks`, \
                        `thread.is_main_thread = 1` when available, and Chrome's \
                        `Cr*Main` thread-name convention as a fallback for traces \
                        where thread metadata is incomplete or incorrect. Pass a returned \
@@ -1530,6 +1493,17 @@ async fn table_has_column(
 fn decoded_table_has_column(table: &DecodedTable, column_name: &str) -> bool {
     (0..table.len())
         .any(|i| table.cell(i, "name").and_then(|value| value.as_str()) == Some(column_name))
+}
+
+fn reject_table_structure_pattern(table_name: &str) -> Result<(), String> {
+    if table_name.contains('*') || table_name.contains('?') {
+        return Err(
+            "`list_table_structure` requires one exact table/view name; use `list_tables` with \
+             `pattern` first, then pass one returned name."
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn trace_schema_cache_key(trace_path: &str) -> Result<SchemaCacheTraceKey, String> {

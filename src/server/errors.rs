@@ -27,6 +27,24 @@ pub(super) fn format_execute_sql_error(err: PerfettoError) -> String {
              inferring column names by analogy."
         ),
         PerfettoError::QueryError {
+            kind: QueryErrorKind::AmbiguousColumn,
+            message,
+        } => format!(
+            "SQL error: {message}\n\nHint: qualify ambiguous columns with table \
+             aliases (for example `s.depth` instead of `depth`) and give recursive \
+             CTE columns explicit names. Use `list_table_structure('<table>')` if \
+             you need to confirm which tables expose the column."
+        ),
+        PerfettoError::QueryError {
+            kind: QueryErrorKind::MissingFunction,
+            message,
+        } => format!(
+            "SQL error: {message}\n\nHint: PerfettoSQL uses SQLite plus Perfetto \
+             functions, so functions from other SQL dialects may be unavailable. \
+             Prefer documented PerfettoSQL functions, or `INCLUDE PERFETTO MODULE ...` \
+             and query the stdlib view that already computes the metric."
+        ),
+        PerfettoError::QueryError {
             kind: QueryErrorKind::MissingModule,
             message,
         } => format!(

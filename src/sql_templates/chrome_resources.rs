@@ -46,8 +46,10 @@ fn chrome_resource_window_exprs(page_window: ChromePageLoadWindowSql) -> ChromeR
         None => "s.ts".to_owned(),
     };
     let overlap_end_expr = match &end_bound {
-        Some(bound) => format!("MIN(s.ts + s.dur, {bound})"),
-        None => "s.ts + s.dur".to_owned(),
+        Some(bound) => {
+            format!("CASE WHEN s.dur >= 0 THEN MIN(s.ts + s.dur, {bound}) ELSE {bound} END")
+        }
+        None => "CASE WHEN s.dur >= 0 THEN s.ts + s.dur ELSE trace_end() END".to_owned(),
     };
     let window_dur_expr = match (&start_bound, &end_bound) {
         (Some(start), Some(end)) => Some(format!("({end} - {start})")),
@@ -94,8 +96,12 @@ fn append_chrome_resource_candidates_cte(
              s.dur, \
              s.arg_set_id, \
              ROUND((s.ts - {}) / 1e6, 3) AS start_ms, \
-             ROUND((s.ts + s.dur - {}) / 1e6, 3) AS end_ms, \
-             ROUND(s.dur / 1e6, 3) AS dur_ms, \
+             CASE WHEN s.dur >= 0 \
+                  THEN ROUND((s.ts + s.dur - {}) / 1e6, 3) \
+             END AS end_ms, \
+             CASE WHEN s.dur >= 0 THEN ROUND(s.dur / 1e6, 3) END AS dur_ms, \
+             CASE WHEN s.dur < 0 THEN 'incomplete_duration' ELSE 'complete' END \
+               AS slice_duration_status, \
              {} AS overlap_start_ts, \
              {} AS overlap_end_ts, \
              ({} - {}) AS overlap_dur, \
@@ -147,7 +153,7 @@ fn append_chrome_resource_candidates_cte(
         sql.push_str("CROSS JOIN resource_window rw ");
     }
     sql.push_str(&format!(
-        "WHERE s.dur >= {min_dur_ns} \
+        "WHERE ({} - {}) >= {min_dur_ns} \
            AND ( \
              s.name GLOB '*Resource*' OR \
               s.name GLOB '*URLLoader*' OR \
@@ -163,10 +169,11 @@ fn append_chrome_resource_candidates_cte(
              s.name GLOB '*DidStartProvisionalLoad*' OR \
              s.name GLOB '*DidStopLoading*' OR \
              s.name GLOB '*DidFinishLoad*' \
-           )"
+           )",
+        exprs.overlap_end_expr, exprs.overlap_start_expr
     ));
     if let Some(bound) = &exprs.start_bound {
-        sql.push_str(&format!(" AND s.ts + s.dur > {bound}"));
+        sql.push_str(&format!(" AND {} > {bound}", exprs.overlap_end_expr));
     }
     if let Some(bound) = &exprs.end_bound {
         sql.push_str(&format!(" AND s.ts < {bound}"));
@@ -220,6 +227,7 @@ fn append_chrome_resource_candidates_cte(
              rcs.start_ms, \
              rcs.end_ms, \
              rcs.dur_ms, \
+             rcs.slice_duration_status, \
              rcs.overlap_start_ts, \
              rcs.overlap_end_ts, \
              rcs.overlap_dur, \
@@ -277,6 +285,7 @@ pub fn chrome_page_load_resource_hotspots_sql(
            start_ms, \
            end_ms, \
            dur_ms, \
+           slice_duration_status, \
            overlap_ms, \
            pct_of_window, \
            name, \
@@ -435,6 +444,8 @@ pub fn chrome_page_load_resource_summary_sql(
             END AS renderer_relation_source, \
             (SELECT target_renderer_upids FROM navigation_context) AS target_renderer_upids, \
             COUNT(*) AS slice_count, \
+            SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END) \
+              AS incomplete_duration_slice_count, \
             (SELECT r2.name FROM resource_rows r2 \
              WHERE r2.url_key = rr.url_key \
              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS primary_slice_name, \
@@ -786,6 +797,8 @@ pub fn chrome_page_load_resource_pipeline_sql(
                          ELSE 2 END, \
                         r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS matched_url_seed, \
               COUNT(*) AS resource_slice_count, \
+             SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END) \
+               AS incomplete_duration_resource_slice_count, \
              ROUND(MIN(rr.start_ms), 3) AS first_resource_start_ms, \
              ROUND(MAX(rr.end_ms), 3) AS last_resource_end_ms, \
              ROUND(MAX(rr.overlap_dur) / 1e6, 3) AS max_request_overlap_ms, \
@@ -922,7 +935,7 @@ pub(super) fn chrome_url_arg_priority_expr(args_alias: &str) -> String {
     )
 }
 
-const RAW_WINDOW_NAV_END_EXPR: &str = "NULLIF(MAX( \
+const RAW_WINDOW_NAV_OBSERVED_END_EXPR: &str = "COALESCE(NULLIF(MAX( \
         COALESCE(load_event_ts, -1), \
         COALESCE(fcp_ts, -1), \
         COALESCE(lcp_ts, -1), \
@@ -930,7 +943,7 @@ const RAW_WINDOW_NAV_END_EXPR: &str = "NULLIF(MAX( \
         COALESCE(mark_fully_loaded_ts, -1), \
         COALESCE(mark_fully_visible_ts, -1), \
         COALESCE(mark_interactive_ts, -1) \
-    ), -1)";
+    ), -1), trace_end())";
 
 fn chrome_page_load_raw_window_navigation_url_expr(page_window: ChromePageLoadWindowSql) -> String {
     let Some(predicates) = chrome_page_load_raw_window_navigation_predicates(page_window) else {
@@ -980,15 +993,12 @@ fn chrome_page_load_raw_window_navigation_predicates(
     if page_window.start_ts_ns.is_none() && page_window.end_ts_ns.is_none() {
         return None;
     }
-    let mut predicates = vec![
-        "navigation_start_ts IS NOT NULL".to_owned(),
-        format!("{RAW_WINDOW_NAV_END_EXPR} IS NOT NULL"),
-    ];
+    let mut predicates = vec!["navigation_start_ts IS NOT NULL".to_owned()];
     if let Some(end) = page_window.end_ts_ns {
         predicates.push(format!("navigation_start_ts < {end}"));
     }
     if let Some(start) = page_window.start_ts_ns {
-        predicates.push(format!("{RAW_WINDOW_NAV_END_EXPR} > {start}"));
+        predicates.push(format!("{RAW_WINDOW_NAV_OBSERVED_END_EXPR} > {start}"));
     }
     Some(predicates)
 }
@@ -1100,7 +1110,7 @@ pub fn chrome_page_load_resource_timing_evidence_sql(
                  a.key IN ('url', 'request_url', 'fileName') OR \
                  lower(a.flat_key) LIKE '%url%' \
                ) \
-             THEN s.id END) AS incomplete_resource_slice_count \
+             THEN s.id END) AS incomplete_duration_resource_slice_count \
            FROM slice s \
            LEFT JOIN args a ON s.arg_set_id = a.arg_set_id ",
     );
@@ -1157,7 +1167,8 @@ pub fn chrome_page_load_resource_timing_evidence_sql(
          SELECT \
            COALESCE(network_phase_slice_count, 0) AS network_phase_slice_count, \
            COALESCE(network_phase_arg_count, 0) AS network_phase_arg_count, \
-           COALESCE(incomplete_resource_slice_count, 0) AS incomplete_resource_slice_count, \
+           COALESCE(incomplete_duration_resource_slice_count, 0) \
+             AS incomplete_duration_resource_slice_count, \
            CASE WHEN COALESCE(network_phase_slice_count, 0) \
                    + COALESCE(network_phase_arg_count, 0) > 0 \
                 THEN 1 ELSE 0 END AS phase_breakdown_available \

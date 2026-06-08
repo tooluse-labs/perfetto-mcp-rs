@@ -279,7 +279,6 @@ fn schema_cache_is_scoped_to_trace_fingerprint() {
     };
     let mut cache = SchemaCache::default();
 
-    cache.store_table_list(key_a.clone(), None, r#"{"names":["slice"]}"#.to_owned());
     cache.store_table_structure(
         key_a.clone(),
         "slice".to_owned(),
@@ -287,12 +286,11 @@ fn schema_cache_is_scoped_to_trace_fingerprint() {
     );
 
     assert_eq!(
-        cache.table_list(&key_a, &None).as_deref(),
-        Some(r#"{"names":["slice"]}"#)
+        cache.table_structure(&key_a, "slice").as_deref(),
+        Some(r#"{"table":"slice","columns":[]}"#)
     );
-    assert!(cache.table_list(&key_b, &None).is_none());
     assert!(
-        cache.table_structure(&key_a, "slice").is_none(),
+        cache.table_structure(&key_b, "slice").is_none(),
         "switching trace fingerprints must clear stale structures too"
     );
 }
@@ -390,6 +388,34 @@ fn execute_sql_hint_fires_on_missing_column() {
         !formatted.contains("chrome_page_loads") && !formatted.contains("chrome_tasks"),
         "hint must NOT name specific stdlib views — that biases recovery for \
              non-Chrome queries; got: {formatted}",
+    );
+}
+
+#[test]
+fn execute_sql_hint_fires_on_ambiguous_column() {
+    let formatted = format_execute_sql_error(PerfettoError::QueryError {
+        kind: QueryErrorKind::AmbiguousColumn,
+        message: "ambiguous column name: depth".to_owned(),
+    });
+    assert!(formatted.contains("Hint:"), "got: {formatted}");
+    assert!(formatted.contains("aliases"), "got: {formatted}");
+    assert!(
+        formatted.contains("list_table_structure"),
+        "got: {formatted}"
+    );
+}
+
+#[test]
+fn execute_sql_hint_fires_on_missing_function() {
+    let formatted = format_execute_sql_error(PerfettoError::QueryError {
+        kind: QueryErrorKind::MissingFunction,
+        message: "no such function: EXTRACT".to_owned(),
+    });
+    assert!(formatted.contains("Hint:"), "got: {formatted}");
+    assert!(formatted.contains("PerfettoSQL"), "got: {formatted}");
+    assert!(
+        formatted.contains("INCLUDE PERFETTO MODULE"),
+        "got: {formatted}"
     );
 }
 
@@ -770,8 +796,8 @@ fn resource_summary_response_carries_attribution_evidence_before_rows() {
         hypothesis_only: vec!["cdn/server latency"],
         network_phase_slice_count: 0,
         network_phase_arg_count: 0,
-        incomplete_resource_slice_count: 1,
-        incomplete_slices_excluded: true,
+        incomplete_duration_resource_slice_count: 1,
+        incomplete_duration_resource_slices_included: true,
     };
 
     let response = format_chrome_resource_summary_response_with_redaction(
@@ -798,7 +824,7 @@ fn resource_summary_response_carries_attribution_evidence_before_rows() {
         json!(["dns", "ttfb"])
     );
     assert_eq!(
-        parsed["resource_timing_evidence"]["incomplete_resource_slice_count"],
+        parsed["resource_timing_evidence"]["incomplete_duration_resource_slice_count"],
         json!(1)
     );
     assert_eq!(
@@ -813,7 +839,7 @@ fn resource_timing_evidence_probe_distinguishes_absent_and_present_phase_hints()
         &[
             "network_phase_slice_count",
             "network_phase_arg_count",
-            "incomplete_resource_slice_count",
+            "incomplete_duration_resource_slice_count",
             "phase_breakdown_available",
         ],
         vec![vec![json!(0), json!(0), json!(2), json!(0)]],
@@ -822,13 +848,14 @@ fn resource_timing_evidence_probe_distinguishes_absent_and_present_phase_hints()
     assert_eq!(absent_evidence.attribution_scope, "url_lifecycle_span");
     assert_eq!(absent_evidence.phase_breakdown, "absent");
     assert!(absent_evidence.unsafe_inferences.contains(&"download"));
-    assert_eq!(absent_evidence.incomplete_resource_slice_count, 2);
+    assert_eq!(absent_evidence.incomplete_duration_resource_slice_count, 2);
+    assert!(absent_evidence.incomplete_duration_resource_slices_included);
 
     let present = decoded_table(
         &[
             "network_phase_slice_count",
             "network_phase_arg_count",
-            "incomplete_resource_slice_count",
+            "incomplete_duration_resource_slice_count",
             "phase_breakdown_available",
         ],
         vec![vec![json!(3), json!(1), json!(0), json!(1)]],
@@ -2604,6 +2631,14 @@ fn list_table_structure_accepts_name_alias() {
     assert_eq!(from_alias.table_name, "slice");
 }
 
+#[test]
+fn list_table_structure_rejects_glob_patterns() {
+    let err = reject_table_structure_pattern("chrome_*")
+        .expect_err("list_table_structure must require an exact table name");
+    assert!(err.contains("exact table"), "got: {err}");
+    assert!(err.contains("list_tables"), "got: {err}");
+}
+
 // -- v0.11.3 current_trace state -------------------------------------
 
 /// With nothing loaded, `current_trace_path` returns a clear actionable
@@ -2796,6 +2831,13 @@ fn chrome_main_thread_hotspots_sql_no_filter_runs_all_main_threads() {
         "cpu_pct must be clamped to 0..100%, got: {sql}",
     );
     assert!(
+        sql.contains("AS overlap_cpu_pct")
+            && compact.contains(
+                "ROUND(MAX(MIN( ct.thread_dur * ct.dur * 1.0 / ct.dur, ct.dur ), 0.0) * 100.0 / ct.dur, 1)"
+            ),
+        "overlap_cpu_pct must be derived from clipped overlap CPU and overlap duration, got: {sql}",
+    );
+    assert!(
         compact.contains("MAX(MIN( ct.thread_dur * ct.dur * 1.0 / ct.dur, ct.dur ), 0.0)"),
         "overlap_thread_dur_ms must be clamped to the overlap duration range, got: {sql}",
     );
@@ -2935,6 +2977,12 @@ fn chrome_main_thread_hotspots_sql_with_raw_window_emits_ts_filters() {
             "MAX(MIN( ct.thread_dur * (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) * 1.0 / ct.dur, (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) ), 0.0)"
         ),
         "windowed overlap_thread_dur_ms must clamp the prorated CPU estimate to the clipped overlap range, got: {sql}",
+    );
+    assert!(
+        compact.contains(
+            "ROUND(MAX(MIN( ct.thread_dur * (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) * 1.0 / ct.dur, (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) ), 0.0) * 100.0 / (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)), 1)"
+        ),
+        "windowed overlap_cpu_pct must use clipped overlap duration, got: {sql}",
     );
     assert!(
         !sql.contains("hotspot_window"),
@@ -3198,6 +3246,7 @@ fn chrome_page_load_resource_hotspots_sql_defaults_to_resource_slice_scan() {
     let sql =
         chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters::default())
             .expect("resource builder must succeed");
+    let compact = compact_sql(&sql);
     assert!(
         sql.contains("WITH resource_candidate_slices AS") && sql.contains("resource_candidates AS"),
         "default SQL must still use a CTE for result shaping, got: {sql}",
@@ -3207,8 +3256,16 @@ fn chrome_page_load_resource_hotspots_sql_defaults_to_resource_slice_scan() {
         "no-window resource SQL must not include page-loads, got: {sql}",
     );
     assert!(
-        sql.contains("WHERE s.dur >= 50000000"),
-        "default resource threshold must be 50 ms, got: {sql}",
+        compact.contains(
+            "WHERE (CASE WHEN s.dur >= 0 THEN s.ts + s.dur ELSE trace_end() END - s.ts) >= 50000000"
+        ),
+        "default resource threshold must use observed overlap so dur=-1 rows can be included, got: {sql}",
+    );
+    assert!(
+        sql.contains("CASE WHEN s.dur < 0 THEN 'incomplete_duration' ELSE 'complete' END")
+            && sql.contains("AS slice_duration_status")
+            && sql.contains("slice_duration_status,"),
+        "resource rows must expose incomplete dur=-1 slices, got: {sql}",
     );
     assert!(
         sql.contains("FROM slice s LEFT JOIN track tr ON s.track_id = tr.id"),
@@ -3296,7 +3353,7 @@ fn chrome_page_load_resource_hotspots_sql_with_page_load_window_uses_overlap() {
         "page_load_id must not also match navigation_id, got: {sql}",
     );
     assert!(
-        sql.contains("s.ts + s.dur > rw.start_ts"),
+        sql.contains("CASE WHEN s.dur >= 0 THEN MIN(s.ts + s.dur, rw.end_ts) ELSE rw.end_ts END > rw.start_ts"),
         "resource windows must include overlapping slices, got: {sql}",
     );
     assert!(
@@ -3339,7 +3396,7 @@ fn chrome_page_load_resource_hotspots_sql_ands_raw_bounds_with_phase_window() {
         "raw end_ts_ns must be intersected with phase end, got: {sql}",
     );
     assert!(
-        sql.contains("s.ts + s.dur > MAX(rw.start_ts, 1000)"),
+        sql.contains("CASE WHEN s.dur >= 0 THEN MIN(s.ts + s.dur, MIN(rw.end_ts, 2000)) ELSE MIN(rw.end_ts, 2000) END > MAX(rw.start_ts, 1000)"),
         "overlap lower predicate must use effective start, got: {sql}",
     );
     assert!(
@@ -3430,6 +3487,12 @@ fn chrome_page_load_resource_summary_sql_groups_by_url() {
         "compact summary should expose one representative slice name, got: {sql}",
     );
     assert!(
+        sql.contains(
+            "SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END)"
+        ) && sql.contains("AS incomplete_duration_slice_count"),
+        "summary must surface incomplete resource slices per URL, got: {sql}",
+    );
+    assert!(
         sql.contains("GROUP_CONCAT(DISTINCT rr.priority) AS priorities"),
         "summary must expose resource priorities when present, got: {sql}",
     );
@@ -3508,13 +3571,11 @@ fn chrome_page_load_resource_summary_sql_scopes_navigation_context_to_raw_window
         "raw-window navigation context must surface ambiguous multi-navigation windows, got: {sql}",
     );
     assert!(
-        sql.contains("NULLIF(MAX(") && sql.contains("COALESCE(mark_interactive_ts, -1)"),
-        "raw-window navigation context must use the latest non-null page-load marker, got: {sql}",
+        sql.contains("COALESCE(NULLIF(MAX(")
+            && sql.contains("COALESCE(mark_interactive_ts, -1)")
+            && sql.contains("trace_end()) > 1000"),
+        "raw-window navigation context must use latest marker or trace_end for overlap, got: {sql}",
     );
-    assert!(
-            sql.contains("), -1) > 1000"),
-            "raw-window navigation context must require latest marker overlap with the raw start, got: {sql}",
-        );
     assert!(
         sql.contains("WHEN (SELECT nav_url FROM navigation_context) IS NULL THEN 'unknown'"),
         "missing raw-window navigation context must not classify same/cross origin, got: {sql}",
@@ -3631,6 +3692,16 @@ fn chrome_page_load_resource_pipeline_sql_builds_url_drilldown() {
         "pipeline must expose request span evidence, got: {sql}",
     );
     assert!(
+        sql.contains(
+            "SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END)"
+        ),
+        "pipeline must count incomplete duration resource slices for the matched URL, got: {sql}",
+    );
+    assert!(
+        sql.contains("AS incomplete_duration_resource_slice_count"),
+        "pipeline must surface incomplete resource slices for the matched URL, got: {sql}",
+    );
+    assert!(
         sql.contains("THEN rr.overlap_dur END) / 1e6, 3) AS request_span_ms")
             && sql.contains("THEN rr.overlap_dur END) / 1e6, 3) AS cache_or_get_resource_span_ms"),
         "pipeline request/cache spans must use clipped overlap duration, got: {sql}",
@@ -3742,7 +3813,7 @@ fn chrome_page_load_resource_timing_evidence_sql_probes_phase_and_incomplete_sig
         "probe must count phase-like arg keys, got: {sql}",
     );
     assert!(
-        sql.contains("incomplete_resource_slice_count"),
+        sql.contains("incomplete_duration_resource_slice_count"),
         "probe must count incomplete URL-bearing resource slices, got: {sql}",
     );
     assert!(

@@ -205,8 +205,8 @@ pub(super) struct ChromeResourceTimingEvidence {
     pub(super) hypothesis_only: Vec<&'static str>,
     pub(super) network_phase_slice_count: i64,
     pub(super) network_phase_arg_count: i64,
-    pub(super) incomplete_resource_slice_count: i64,
-    pub(super) incomplete_slices_excluded: bool,
+    pub(super) incomplete_duration_resource_slice_count: i64,
+    pub(super) incomplete_duration_resource_slices_included: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -625,8 +625,8 @@ pub(super) fn chrome_resource_timing_evidence_from_probe(
         decoded_table_i64_cell(table, "network_phase_slice_count").unwrap_or(0);
     let network_phase_arg_count =
         decoded_table_i64_cell(table, "network_phase_arg_count").unwrap_or(0);
-    let incomplete_resource_slice_count =
-        decoded_table_i64_cell(table, "incomplete_resource_slice_count").unwrap_or(0);
+    let incomplete_duration_resource_slice_count =
+        decoded_table_i64_cell(table, "incomplete_duration_resource_slice_count").unwrap_or(0);
     let phase_breakdown_available =
         decoded_table_i64_cell(table, "phase_breakdown_available").unwrap_or(0) > 0;
 
@@ -659,8 +659,8 @@ pub(super) fn chrome_resource_timing_evidence_from_probe(
             ],
             network_phase_slice_count,
             network_phase_arg_count,
-            incomplete_resource_slice_count,
-            incomplete_slices_excluded: true,
+            incomplete_duration_resource_slice_count,
+            incomplete_duration_resource_slices_included: true,
         }
     } else {
         ChromeResourceTimingEvidence {
@@ -691,8 +691,8 @@ pub(super) fn chrome_resource_timing_evidence_from_probe(
             ],
             network_phase_slice_count,
             network_phase_arg_count,
-            incomplete_resource_slice_count,
-            incomplete_slices_excluded: true,
+            incomplete_duration_resource_slice_count,
+            incomplete_duration_resource_slices_included: true,
         }
     }
 }

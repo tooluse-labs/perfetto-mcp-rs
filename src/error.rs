@@ -15,6 +15,8 @@ pub enum QueryErrorKind {
     MissingTable,
     MissingModule,
     MissingColumn,
+    AmbiguousColumn,
+    MissingFunction,
     MultipleOutputStatements,
     Other,
 }
@@ -33,6 +35,10 @@ impl QueryErrorKind {
             QueryErrorKind::MissingModule
         } else if message.contains("no such column:") {
             QueryErrorKind::MissingColumn
+        } else if message.contains("ambiguous column name:") {
+            QueryErrorKind::AmbiguousColumn
+        } else if message.contains("no such function:") {
+            QueryErrorKind::MissingFunction
         } else if message.contains("Result rows were returned for multiples queries")
             || message.contains("multiple output statements")
         {
@@ -100,6 +106,22 @@ mod tests {
         assert_eq!(
             QueryErrorKind::classify("no such column: navigation_id"),
             QueryErrorKind::MissingColumn,
+        );
+    }
+
+    #[test]
+    fn classify_recognizes_ambiguous_column() {
+        assert_eq!(
+            QueryErrorKind::classify("ambiguous column name: depth"),
+            QueryErrorKind::AmbiguousColumn,
+        );
+    }
+
+    #[test]
+    fn classify_recognizes_missing_function() {
+        assert_eq!(
+            QueryErrorKind::classify("no such function: EXTRACT"),
+            QueryErrorKind::MissingFunction,
         );
     }
 
