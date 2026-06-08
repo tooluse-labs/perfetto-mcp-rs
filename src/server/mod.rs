@@ -838,7 +838,7 @@ impl PerfettoMcpServer {
     #[tool(
         name = "chrome_page_load_resource_hotspots",
         description = "Rank URL-bearing Chrome resource/request slices in a page-load/raw \
-                       window. Returns slice timing, overlap, process/thread, URL. \
+                       window. Returns timing, overlap, process/thread/machine_id, URL. \
                        Use after `chrome_page_load_resource_summary` to drill into \
                        slow URL slices. Filters: page_load/window, min_dur_ms default \
                        50, limit, max_string_len. \
@@ -875,6 +875,8 @@ impl PerfettoMcpServer {
         .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page-load resource hotspots").await?;
+        let process_machine_id_available =
+            table_has_column(&client, "process", "machine_id").await?;
         let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
         let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
@@ -885,6 +887,7 @@ impl PerfettoMcpServer {
                 start_ts_ns: params.start_ts_ns,
                 end_ts_ns: params.end_ts_ns,
             },
+            process_machine_id_available,
             min_dur_ms: params.min_dur_ms,
             limit: Some(probe_limit as u32),
         })
@@ -910,7 +913,7 @@ impl PerfettoMcpServer {
     #[tool(
         name = "chrome_page_load_resource_summary",
         description = "URL-level Chrome resource/request summary for a page-load/raw \
-                       window. Returns URL key, process/priority sets, span, \
+                       window. Returns URL key, process/machine/priority sets, span, \
                        max/summed overlap, navigation/renderer relation evidence \
                        including `target_renderer_source`, example_slice_id, \
                        incomplete_duration_slice_count. Use before \
@@ -952,10 +955,15 @@ impl PerfettoMcpServer {
             start_ts_ns: params.start_ts_ns,
             end_ts_ns: params.end_ts_ns,
         };
+        let client = self.client_for_current().await?;
+        ensure_chrome_trace(&client, "Chrome page-load resource summary").await?;
+        let process_machine_id_available =
+            table_has_column(&client, "process", "machine_id").await?;
         let effective_limit = bounded_tool_limit(params.limit, 25)?;
         let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
             window,
+            process_machine_id_available,
             min_overlap_ms: params.min_overlap_ms,
             url_grouping: params.url_grouping,
             limit: Some(probe_limit as u32),
@@ -963,8 +971,6 @@ impl PerfettoMcpServer {
         .map_err(|e| e.to_string())?;
         let evidence_sql =
             chrome_page_load_resource_timing_evidence_sql(window).map_err(|e| e.to_string())?;
-        let client = self.client_for_current().await?;
-        ensure_chrome_trace(&client, "Chrome page-load resource summary").await?;
         let evidence_table = client.query(&evidence_sql).await.map_err(|e| {
             format_chrome_tool_error("Chrome page-load resource summary evidence", e)
         })?;
@@ -991,19 +997,13 @@ impl PerfettoMcpServer {
     #[tool(
         name = "chrome_page_load_resource_pipeline",
         description = "Drill into one Chrome page-load resource URL and join its \
-                       lifecycle/request spans with script parse/evaluate and \
-                       style/layout signals. Use after \
-                       `chrome_page_load_resource_summary` by passing \
-                       `example_slice_id` or `url_substring` for a slow URL. \
-                       Returns timing facts, `matched_by`/`matched_url_seed`, \
-                       `last_resource_end_ms` for completed slices, \
-                       `last_observed_resource_overlap_end_ms` for complete or \
-                       incomplete in-window evidence, \
-                       `incomplete_duration_resource_slice_count` and an \
-                       evidence_boundary reminding callers not to label \
-                       DNS/TLS/TTFB/cache without phase-specific rows. \
-                       Parameters: `url_substring` or `example_slice_id` required; \
-                       optional page-load/window filters, `url_grouping`, `limit` \
+                       lifecycle/request spans with script/style/layout signals. Use \
+                       after `chrome_page_load_resource_summary` with \
+                       `example_slice_id` or `url_substring`. Returns timing facts, \
+                       match evidence, completed/observed resource ends, \
+                       resource/script machine-id sets, incomplete count, and an \
+                       evidence_boundary for DNS/TLS/TTFB/cache. Parameters: URL seed \
+                       required; optional window filters, `url_grouping`, `limit` \
                        default 30, `max_string_len`.",
         annotations(
             read_only_hint = true,
@@ -1036,6 +1036,10 @@ impl PerfettoMcpServer {
             params.max_string_len.is_some()
         ))
         .await;
+        let client = self.client_for_current().await?;
+        ensure_chrome_trace(&client, "Chrome page-load resource pipeline").await?;
+        let process_machine_id_available =
+            table_has_column(&client, "process", "machine_id").await?;
         let effective_limit = bounded_tool_limit(params.limit, 30)?;
         let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
@@ -1046,14 +1050,13 @@ impl PerfettoMcpServer {
                 start_ts_ns: params.start_ts_ns,
                 end_ts_ns: params.end_ts_ns,
             },
+            process_machine_id_available,
             url_substring: params.url_substring.as_deref(),
             example_slice_id: params.example_slice_id,
             url_grouping: params.url_grouping,
             limit: Some(probe_limit as u32),
         })
         .map_err(|e| e.to_string())?;
-        let client = self.client_for_current().await?;
-        ensure_chrome_trace(&client, "Chrome page-load resource pipeline").await?;
         let table = client
             .query(&sql)
             .await

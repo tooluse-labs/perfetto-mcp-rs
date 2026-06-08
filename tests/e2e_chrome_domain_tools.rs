@@ -230,6 +230,7 @@ fn e2e_chrome_resource_incomplete_duration_overlaps_raw_window() {
         let hotspots_sql =
             chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
                 window,
+                process_machine_id_available: false,
                 min_dur_ms: Some(0.0),
                 limit: Some(10),
             })
@@ -410,6 +411,7 @@ fn e2e_chrome_page_load_resource_summary_synthetic_ambiguous_window_against_fixt
                     end_ts_ns: Some(raw_end_ts),
                     ..Default::default()
                 },
+                process_machine_id_available: false,
                 min_overlap_ms: Some(0.0),
                 url_grouping: Some(ChromePageLoadResourceUrlGrouping::WithoutQuery),
                 limit: Some(5),

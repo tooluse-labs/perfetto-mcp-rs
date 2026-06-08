@@ -71,6 +71,7 @@ fn append_chrome_resource_candidates_cte(
     page_window: ChromePageLoadWindowSql,
     exprs: &ChromeResourceWindowExprs,
     min_dur_ns: i64,
+    process_machine_id_available: bool,
 ) {
     let pct_expr = match &exprs.window_dur_expr {
         Some(expr) => format!(
@@ -87,6 +88,11 @@ fn append_chrome_resource_candidates_cte(
     };
 
     let url_arg_priority_expr = chrome_url_arg_priority_expr("a");
+    let machine_id_expr = if process_machine_id_available {
+        "COALESCE(p_thread.machine_id, p_process.machine_id, p_parent_thread.machine_id, p_parent_process.machine_id)"
+    } else {
+        "NULL"
+    };
 
     sql.push_str(&format!(
         "resource_candidate_slices AS ( \
@@ -117,6 +123,7 @@ fn append_chrome_resource_candidates_cte(
                 AS upid, \
               COALESCE(p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid) \
                 AS pid, \
+              {machine_id_expr} AS machine_id, \
               COALESCE(t.name, parent_t.name) AS thread_name, \
              COALESCE( \
                MAX(CASE WHEN a.flat_key IN ('debug.priority', 'priority') \
@@ -184,20 +191,21 @@ fn append_chrome_resource_candidates_cte(
     if let (Some(start), Some(end)) = (&exprs.start_bound, &exprs.end_bound) {
         sql.push_str(&format!(" AND {end} > {start}"));
     }
-    sql.push_str(
+    sql.push_str(&format!(
         " GROUP BY \
              s.id, s.ts, s.dur, s.arg_set_id, s.name, \
              p_thread.name, p_process.name, p_parent_thread.name, p_parent_process.name, \
              p_thread.upid, p_process.upid, p_parent_thread.upid, p_parent_process.upid, \
              p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid, \
+             {machine_id_expr}, \
              t.name, parent_t.name \
          ), \
          resource_candidate_urls AS ( \
            SELECT \
              rcs.id, \
              a.display_value AS url, \
-             ",
-    );
+             "
+    ));
     sql.push_str(&url_arg_priority_expr);
     sql.push_str(
         " AS url_priority \
@@ -240,6 +248,7 @@ fn append_chrome_resource_candidates_cte(
              rcs.process_name, \
              rcs.upid, \
              rcs.pid, \
+             rcs.machine_id, \
              rcs.thread_name, \
              rcsu.url, \
              rcs.priority \
@@ -261,6 +270,7 @@ pub fn chrome_page_load_resource_hotspots_sql(
 ) -> Result<String, PerfettoError> {
     let ChromePageLoadResourceHotspotsFilters {
         window,
+        process_machine_id_available,
         min_dur_ms,
         limit,
     } = filters;
@@ -277,7 +287,13 @@ pub fn chrome_page_load_resource_hotspots_sql(
     }
 
     let exprs = chrome_resource_window_exprs(page_window);
-    append_chrome_resource_candidates_cte(&mut sql, page_window, &exprs, min_dur_ns);
+    append_chrome_resource_candidates_cte(
+        &mut sql,
+        page_window,
+        &exprs,
+        min_dur_ns,
+        process_machine_id_available,
+    );
     sql.push_str(
         " SELECT \
            id, \
@@ -292,6 +308,7 @@ pub fn chrome_page_load_resource_hotspots_sql(
            process_name, \
            upid, \
            pid, \
+           machine_id, \
            thread_name, \
            url \
          FROM resource_candidates ",
@@ -315,6 +332,7 @@ pub fn chrome_page_load_resource_summary_sql(
 ) -> Result<String, PerfettoError> {
     let ChromePageLoadResourceSummaryFilters {
         window,
+        process_machine_id_available,
         min_overlap_ms,
         url_grouping,
         limit,
@@ -332,7 +350,13 @@ pub fn chrome_page_load_resource_summary_sql(
     }
 
     let exprs = chrome_resource_window_exprs(page_window);
-    append_chrome_resource_candidates_cte(&mut sql, page_window, &exprs, 0);
+    append_chrome_resource_candidates_cte(
+        &mut sql,
+        page_window,
+        &exprs,
+        0,
+        process_machine_id_available,
+    );
 
     let url_key_expr = chrome_resource_url_key_expr("url", url_grouping);
     let nav_url_expr = if page_window.phase.is_some() {
@@ -519,6 +543,7 @@ pub fn chrome_page_load_resource_summary_sql(
              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS primary_slice_name, \
             GROUP_CONCAT(DISTINCT rr.process_name) AS process_names, \
             GROUP_CONCAT(DISTINCT rr.upid) AS upids, \
+            GROUP_CONCAT(DISTINCT rr.machine_id) AS machine_ids, \
             GROUP_CONCAT(DISTINCT rr.priority) AS priorities, \
             ROUND(MIN(rr.overlap_start_ms), 3) AS first_start_ms, \
             ROUND(MAX(rr.overlap_end_ms), 3) AS last_end_ms, \
@@ -554,6 +579,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
 ) -> Result<String, PerfettoError> {
     let ChromePageLoadResourcePipelineFilters {
         window,
+        process_machine_id_available,
         url_substring,
         example_slice_id,
         url_grouping,
@@ -590,7 +616,13 @@ pub fn chrome_page_load_resource_pipeline_sql(
     }
 
     let exprs = chrome_resource_window_exprs(page_window);
-    append_chrome_resource_candidates_cte(&mut sql, page_window, &exprs, 0);
+    append_chrome_resource_candidates_cte(
+        &mut sql,
+        page_window,
+        &exprs,
+        0,
+        process_machine_id_available,
+    );
 
     let url_key_expr = chrome_resource_url_key_expr("url", url_grouping);
     let rc_url_key_expr = chrome_resource_url_key_expr("rc.url", url_grouping);
@@ -605,6 +637,11 @@ pub fn chrome_page_load_resource_pipeline_sql(
     let example_url_arg_priority_expr = chrome_url_arg_priority_expr("a");
     let example_key_match = format!("{rc_url_key_expr} = {eu_example_url_key_expr}");
     let script_url_arg_priority_expr = chrome_url_arg_priority_expr("a");
+    let script_machine_id_expr = if process_machine_id_available {
+        "p.machine_id"
+    } else {
+        "NULL"
+    };
     let script_start_bound = exprs.start_bound.as_deref();
     let script_end_bound = exprs.end_bound.as_deref();
     let script_anchor_expr = &exprs.anchor_expr;
@@ -695,6 +732,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
               p.name AS process_name, \
               p.upid AS upid, \
               p.pid AS pid, \
+              {script_machine_id_expr} AS machine_id, \
               t.name AS thread_name, \
               MAX(CASE WHEN a.flat_key = 'debug.size' THEN a.int_value END) AS size_bytes \
             FROM slice s \
@@ -734,7 +772,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
         sql.push_str(&format!(" AND {end} > {start}"));
     }
     sql.push_str(&format!(
-        " GROUP BY s.id, s.ts, s.dur, s.arg_set_id, s.thread_dur, s.name, p.name, p.upid, p.pid, t.name \
+        " GROUP BY s.id, s.ts, s.dur, s.arg_set_id, s.thread_dur, s.name, p.name, p.upid, p.pid, {script_machine_id_expr}, t.name \
          ), \
          raw_script_url_args AS ( \
            SELECT \
@@ -775,6 +813,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
              rss.process_name, \
              rss.upid, \
              rss.pid, \
+             rss.machine_id, \
              rss.thread_name, \
              rssu.url, \
              rss.size_bytes \
@@ -865,8 +904,9 @@ pub fn chrome_page_load_resource_pipeline_sql(
                          ELSE 2 END, \
                         r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS matched_url_seed, \
               COUNT(*) AS resource_slice_count, \
-             SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END) \
-               AS incomplete_duration_resource_slice_count, \
+              SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END) \
+                AS incomplete_duration_resource_slice_count, \
+             GROUP_CONCAT(DISTINCT rr.machine_id) AS resource_machine_ids, \
              ROUND(MIN(rr.start_ms), 3) AS first_resource_start_ms, \
              ROUND(MAX(rr.end_ms), 3) AS last_resource_end_ms, \
              ROUND(MAX(rr.overlap_end_ms), 3) AS last_observed_resource_overlap_end_ms, \
@@ -893,6 +933,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
            SELECT \
              {ss_url_key_expr} AS url_key, \
              COUNT(*) AS script_slice_count, \
+             GROUP_CONCAT(DISTINCT ss.machine_id) AS script_machine_ids, \
              ROUND(SUM(CASE WHEN ss.name GLOB '*parseOnBackground*' \
                OR ss.name GLOB '*RunScriptStreamingTask*' THEN ss.overlap_dur ELSE 0 END) / 1e6, 3) \
                AS background_parse_ms, \
@@ -923,6 +964,8 @@ pub fn chrome_page_load_resource_pipeline_sql(
            rr.matched_url_seed, \
            rr.resource_slice_count, \
            COALESCE(sr.script_slice_count, 0) AS script_slice_count, \
+           rr.resource_machine_ids, \
+           sr.script_machine_ids, \
            rr.first_resource_start_ms, \
            rr.last_resource_end_ms, \
            rr.last_observed_resource_overlap_end_ms, \

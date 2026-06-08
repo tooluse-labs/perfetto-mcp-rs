@@ -664,6 +664,8 @@ pub struct ChromePageLoadWindowFilters {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ChromePageLoadResourceHotspotsFilters {
     pub window: ChromePageLoadWindowFilters,
+    /// True when `process.machine_id` exists in the loaded trace schema.
+    pub process_machine_id_available: bool,
     /// Optional override of the default 50 ms threshold (ms; must be finite
     /// non-negative, finite when multiplied to ns).
     pub min_dur_ms: Option<f64>,
@@ -676,6 +678,8 @@ pub struct ChromePageLoadResourceHotspotsFilters {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ChromePageLoadResourceSummaryFilters {
     pub window: ChromePageLoadWindowFilters,
+    /// True when `process.machine_id` exists in the loaded trace schema.
+    pub process_machine_id_available: bool,
     /// Optional override of the default 50 ms per-URL max-overlap threshold.
     pub min_overlap_ms: Option<f64>,
     /// Optional URL grouping strategy. Defaults to full URL.
@@ -689,6 +693,8 @@ pub struct ChromePageLoadResourceSummaryFilters {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ChromePageLoadResourcePipelineFilters<'a> {
     pub window: ChromePageLoadWindowFilters,
+    /// True when `process.machine_id` exists in the loaded trace schema.
+    pub process_machine_id_available: bool,
     /// URL substring matched with SQL INSTR, not LIKE.
     pub url_substring: Option<&'a str>,
     /// Example slice id whose URL should seed the drilldown.

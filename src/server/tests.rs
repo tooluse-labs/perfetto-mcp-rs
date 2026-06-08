@@ -3576,12 +3576,46 @@ fn chrome_page_load_resource_hotspots_sql_defaults_to_resource_slice_scan() {
         "resource SQL must expose nullable thread context for async/process tracks, got: {sql}",
     );
     assert!(
+        sql.contains("NULL AS machine_id"),
+        "old process schemas must keep the output shape without referencing process.machine_id, got: {sql}",
+    );
+    assert!(
+        !sql.contains("p_thread.machine_id") && !sql.contains("p_process.machine_id"),
+        "default resource SQL must not reference process.machine_id unless the schema probe found it, got: {sql}",
+    );
+    assert!(
         sql.contains("JOIN resource_candidate_selected_urls rcsu ON rcsu.id = rcs.id"),
         "resource tool must suppress URL-less wrapper rows through URL-priority joins, got: {sql}",
     );
     assert!(
         sql.contains("ORDER BY overlap_ms DESC, dur_ms DESC, start_ms ASC LIMIT 100"),
         "default resource limit/order must be stable, got: {sql}",
+    );
+}
+
+#[test]
+fn chrome_page_load_resource_hotspots_sql_exposes_machine_id_when_available() {
+    let sql = chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
+        process_machine_id_available: true,
+        ..Default::default()
+    })
+    .expect("resource builder must succeed with process.machine_id available");
+    let compact = compact_sql(&sql);
+    assert!(
+        sql.contains(
+            "COALESCE(p_thread.machine_id, p_process.machine_id, p_parent_thread.machine_id, p_parent_process.machine_id) AS machine_id"
+        ),
+        "machine_id-capable resource SQL must expose process.machine_id evidence, got: {sql}",
+    );
+    assert!(
+        compact.contains(
+            "p_thread.pid, p_process.pid, p_parent_thread.pid, p_parent_process.pid, COALESCE(p_thread.machine_id"
+        ),
+        "resource candidate grouping must include machine_id to avoid cross-machine pid merges, got: {sql}",
+    );
+    assert!(
+        compact.contains("pid, machine_id, thread_name"),
+        "resource hotspots final rows must include machine_id, got: {sql}",
     );
 }
 
@@ -3620,6 +3654,7 @@ fn chrome_page_load_resource_hotspots_sql_with_page_load_window_uses_overlap() {
             phase: Some(ChromePageLoadPhase::DclToFcp),
             ..Default::default()
         },
+        process_machine_id_available: false,
         min_dur_ms: Some(0.0),
         limit: Some(25),
     })
@@ -3798,6 +3833,10 @@ fn chrome_page_load_resource_summary_sql_groups_by_url() {
         "summary must expose resource priorities when present, got: {sql}",
     );
     assert!(
+        sql.contains("GROUP_CONCAT(DISTINCT rr.machine_id) AS machine_ids"),
+        "summary must expose machine_id evidence for multi-machine traces, got: {sql}",
+    );
+    assert!(
         sql.contains("ORDER BY MAX(rr.overlap_dur) DESC"),
         "summary must rank by max overlap instead of summed overlap, got: {sql}",
     );
@@ -3821,6 +3860,7 @@ fn chrome_page_load_resource_summary_sql_can_group_without_query() {
             end_ts_ns: Some(2000),
             ..Default::default()
         },
+        process_machine_id_available: false,
         min_overlap_ms: Some(0.0),
         url_grouping: Some(ChromePageLoadResourceUrlGrouping::WithoutQuery),
         limit: Some(25),
@@ -3959,6 +3999,7 @@ fn chrome_page_load_resource_pipeline_sql_builds_url_drilldown() {
         url_substring: Some("main.js"),
         example_slice_id: Some(54333),
         url_grouping: Some(ChromePageLoadResourceUrlGrouping::WithoutQuery),
+        process_machine_id_available: false,
         limit: None,
     })
     .expect("pipeline SQL builder must succeed");
@@ -3973,6 +4014,14 @@ fn chrome_page_load_resource_pipeline_sql_builds_url_drilldown() {
     assert!(
         sql.contains("matched_by") && sql.contains("matched_url_seed"),
         "pipeline must expose URL seed/match evidence, got: {sql}",
+    );
+    assert!(
+        sql.contains("NULL AS machine_id"),
+        "old process schemas must keep the pipeline output shape without referencing process.machine_id, got: {sql}",
+    );
+    assert!(
+        !sql.contains("p.machine_id") && !sql.contains("p_thread.machine_id"),
+        "default pipeline SQL must not reference process.machine_id unless the schema probe found it, got: {sql}",
     );
     assert!(
         sql.contains("example_url_args")
@@ -4028,8 +4077,42 @@ fn chrome_page_load_resource_pipeline_sql_builds_url_drilldown() {
         "pipeline must carry attribution boundary text, got: {sql}",
     );
     assert!(
+        sql.contains("rr.resource_machine_ids") && sql.contains("sr.script_machine_ids"),
+        "pipeline final rows must expose resource/script machine_id sets, got: {sql}",
+    );
+    assert!(
         sql.contains("LIMIT 30"),
         "default pipeline limit should be compact, got: {sql}",
+    );
+}
+
+#[test]
+fn chrome_page_load_resource_pipeline_sql_exposes_machine_ids_when_available() {
+    let sql = chrome_page_load_resource_pipeline_sql(ChromePageLoadResourcePipelineFilters {
+        url_substring: Some("main.js"),
+        process_machine_id_available: true,
+        ..Default::default()
+    })
+    .expect("pipeline SQL builder must succeed with process.machine_id available");
+    let compact = compact_sql(&sql);
+    assert!(
+        sql.contains(
+            "COALESCE(p_thread.machine_id, p_process.machine_id, p_parent_thread.machine_id, p_parent_process.machine_id) AS machine_id"
+        ),
+        "pipeline resource candidates must expose process.machine_id evidence, got: {sql}",
+    );
+    assert!(
+        sql.contains("p.machine_id AS machine_id"),
+        "pipeline script candidates must expose process.machine_id evidence, got: {sql}",
+    );
+    assert!(
+        compact.contains("GROUP BY s.id, s.ts, s.dur, s.arg_set_id, s.thread_dur, s.name, p.name, p.upid, p.pid, p.machine_id, t.name"),
+        "pipeline script grouping must include machine_id to avoid cross-machine pid merges, got: {sql}",
+    );
+    assert!(
+        sql.contains("GROUP_CONCAT(DISTINCT rr.machine_id) AS resource_machine_ids")
+            && sql.contains("GROUP_CONCAT(DISTINCT ss.machine_id) AS script_machine_ids"),
+        "pipeline rollups must expose machine_id sets, got: {sql}",
     );
 }
 
