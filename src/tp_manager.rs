@@ -135,7 +135,19 @@ pub(crate) fn trace_file_platform_fingerprint(metadata: &std::fs::Metadata) -> O
         ))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some(format!(
+            "windows:{}:{}:{}:{}",
+            metadata.file_attributes(),
+            metadata.creation_time(),
+            metadata.last_write_time(),
+            metadata.file_size()
+        ))
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = metadata;
         None
@@ -1923,6 +1935,21 @@ mod tests {
         assert!(
             err.to_string().contains("changed while fingerprinting"),
             "error should explain retryable trace write race, got: {err}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_platform_fingerprint_uses_unix_identity_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let trace = tmp.path().join("identity.perfetto-trace");
+        std::fs::write(&trace, b"trace").expect("write trace content");
+        let metadata = std::fs::metadata(&trace).expect("trace metadata");
+        let platform = trace_file_platform_fingerprint(&metadata).expect("unix fingerprint");
+
+        assert!(
+            platform.starts_with("unix:"),
+            "unix platform fingerprint should include dev/inode metadata, got: {platform}",
         );
     }
 
