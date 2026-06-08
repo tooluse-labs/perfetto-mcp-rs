@@ -164,6 +164,7 @@ Server settings are read at startup; when both a CLI flag and environment variab
 | `--span-timings` / `PERFETTO_MCP_SPAN_TIMINGS` | off | Emit tracing span-close timings for performance hotspot diagnosis (`1` / `true` / `yes` / `on`) |
 | `--artifacts-base-url` / `PERFETTO_ARTIFACTS_BASE_URL` | LUCI bucket | Override the `trace_processor_shell` download source on a cache miss (mirror/proxy; same pinned version) |
 | `PERFETTO_MCP_REDACT_STRINGS_DEFAULT` | `true` | Mask sensitive URL/header/cookie/path strings in tool output; set `false` for raw forensic work |
+| `PERFETTO_MCP_FULL_TRACE_FINGERPRINT` | off | Use full-file SHA-256 for trace cache identity instead of head/middle/tail sampling (`1` / `true` / `yes` / `on`) |
 | `RUST_LOG` | — | `tracing-subscriber` filter, e.g. `RUST_LOG=debug` for verbose logs (written to stderr) |
 
 ## Install options

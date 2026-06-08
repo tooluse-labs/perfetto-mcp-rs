@@ -23,6 +23,7 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const STATUS_FALLBACK_DELAY: Duration = Duration::from_millis(500);
 const STATUS_FALLBACK_STABILITY: Duration = Duration::from_millis(300);
 const TRACE_FINGERPRINT_SAMPLE_BYTES: u64 = 64 * 1024;
+const TRACE_FINGERPRINT_FULL_HASH_ENV: &str = "PERFETTO_MCP_FULL_TRACE_FINGERPRINT";
 
 type SharedStderrTail = Arc<StdMutex<std::collections::VecDeque<String>>>;
 
@@ -87,7 +88,7 @@ struct TraceFileMetadataSnapshot {
 impl TraceFileFingerprint {
     fn from_path(path: &Path) -> Result<Self> {
         let before = trace_file_metadata_snapshot(path)?;
-        let sample_sha256 = trace_file_sample_sha256(path, before.size_bytes)?;
+        let sample_sha256 = trace_file_content_sha256(path, before.size_bytes)?;
         ensure_trace_file_metadata_stable(path, &before)?;
         Ok(Self {
             size_bytes: before.size_bytes,
@@ -96,6 +97,25 @@ impl TraceFileFingerprint {
             sample_sha256,
         })
     }
+}
+
+fn trace_file_content_sha256(path: &Path, size_bytes: u64) -> Result<String> {
+    if trace_file_full_hash_enabled() {
+        trace_file_full_sha256(path)
+    } else {
+        trace_file_sample_sha256(path, size_bytes)
+    }
+}
+
+fn trace_file_full_hash_enabled() -> bool {
+    std::env::var(TRACE_FINGERPRINT_FULL_HASH_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn trace_file_metadata_snapshot(path: &Path) -> Result<TraceFileMetadataSnapshot> {
@@ -120,6 +140,27 @@ fn ensure_trace_file_metadata_stable(
         );
     }
     Ok(())
+}
+
+pub(crate) fn trace_file_full_sha256(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open trace file for full fingerprint: {}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0_u8; TRACE_FINGERPRINT_SAMPLE_BYTES as usize];
+    loop {
+        let read = file.read(&mut buf).with_context(|| {
+            format!("failed to read trace full fingerprint: {}", path.display())
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub(crate) fn trace_file_platform_fingerprint(metadata: &std::fs::Metadata) -> Option<String> {
@@ -1974,6 +2015,36 @@ mod tests {
         assert_ne!(
             first, second,
             "large same-size middle-only changes must alter the trace fingerprint sample",
+        );
+    }
+
+    #[test]
+    fn trace_file_full_hash_detects_unsampled_large_file_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let trace = tmp.path().join("large-unsampled-change.perfetto-trace");
+        let size = (TRACE_FINGERPRINT_SAMPLE_BYTES * 4) as usize;
+        let unsampled_offset = TRACE_FINGERPRINT_SAMPLE_BYTES as usize + 1024;
+        let mut first_content = vec![b'a'; size];
+        first_content[unsampled_offset] = b'x';
+        std::fs::write(&trace, &first_content).expect("write first large content");
+        let sampled_first = trace_file_sample_sha256(&trace, size as u64)
+            .expect("sample-hash first large trace content");
+        let full_first = trace_file_full_sha256(&trace).expect("full-hash first large trace");
+
+        let mut second_content = first_content;
+        second_content[unsampled_offset] = b'y';
+        std::fs::write(&trace, &second_content).expect("write second large content");
+        let sampled_second = trace_file_sample_sha256(&trace, size as u64)
+            .expect("sample-hash second large trace content");
+        let full_second = trace_file_full_sha256(&trace).expect("full-hash second large trace");
+
+        assert_eq!(
+            sampled_first, sampled_second,
+            "test setup should change only bytes outside the default sample windows",
+        );
+        assert_ne!(
+            full_first, full_second,
+            "strict full-file fingerprint must catch unsampled same-size changes",
         );
     }
 

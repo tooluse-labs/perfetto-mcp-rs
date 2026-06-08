@@ -156,6 +156,7 @@ ORDER BY n DESC;
 | `--span-timings` / `PERFETTO_MCP_SPAN_TIMINGS` | 关 | 输出 tracing span close 计时，用于性能热点诊断（`1` / `true` / `yes` / `on`） |
 | `--artifacts-base-url` / `PERFETTO_ARTIFACTS_BASE_URL` | LUCI bucket | 缓存未命中时覆盖 `trace_processor_shell` 的下载源（镜像/代理；版本仍为固定 pin） |
 | `PERFETTO_MCP_REDACT_STRINGS_DEFAULT` | `true` | 遮蔽 tool 输出里 URL/header/cookie/路径的敏感字符串；设 `false` 走原始取证 |
+| `PERFETTO_MCP_FULL_TRACE_FINGERPRINT` | 关 | trace 缓存身份使用全文件 SHA-256，而非 head/middle/tail 采样（`1` / `true` / `yes` / `on`） |
 | `RUST_LOG` | — | `tracing-subscriber` 日志过滤，例如 `RUST_LOG=debug`（写到 stderr） |
 
 ## 安装选项
