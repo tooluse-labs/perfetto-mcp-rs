@@ -926,6 +926,9 @@ impl PerfettoMcpServer {
                        `chrome_page_load_resource_summary` by passing \
                        `example_slice_id` or `url_substring` for a slow URL. \
                        Returns timing facts, `matched_by`/`matched_url_seed`, \
+                       `last_resource_end_ms` for completed slices, \
+                       `last_observed_resource_overlap_end_ms` for complete or \
+                       incomplete in-window evidence, \
                        `incomplete_duration_resource_slice_count` and an \
                        evidence_boundary reminding callers not to label \
                        DNS/TLS/TTFB/cache without phase-specific rows. \

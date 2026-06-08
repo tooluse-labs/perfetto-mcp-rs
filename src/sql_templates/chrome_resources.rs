@@ -801,6 +801,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
                AS incomplete_duration_resource_slice_count, \
              ROUND(MIN(rr.start_ms), 3) AS first_resource_start_ms, \
              ROUND(MAX(rr.end_ms), 3) AS last_resource_end_ms, \
+             ROUND(MAX(rr.overlap_end_ms), 3) AS last_observed_resource_overlap_end_ms, \
              ROUND(MAX(rr.overlap_dur) / 1e6, 3) AS max_request_overlap_ms, \
              ROUND(MAX(CASE WHEN rr.name IN ( \
                'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
@@ -856,6 +857,7 @@ pub fn chrome_page_load_resource_pipeline_sql(
            COALESCE(sr.script_slice_count, 0) AS script_slice_count, \
            rr.first_resource_start_ms, \
            rr.last_resource_end_ms, \
+           rr.last_observed_resource_overlap_end_ms, \
            rr.max_request_overlap_ms, \
            rr.request_span_ms, \
            rr.resource_create_ms, \
@@ -1149,9 +1151,7 @@ pub fn chrome_page_load_resource_timing_evidence_sql(
            )",
     );
     if let Some(bound) = &exprs.start_bound {
-        sql.push_str(&format!(
-            " AND ((s.dur >= 0 AND s.ts + s.dur > {bound}) OR (s.dur < 0 AND s.ts >= {bound}))"
-        ));
+        sql.push_str(&format!(" AND {} > {bound}", exprs.overlap_end_expr));
     }
     if let Some(bound) = &exprs.end_bound {
         sql.push_str(&format!(" AND s.ts < {bound}"));

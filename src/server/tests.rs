@@ -3702,6 +3702,14 @@ fn chrome_page_load_resource_pipeline_sql_builds_url_drilldown() {
         "pipeline must expose request span evidence, got: {sql}",
     );
     assert!(
+        sql.contains("ROUND(MAX(rr.end_ms), 3) AS last_resource_end_ms")
+            && sql.contains(
+                "ROUND(MAX(rr.overlap_end_ms), 3) AS last_observed_resource_overlap_end_ms"
+            )
+            && sql.contains("rr.last_observed_resource_overlap_end_ms"),
+        "pipeline must distinguish completed resource end from observed overlap end, got: {sql}",
+    );
+    assert!(
         sql.contains(
             "SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END)"
         ),
@@ -3809,6 +3817,7 @@ fn chrome_page_load_resource_timing_evidence_sql_probes_phase_and_incomplete_sig
         ..Default::default()
     })
     .expect("resource timing evidence SQL builder must succeed");
+    let compact = compact_sql(&sql);
 
     assert!(
         sql.contains("resource_timing_probe AS"),
@@ -3833,6 +3842,16 @@ fn chrome_page_load_resource_timing_evidence_sql_probes_phase_and_incomplete_sig
     assert!(
         sql.contains("MIN(rw.end_ts, 2000)"),
         "raw end bound must AND with page-load phase window, got: {sql}",
+    );
+    assert!(
+        compact.contains(
+            "CASE WHEN s.dur >= 0 THEN MIN(s.ts + s.dur, MIN(rw.end_ts, 2000)) ELSE MIN(rw.end_ts, 2000) END > MAX(rw.start_ts, 1000)"
+        ),
+        "probe must use observed overlap semantics so in-flight slices started before the window still count, got: {sql}",
+    );
+    assert!(
+        !compact.contains("s.dur < 0 AND s.ts >= MAX(rw.start_ts, 1000)"),
+        "probe must not use the old incomplete-only start-ts filter, got: {sql}",
     );
     assert!(
         sql.contains("phase_breakdown_available"),
