@@ -1069,13 +1069,14 @@ impl PerfettoMcpServer {
     #[tool(
         name = "chrome_page_load_script_hotspots",
         description = "Rank renderer main-thread script groups in a Chrome \
-                       page-load/raw window: URL/name/process/thread, wall/CPU totals, \
-                       style/layout ms, example_slice_id. Read-only.\n\
+                       page-load/raw window: URL/name/process/thread/machine_id, \
+                       wall/CPU totals, style/layout ms, example_slice_id. Read-only.\n\
                        \n\
                        Use when: slow FCP/load needs post-resource JS attribution; expand \
                        `example_slice_id` with `slice_descendants_breakdown`.\n\
                        \n\
-                       Parameters: optional process filters, page-load/window filters shared \
+                       Parameters: optional process filters (`process_name`/`pid`/\
+                       `machine_id`/`upid`), page-load/window filters shared \
                        with `chrome_main_thread_hotspots`, `min_total_ms` (default 20), \
                        `limit`, `max_string_len`. Empty result: no matching script groups.",
         annotations(
@@ -1097,7 +1098,10 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span(format!(
             "process_filter_set={},window_set={},min_total_ms_set={},limit_set={},max_string_len_set={}",
-            params.process_name.is_some() || params.pid.is_some() || params.upid.is_some(),
+            params.process_name.is_some()
+                || params.pid.is_some()
+                || params.machine_id.is_some()
+                || params.upid.is_some(),
             params.page_load_id.is_some()
                 || params.navigation_id.is_some()
                 || params.phase.is_some()
@@ -1110,11 +1114,15 @@ impl PerfettoMcpServer {
         .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome page-load script hotspots").await?;
+        let process_machine_id_available =
+            table_has_column(&client, "process", "machine_id").await?;
         let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
         let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
             process_name: params.process_name.as_deref(),
             pid: params.pid,
+            machine_id: params.machine_id,
+            process_machine_id_available,
             upid: params.upid,
             window: ChromePageLoadWindowFilters {
                 page_load_id: params.page_load_id,
@@ -1149,26 +1157,24 @@ impl PerfettoMcpServer {
         name = "chrome_main_thread_hotspots",
         description = "Top Chrome main-thread tasks by wall duration: id, ts, \
                        name, task_type, thread_name, process_name, upid, pid, \
-                       dur_ms, overlap_dur_ms, cpu_pct/thread_dur_ms (full-task), \
+                       nullable machine_id, dur_ms, overlap_dur_ms, \
+                       cpu_pct/thread_dur_ms (full-task), \
                        overlap_cpu_pct/overlap_thread_dur_ms (window estimates). \
-                       Uses `chrome.tasks`, \
-                       `thread.is_main_thread = 1` when available, and Chrome's \
-                       `Cr*Main` thread-name convention as a fallback for traces \
-                       where thread metadata is incomplete or incorrect. Pass a returned \
+                       Uses `chrome.tasks`, `thread.is_main_thread = 1`, and \
+                       Chrome's `Cr*Main` fallback. Pass a returned \
                        `id` to `slice_descendants_breakdown` for child-slice breakdowns.\n\
                        \n\
-                       Use when: investigating main-thread responsiveness, finding hot \
-                       tasks during scroll/load, comparing CPU vs wall time, scoping \
-                       to one renderer in multi-renderer traces.\n\
+                       Use when: investigating responsiveness, scroll/load stalls, \
+                       CPU vs wall time, or one renderer.\n\
                        \n\
                        Don't use for: non-Chrome traces (will error). For background \
                        (non-main) thread tasks, drop to `execute_sql` against \
                        `chrome.tasks` directly.\n\
                        \n\
                        Parameters (all optional):\n\
-                       - `process_name` / `pid` / `upid`: scope to one process or \
-                         type. Prefer `upid` for multi-renderer traces; all filters \
-                         AND together.\n\
+                       - `process_name` / `pid` / `machine_id` / `upid`: scope to \
+                         one process/type. Prefer `upid`; add `machine_id` to \
+                         disambiguate multi-machine `pid`s. All filters AND.\n\
                        - `page_load_id` / `navigation_id` / `phase`: scope to a \
                          page-load window. IDs match `chrome_page_loads.id` and \
                          `.navigation_id` respectively and are mutually exclusive. \
@@ -1214,7 +1220,10 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span(format!(
             "process_filter_set={},window_set={},min_dur_ms_set={},limit_set={},max_string_len_set={}",
-            params.process_name.is_some() || params.pid.is_some() || params.upid.is_some(),
+            params.process_name.is_some()
+                || params.pid.is_some()
+                || params.machine_id.is_some()
+                || params.upid.is_some(),
             params.page_load_id.is_some()
                 || params.navigation_id.is_some()
                 || params.phase.is_some()
@@ -1227,11 +1236,15 @@ impl PerfettoMcpServer {
         .await;
         let client = self.client_for_current().await?;
         ensure_chrome_trace(&client, "Chrome main-thread hotspots").await?;
+        let process_machine_id_available =
+            table_has_column(&client, "process", "machine_id").await?;
         let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
         let probe_limit = extra_row_probe_limit(effective_limit);
         let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
             process_name: params.process_name.as_deref(),
             pid: params.pid,
+            machine_id: params.machine_id,
+            process_machine_id_available,
             upid: params.upid,
             page_load_id: params.page_load_id,
             navigation_id: params.navigation_id,

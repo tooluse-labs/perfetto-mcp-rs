@@ -2296,6 +2296,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
             .chrome_page_load_script_hotspots(Parameters(ChromePageLoadScriptHotspotsParams {
                 process_name: None,
                 pid: None,
+                machine_id: None,
                 upid: None,
                 page_load_id: None,
                 navigation_id: None,
@@ -2321,6 +2322,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
             .chrome_main_thread_hotspots(Parameters(ChromeMainThreadHotspotsParams {
                 process_name: None,
                 pid: None,
+                machine_id: None,
                 upid: None,
                 page_load_id: None,
                 navigation_id: None,
@@ -2514,10 +2516,11 @@ fn schema_discovery_tools_warn_against_execute_sql_misuse() {
 #[test]
 fn chrome_main_thread_hotspots_params_accepts_stringified_numerics() {
     let p: ChromeMainThreadHotspotsParams = serde_json::from_str(
-            r#"{"pid": "12800", "page_load_id": "1", "start_ts_ns": "100", "end_ts_ns": "200", "min_dur_ms": "50", "limit": "30", "max_string_len": "260"}"#,
+            r#"{"pid": "12800", "machine_id": "3", "page_load_id": "1", "start_ts_ns": "100", "end_ts_ns": "200", "min_dur_ms": "50", "limit": "30", "max_string_len": "260"}"#,
         )
         .expect("stringified numerics must deserialize after v0.11.3");
     assert_eq!(p.pid, Some(12800));
+    assert_eq!(p.machine_id, Some(3));
     assert_eq!(p.page_load_id, Some(1));
     assert_eq!(p.start_ts_ns, Some(100));
     assert_eq!(p.end_ts_ns, Some(200));
@@ -2580,10 +2583,11 @@ fn chrome_page_load_resource_pipeline_params_accepts_stringified_numerics() {
 #[test]
 fn chrome_page_load_script_hotspots_params_accepts_stringified_numerics() {
     let p: ChromePageLoadScriptHotspotsParams = serde_json::from_str(
-            r#"{"upid": "14", "navigation_id": "7", "start_ts_ns": "100", "end_ts_ns": "200", "min_total_ms": "20", "limit": "30", "max_string_len": "260"}"#,
+            r#"{"upid": "14", "machine_id": "3", "navigation_id": "7", "start_ts_ns": "100", "end_ts_ns": "200", "min_total_ms": "20", "limit": "30", "max_string_len": "260"}"#,
         )
         .expect("stringified numerics must deserialize");
     assert_eq!(p.upid, Some(14));
+    assert_eq!(p.machine_id, Some(3));
     assert_eq!(p.navigation_id, Some(7));
     assert_eq!(p.start_ts_ns, Some(100));
     assert_eq!(p.end_ts_ns, Some(200));
@@ -2946,6 +2950,14 @@ fn chrome_main_thread_hotspots_sql_no_filter_runs_all_main_threads() {
     assert!(sql.contains("ct.ts"));
     assert!(sql.contains("ct.upid"));
     assert!(sql.contains("p.pid"));
+    assert!(
+        sql.contains("NULL AS machine_id"),
+        "old process schemas must keep the output shape without referencing p.machine_id, got: {sql}",
+    );
+    assert!(
+        !sql.contains("p.machine_id"),
+        "default SQL must not reference process.machine_id unless the schema probe found it, got: {sql}",
+    );
     assert!(sql.contains("LEFT JOIN thread t ON ct.utid = t.utid"));
     assert!(sql.contains("LEFT JOIN process p ON ct.upid = p.upid"));
     assert!(sql.contains("WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main')"));
@@ -3015,6 +3027,35 @@ fn chrome_main_thread_hotspots_sql_with_pid_emits_filter() {
         !sql.contains("p.upid ="),
         "pid-only filter must not emit upid clause, got: {sql}",
     );
+}
+
+#[test]
+fn chrome_main_thread_hotspots_sql_with_machine_id_emits_filter_when_available() {
+    let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+        pid: Some(12800),
+        machine_id: Some(7),
+        process_machine_id_available: true,
+        ..Default::default()
+    })
+    .expect("machine_id-filter builder must succeed when process.machine_id exists");
+    assert!(
+        sql.contains("p.machine_id AS machine_id"),
+        "machine_id-capable traces must expose process.machine_id, got: {sql}",
+    );
+    assert!(sql.contains("AND p.pid = 12800"), "got: {sql}");
+    assert!(sql.contains("AND p.machine_id = 7"), "got: {sql}");
+}
+
+#[test]
+fn chrome_main_thread_hotspots_sql_rejects_machine_id_when_unavailable() {
+    let err = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
+        machine_id: Some(7),
+        process_machine_id_available: false,
+        ..Default::default()
+    })
+    .expect_err("machine_id filter must reject when process.machine_id is absent");
+    assert!(err.to_string().contains("machine_id"), "got: {err}");
+    assert!(err.to_string().contains("process.machine_id"), "got: {err}");
 }
 
 /// upid is the trace-internal unique pid — precise even when the OS
@@ -4009,6 +4050,14 @@ fn chrome_page_load_script_hotspots_sql_defaults_to_grouped_script_scan() {
         "script SQL must scope to renderer main-thread-style work, got: {sql}",
     );
     assert!(
+        sql.contains("NULL AS machine_id"),
+        "old process schemas must keep the output shape without referencing p.machine_id, got: {sql}",
+    );
+    assert!(
+        !sql.contains("p.machine_id"),
+        "default script SQL must not reference process.machine_id unless the schema probe found it, got: {sql}",
+    );
+    assert!(
         sql.contains("'EvaluateScript', 'v8.run', 'FunctionCall'"),
         "script SQL must match canonical JS execution slices, got: {sql}",
     );
@@ -4156,6 +4205,48 @@ fn chrome_page_load_script_hotspots_sql_with_window_and_process_filters() {
         sql.contains("LIMIT 25"),
         "limit must be honored, got: {sql}"
     );
+}
+
+#[test]
+fn chrome_page_load_script_hotspots_sql_with_machine_id_groups_and_filters_when_available() {
+    let sql = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
+        pid: Some(12800),
+        machine_id: Some(7),
+        process_machine_id_available: true,
+        ..Default::default()
+    })
+    .expect("script machine_id filter must succeed when process.machine_id exists");
+    let compact = compact_sql(&sql);
+    assert!(
+        sql.contains("p.machine_id AS machine_id"),
+        "machine_id-capable traces must expose process.machine_id, got: {sql}",
+    );
+    assert!(sql.contains("AND p.pid = 12800"), "got: {sql}");
+    assert!(sql.contains("AND p.machine_id = 7"), "got: {sql}");
+    assert!(
+        compact.contains("p.name, p.upid, p.pid, p.machine_id, t.name"),
+        "script_slices must group by process.machine_id to avoid cross-machine pid merges, got: {sql}",
+    );
+    assert!(
+        compact.contains("AND s2.machine_id IS ss.machine_id"),
+        "example_slice_id tie-breaker must stay within the same machine_id group, got: {sql}",
+    );
+    assert!(
+        compact.contains("GROUP BY ss.url, ss.name, ss.process_name, ss.upid, ss.pid, ss.machine_id, ss.thread_name"),
+        "final script groups must include machine_id, got: {sql}",
+    );
+}
+
+#[test]
+fn chrome_page_load_script_hotspots_sql_rejects_machine_id_when_unavailable() {
+    let err = chrome_page_load_script_hotspots_sql(ChromePageLoadScriptHotspotsFilters {
+        machine_id: Some(7),
+        process_machine_id_available: false,
+        ..Default::default()
+    })
+    .expect_err("machine_id filter must reject when process.machine_id is absent");
+    assert!(err.to_string().contains("machine_id"), "got: {err}");
+    assert!(err.to_string().contains("process.machine_id"), "got: {err}");
 }
 
 #[test]

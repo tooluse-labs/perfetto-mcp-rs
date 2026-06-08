@@ -19,14 +19,26 @@ pub fn chrome_page_load_script_hotspots_sql(
     let ChromePageLoadScriptHotspotsFilters {
         process_name,
         pid,
+        machine_id,
+        process_machine_id_available,
         upid,
         window,
         min_total_ms,
         limit,
     } = filters;
+    if machine_id.is_some() && !process_machine_id_available {
+        return Err(PerfettoError::InvalidParam(
+            "machine_id filter requires a trace schema with process.machine_id".to_owned(),
+        ));
+    }
     let page_window = validate_chrome_page_load_window(window)?;
     let min_total_ns = duration_ms_to_ns("min_total_ms", min_total_ms, 20_000_000)?;
     let row_limit = chrome_tool_row_limit(limit)?;
+    let machine_id_expr = if process_machine_id_available {
+        "p.machine_id"
+    } else {
+        "NULL"
+    };
 
     let start_bound = match (page_window.phase.is_some(), page_window.start_ts_ns) {
         (true, Some(ts)) => Some(format!("MAX(sw.start_ts, {ts})")),
@@ -88,6 +100,7 @@ pub fn chrome_page_load_script_hotspots_sql(
              p.name AS process_name, \
              p.upid AS upid, \
              p.pid AS pid, \
+             {machine_id_expr} AS machine_id, \
              t.name AS thread_name, \
              COALESCE( \
                MAX(CASE WHEN a.flat_key IN ( \
@@ -142,12 +155,16 @@ pub fn chrome_page_load_script_hotspots_sql(
     if let Some(pid) = pid {
         sql.push_str(&format!(" AND p.pid = {pid}"));
     }
+    if let Some(machine_id) = machine_id {
+        sql.push_str(&format!(" AND p.machine_id = {machine_id}"));
+    }
     if let Some(upid) = upid {
         sql.push_str(&format!(" AND p.upid = {upid}"));
     }
-    sql.push_str(
+    sql.push_str(&format!(
         " GROUP BY \
-             s.id, s.ts, s.dur, s.thread_dur, s.name, p.name, p.upid, p.pid, t.name \
+             s.id, s.ts, s.dur, s.thread_dur, s.name, \
+             p.name, p.upid, p.pid, {machine_id_expr}, t.name \
          ), \
          script_descendants(root_id, id, depth) AS ( \
            SELECT id, id, 0 FROM script_slices \
@@ -223,6 +240,7 @@ pub fn chrome_page_load_script_hotspots_sql(
            ss.process_name, \
            ss.upid, \
            ss.pid, \
+           ss.machine_id, \
            ss.thread_name, \
            COUNT(*) AS slice_count, \
            ROUND(SUM(ss.overlap_dur) / 1e6, 3) AS total_wall_ms, \
@@ -240,13 +258,15 @@ pub fn chrome_page_load_script_hotspots_sql(
               AND s2.name IS ss.name \
               AND s2.upid IS ss.upid \
               AND s2.pid IS ss.pid \
+              AND s2.machine_id IS ss.machine_id \
               AND s2.thread_name IS ss.thread_name \
             ORDER BY s2.overlap_dur DESC, s2.dur DESC, s2.id ASC \
             LIMIT 1) AS example_slice_id \
          FROM script_slices ss \
          LEFT JOIN descendant_rollup dr ON dr.root_id = ss.id \
-         GROUP BY ss.url, ss.name, ss.process_name, ss.upid, ss.pid, ss.thread_name ",
-    );
+         GROUP BY ss.url, ss.name, ss.process_name, ss.upid, ss.pid, \
+                  ss.machine_id, ss.thread_name ",
+    ));
     sql.push_str(&format!(
         "HAVING SUM(ss.overlap_dur) >= {min_total_ns} \
          ORDER BY total_wall_ms DESC, max_wall_ms DESC, first_start_ms ASC \

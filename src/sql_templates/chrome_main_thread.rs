@@ -24,6 +24,8 @@ pub fn chrome_main_thread_hotspots_sql(
     let ChromeMainThreadHotspotsFilters {
         process_name,
         pid,
+        machine_id,
+        process_machine_id_available,
         upid,
         page_load_id,
         navigation_id,
@@ -33,6 +35,11 @@ pub fn chrome_main_thread_hotspots_sql(
         min_dur_ms,
         limit,
     } = filters;
+    if machine_id.is_some() && !process_machine_id_available {
+        return Err(PerfettoError::InvalidParam(
+            "machine_id filter requires a trace schema with process.machine_id".to_owned(),
+        ));
+    }
     let page_window_filters = ChromePageLoadWindowFilters {
         page_load_id,
         navigation_id,
@@ -43,6 +50,11 @@ pub fn chrome_main_thread_hotspots_sql(
     let page_window = validate_chrome_page_load_window(page_window_filters)?;
     let min_dur_ns = duration_ms_to_ns("min_dur_ms", min_dur_ms, 16_000_000)?;
     let row_limit = chrome_tool_row_limit(limit)?;
+    let machine_id_expr = if process_machine_id_available {
+        "p.machine_id"
+    } else {
+        "NULL"
+    };
     let effective_phase = page_window.phase;
     let start_bound = match (effective_phase.is_some(), page_window.start_ts_ns) {
         (true, Some(ts)) => Some(format!("MAX(hw.start_ts, {ts})")),
@@ -95,6 +107,7 @@ pub fn chrome_main_thread_hotspots_sql(
            ct.process_name, \
            ct.upid, \
            p.pid, \
+           {machine_id_expr} AS machine_id, \
            ct.dur / 1e6 AS dur_ms, \
            ROUND({overlap_dur_expr} / 1e6, 3) AS overlap_dur_ms, \
            CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
@@ -139,6 +152,9 @@ pub fn chrome_main_thread_hotspots_sql(
     }
     if let Some(pid) = pid {
         sql.push_str(&format!(" AND p.pid = {pid}"));
+    }
+    if let Some(machine_id) = machine_id {
+        sql.push_str(&format!(" AND p.machine_id = {machine_id}"));
     }
     if let Some(upid) = upid {
         sql.push_str(&format!(" AND p.upid = {upid}"));

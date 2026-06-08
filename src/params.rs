@@ -441,6 +441,10 @@ pub struct ChromePageLoadScriptHotspotsParams {
     /// Optional OS pid filter. Accepts both numbers and numeric strings.
     #[serde(default, deserialize_with = "lenient_i64")]
     pub pid: Option<i64>,
+    /// Optional machine id filter for multi-machine traces when the trace
+    /// schema has `process.machine_id`. Accepts numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub machine_id: Option<i64>,
     /// Optional trace-internal upid filter. Prefer this when distinguishing
     /// same-named Renderer processes. Accepts numbers and numeric strings.
     #[serde(default, deserialize_with = "lenient_i64")]
@@ -497,6 +501,12 @@ pub struct ChromeMainThreadHotspotsParams {
     /// precision matters. Accepts both numbers and numeric strings.
     #[serde(default, deserialize_with = "lenient_i64")]
     pub pid: Option<i64>,
+    /// Optional machine id filter for multi-machine traces when the trace
+    /// schema has `process.machine_id`. ANDs with pid/process filters and
+    /// disambiguates same pid values on different machines. Accepts numbers
+    /// and numeric strings.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub machine_id: Option<i64>,
     /// Optional upid filter — the trace-internal Unique Process ID assigned by
     /// trace_processor (also from `list_processes`). Always uniquely identifies
     /// one process within a trace, even if the OS recycled its pid. Use this
@@ -607,6 +617,10 @@ pub struct ChromeMainThreadHotspotsFilters<'a> {
     pub process_name: Option<&'a str>,
     /// Optional OS pid filter — see `ChromeMainThreadHotspotsParams::pid`.
     pub pid: Option<i64>,
+    /// Optional machine id filter for multi-machine traces.
+    pub machine_id: Option<i64>,
+    /// True when `process.machine_id` exists in the loaded trace schema.
+    pub process_machine_id_available: bool,
     /// Optional trace-internal upid filter — precise even when pid recycles.
     pub upid: Option<i64>,
     /// Optional page-load id/window scoping. Matches `chrome_page_loads.id`.
@@ -693,6 +707,10 @@ pub struct ChromePageLoadScriptHotspotsFilters<'a> {
     pub process_name: Option<&'a str>,
     /// Optional OS pid filter.
     pub pid: Option<i64>,
+    /// Optional machine id filter for multi-machine traces.
+    pub machine_id: Option<i64>,
+    /// True when `process.machine_id` exists in the loaded trace schema.
+    pub process_machine_id_available: bool,
     /// Optional trace-internal upid filter.
     pub upid: Option<i64>,
     pub window: ChromePageLoadWindowFilters,
