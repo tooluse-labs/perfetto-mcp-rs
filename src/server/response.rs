@@ -28,6 +28,7 @@ pub(super) const CHROME_TOOL_KNOWN_ROW_COUNT_NOTE: &str =
     "row_count is exact for the tool query; truncated=true means more rows exist than returned; \
      string_truncated=cell text shortened; full blob cells use blob:hex:<hex>; \
      non-finite floats use float:* strings.";
+#[cfg(test)]
 pub(super) const CHROME_TOOL_PROBED_ROW_COUNT_NOTE: &str =
     "row_count unknown; truncated=true means an extra-row probe found more rows than returned; \
      at the 5000-row global cap, absence of truncated does not prove completeness; \
@@ -231,6 +232,14 @@ pub(super) struct SliceDescendantsAppliedFilters {
     pub(super) include_args: bool,
 }
 
+pub(super) struct SliceDescendantsResponseMeta {
+    pub(super) effective_limit: usize,
+    pub(super) row_count: Option<usize>,
+    pub(super) applied_filters: SliceDescendantsAppliedFilters,
+    pub(super) missing_root_ids: Vec<i64>,
+    pub(super) incomplete_descendant_count: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct SliceDescendantsRowsResponse {
     pub(super) columns: Vec<String>,
@@ -335,19 +344,22 @@ pub(super) fn format_chrome_tool_response_with_redaction(
     .map_err(|e| format!("Failed to serialize results: {e}"))
 }
 
-pub(super) fn format_chrome_tool_response_with_probe_limit(
+pub(super) fn format_chrome_tool_response_with_probe_limit_and_known_row_count(
     table: DecodedTable,
     effective_limit: usize,
+    row_count: usize,
     max_string_len: Option<u32>,
 ) -> Result<String, String> {
-    format_chrome_tool_response_with_probe_limit_and_redaction(
+    format_chrome_tool_response_with_probe_limit_known_row_count_and_redaction(
         table,
         effective_limit,
+        row_count,
         tool_max_string_len(max_string_len)?,
         default_redact_strings(),
     )
 }
 
+#[cfg(test)]
 pub(super) fn format_chrome_tool_response_with_probe_limit_and_redaction(
     table: DecodedTable,
     effective_limit: usize,
@@ -386,6 +398,51 @@ pub(super) fn format_chrome_tool_response_with_probe_limit_and_redaction(
         string_truncated,
         redacted,
         note: CHROME_TOOL_PROBED_ROW_COUNT_NOTE,
+        rows,
+    })
+    .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+pub(super) fn format_chrome_tool_response_with_probe_limit_known_row_count_and_redaction(
+    table: DecodedTable,
+    effective_limit: usize,
+    row_count: usize,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+) -> Result<String, String> {
+    let span = tracing::debug_span!(
+        "mcp.response_shape",
+        response = "chrome_rows_probe_known_count",
+        fetched_rows = table.rows.len(),
+        row_count,
+        effective_limit,
+        max_string_len_set = max_string_len.is_some(),
+        redact_strings,
+        string_truncated = tracing::field::Empty,
+        redacted = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let shape = ExecuteSqlOutputShape {
+        mode: ExecuteSqlOutputMode::FullRows,
+        active: true,
+        max_string_len,
+        redact_strings,
+    };
+    let returned_rows = table.rows.len().min(effective_limit);
+    let truncated = row_count > returned_rows;
+    let (rows, string_truncated, redacted) =
+        transform_rows(table.rows.iter().take(effective_limit), shape);
+    tracing::Span::current().record("string_truncated", string_truncated);
+    tracing::Span::current().record("redacted", redacted);
+    serde_json::to_string(&ChromeToolRowsResponse {
+        columns: table.columns,
+        row_count: Some(row_count),
+        returned_rows,
+        truncated,
+        row_count_known: true,
+        string_truncated,
+        redacted,
+        note: CHROME_TOOL_KNOWN_ROW_COUNT_NOTE,
         rows,
     })
     .map_err(|e| format!("Failed to serialize results: {e}"))
@@ -557,32 +614,36 @@ pub(super) fn format_chrome_resource_summary_response_with_redaction(
     .map_err(|e| format!("Failed to serialize results: {e}"))
 }
 
-pub(super) fn format_chrome_resource_summary_response_with_probe_limit(
+pub(super) fn format_chrome_resource_summary_response_with_probe_limit_and_known_row_count(
     table: DecodedTable,
     effective_limit: usize,
+    row_count: usize,
     max_string_len: Option<u32>,
     evidence: ChromeResourceTimingEvidence,
 ) -> Result<String, String> {
-    format_chrome_resource_summary_response_with_probe_limit_and_redaction(
+    format_chrome_resource_summary_response_with_probe_limit_known_row_count_and_redaction(
         table,
         effective_limit,
+        row_count,
         tool_max_string_len(max_string_len)?,
         default_redact_strings(),
         evidence,
     )
 }
 
-pub(super) fn format_chrome_resource_summary_response_with_probe_limit_and_redaction(
+pub(super) fn format_chrome_resource_summary_response_with_probe_limit_known_row_count_and_redaction(
     table: DecodedTable,
     effective_limit: usize,
+    row_count: usize,
     max_string_len: Option<usize>,
     redact_strings: bool,
     evidence: ChromeResourceTimingEvidence,
 ) -> Result<String, String> {
     let span = tracing::debug_span!(
         "mcp.response_shape",
-        response = "chrome_resource_summary_probe",
+        response = "chrome_resource_summary_probe_known_count",
         fetched_rows = table.rows.len(),
+        row_count,
         effective_limit,
         max_string_len_set = max_string_len.is_some(),
         redact_strings,
@@ -597,22 +658,22 @@ pub(super) fn format_chrome_resource_summary_response_with_probe_limit_and_redac
         max_string_len,
         redact_strings,
     };
-    let truncated = effective_limit > 0 && table.rows.len() > effective_limit;
     let returned_rows = table.rows.len().min(effective_limit);
+    let truncated = row_count > returned_rows;
     let (rows, string_truncated, redacted) =
         transform_rows(table.rows.iter().take(effective_limit), shape);
     tracing::Span::current().record("string_truncated", string_truncated);
     tracing::Span::current().record("redacted", redacted);
     serde_json::to_string(&ChromeResourceSummaryRowsResponse {
         columns: table.columns,
-        row_count: None,
+        row_count: Some(row_count),
         returned_rows,
         truncated,
-        row_count_known: false,
+        row_count_known: true,
         string_truncated,
         redacted,
         resource_timing_evidence: evidence,
-        note: CHROME_TOOL_PROBED_ROW_COUNT_NOTE,
+        note: CHROME_TOOL_KNOWN_ROW_COUNT_NOTE,
         rows,
     })
     .map_err(|e| format!("Failed to serialize results: {e}"))
@@ -753,6 +814,7 @@ pub(super) fn slice_descendants_applied_filters(
     }
 }
 
+#[cfg(test)]
 pub(super) fn format_slice_descendants_tool_response_with_redaction(
     table: DecodedTable,
     effective_limit: usize,
@@ -762,10 +824,43 @@ pub(super) fn format_slice_descendants_tool_response_with_redaction(
     max_string_len: Option<usize>,
     redact_strings: bool,
 ) -> Result<String, String> {
+    let meta = SliceDescendantsResponseMeta {
+        effective_limit,
+        row_count: None,
+        applied_filters,
+        missing_root_ids,
+        incomplete_descendant_count,
+    };
+    format_slice_descendants_tool_response_inner(table, meta, max_string_len, redact_strings)
+}
+
+pub(super) fn format_slice_descendants_tool_response_with_known_row_count_and_redaction(
+    table: DecodedTable,
+    meta: SliceDescendantsResponseMeta,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+) -> Result<String, String> {
+    format_slice_descendants_tool_response_inner(table, meta, max_string_len, redact_strings)
+}
+
+fn format_slice_descendants_tool_response_inner(
+    table: DecodedTable,
+    meta: SliceDescendantsResponseMeta,
+    max_string_len: Option<usize>,
+    redact_strings: bool,
+) -> Result<String, String> {
+    let SliceDescendantsResponseMeta {
+        effective_limit,
+        row_count,
+        applied_filters,
+        missing_root_ids,
+        incomplete_descendant_count,
+    } = meta;
     let span = tracing::debug_span!(
         "mcp.response_shape",
         response = "slice_descendants",
         row_count = table.rows.len(),
+        exact_row_count = row_count,
         effective_limit,
         missing_root_count = missing_root_ids.len(),
         max_string_len_set = max_string_len.is_some(),
@@ -780,18 +875,21 @@ pub(super) fn format_slice_descendants_tool_response_with_redaction(
         max_string_len,
         redact_strings,
     };
-    let truncated = effective_limit > 0 && table.rows.len() > effective_limit;
     let returned_rows = table.rows.len().min(effective_limit);
+    let truncated = row_count.map_or(
+        effective_limit > 0 && table.rows.len() > effective_limit,
+        |n| n > returned_rows,
+    );
     let (rows, string_truncated, redacted) =
         transform_rows(table.rows.iter().take(effective_limit), shape);
     tracing::Span::current().record("string_truncated", string_truncated);
     tracing::Span::current().record("redacted", redacted);
     serde_json::to_string(&SliceDescendantsRowsResponse {
         columns: table.columns,
-        row_count: None,
+        row_count,
         returned_rows,
         truncated,
-        row_count_known: false,
+        row_count_known: row_count.is_some(),
         string_truncated,
         redacted,
         summary_scope: SLICE_DESCENDANTS_BREAKDOWN_SCOPE,

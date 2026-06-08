@@ -579,6 +579,77 @@ fn extra_row_probe_limit_adds_one_until_global_cap() {
 }
 
 #[test]
+fn count_sql_for_limited_query_wraps_outer_select_only() {
+    let sql = "INCLUDE PERFETTO MODULE chrome.page_loads; \
+               WITH rows AS (SELECT id FROM slice ORDER BY id LIMIT 1) \
+               SELECT * FROM rows ORDER BY id DESC LIMIT 101";
+    let count_sql = count_sql_for_limited_query(sql).expect("count SQL must build");
+    let compact = compact_sql(&count_sql);
+
+    assert!(
+        compact.starts_with(
+            "INCLUDE PERFETTO MODULE chrome.page_loads; SELECT COUNT(*) AS row_count FROM ("
+        ),
+        "count SQL must preserve leading INCLUDE before the count wrapper, got: {count_sql}",
+    );
+    assert!(
+        compact.contains("SELECT id FROM slice ORDER BY id LIMIT 1"),
+        "count SQL must keep inner LIMIT clauses, got: {count_sql}",
+    );
+    assert!(
+        !compact.ends_with("LIMIT 101)"),
+        "count SQL must strip only the outer display LIMIT, got: {count_sql}",
+    );
+}
+
+#[test]
+fn count_sql_for_limited_query_executes_against_resource_summary_fixture() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = TraceProcessorManager::new_with_starting_port(1, 19_271);
+        let trace = PathBuf::from("tests/fixtures/page_loads.pftrace");
+        let client = manager.get_client(&trace).await.expect("spawn tp_shell");
+        let limited_sql = chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
+            window: ChromePageLoadWindowFilters {
+                page_load_id: Some(1),
+                phase: Some(ChromePageLoadPhase::NavigationToFcp),
+                ..Default::default()
+            },
+            min_overlap_ms: Some(0.0),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .expect("resource summary SQL builder must succeed");
+        let limited_rows = client
+            .query(&limited_sql)
+            .await
+            .expect("limited resource summary query must succeed");
+        assert_eq!(
+            limited_rows.len(),
+            2,
+            "fixture should provide at least two limited rows",
+        );
+
+        let count_sql = count_sql_for_limited_query(&limited_sql).expect("count SQL must build");
+        let count_table = client
+            .query(&count_sql)
+            .await
+            .expect("resource summary count wrapper must execute");
+        let row_count =
+            decoded_row_count(&count_table, "resource summary fixture count").expect("row_count");
+        assert!(
+            row_count > limited_rows.len(),
+            "count wrapper must count beyond the display LIMIT: row_count={row_count}, limited_rows={}",
+            limited_rows.len(),
+        );
+    });
+}
+
+#[test]
 fn chrome_tool_probe_response_trims_extra_row_and_avoids_cap_false_positive() {
     let exact_table = decoded_table(&["id"], vec![vec![json!(1)], vec![json!(2)]]);
     let exact_response = format_chrome_tool_response_with_probe_limit_and_redaction(
@@ -614,6 +685,26 @@ fn chrome_tool_probe_response_trims_extra_row_and_avoids_cap_false_positive() {
     assert_eq!(extra["returned_rows"], json!(2));
     assert_eq!(extra["truncated"], json!(true));
     assert_eq!(extra["rows"], json!([[1], [2]]));
+
+    let known_count_table = decoded_table(
+        &["id"],
+        vec![vec![json!(1)], vec![json!(2)], vec![json!(3)]],
+    );
+    let known_count_response =
+        format_chrome_tool_response_with_probe_limit_known_row_count_and_redaction(
+            known_count_table,
+            2,
+            7,
+            DEFAULT_TOOL_MAX_STRING_LEN,
+            false,
+        )
+        .expect("serialize");
+    let known_count: serde_json::Value = serde_json::from_str(&known_count_response).expect("json");
+    assert_eq!(known_count["row_count"], json!(7));
+    assert_eq!(known_count["row_count_known"], json!(true));
+    assert_eq!(known_count["returned_rows"], json!(2));
+    assert_eq!(known_count["truncated"], json!(true));
+    assert_eq!(known_count["rows"], json!([[1], [2]]));
 }
 
 #[test]
@@ -1077,7 +1168,7 @@ fn slice_descendants_response_trims_extra_probe_row() {
     let response = format_slice_descendants_tool_response_with_redaction(
         table,
         2,
-        applied_filters,
+        applied_filters.clone(),
         Vec::new(),
         0,
         None,
@@ -1089,6 +1180,34 @@ fn slice_descendants_response_trims_extra_probe_row() {
     assert_eq!(parsed["returned_rows"], json!(2));
     assert_eq!(parsed["truncated"], json!(true));
     assert_eq!(parsed["rows"], json!([[1, 1, "a", 1], [1, 1, "b", 1]]));
+
+    let known_count_table = decoded_table(
+        &["root_id", "depth", "name", "slice_count"],
+        vec![
+            vec![json!(1), json!(1), json!("a"), json!(1)],
+            vec![json!(1), json!(1), json!("b"), json!(1)],
+            vec![json!(1), json!(1), json!("c"), json!(1)],
+        ],
+    );
+    let known_count_response =
+        format_slice_descendants_tool_response_with_known_row_count_and_redaction(
+            known_count_table,
+            SliceDescendantsResponseMeta {
+                effective_limit: 2,
+                row_count: Some(9),
+                applied_filters,
+                missing_root_ids: Vec::new(),
+                incomplete_descendant_count: 0,
+            },
+            None,
+            false,
+        )
+        .expect("serialize");
+    let known_count: serde_json::Value = serde_json::from_str(&known_count_response).expect("json");
+    assert_eq!(known_count["row_count"], json!(9));
+    assert_eq!(known_count["row_count_known"], json!(true));
+    assert_eq!(known_count["returned_rows"], json!(2));
+    assert_eq!(known_count["truncated"], json!(true));
 }
 
 #[test]

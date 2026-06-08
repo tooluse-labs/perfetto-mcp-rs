@@ -25,9 +25,10 @@ use crate::tp_manager::{
     trace_file_platform_fingerprint, trace_file_sample_sha256, TraceProcessorManager,
 };
 
+use crate::error::PerfettoError;
 #[cfg(test)]
-use crate::error::{PerfettoError, QueryErrorKind, MAX_ROWS};
-use crate::query::DecodedTable;
+use crate::error::{QueryErrorKind, MAX_ROWS};
+use crate::query::{DecodeQueryOptions, DecodedTable};
 #[cfg(test)]
 use crate::stdlib_catalog::STDLIB_MODULE_LIST;
 
@@ -162,6 +163,50 @@ fn decoded_row_count(table: &crate::query::DecodedTable, tool_name: &str) -> Res
     decoded_table_i64_cell(table, "row_count")
         .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| format!("{tool_name} count query did not return a valid row_count"))
+}
+
+fn count_sql_for_limited_query(sql: &str) -> Result<String, String> {
+    let limit_idx = sql
+        .rfind(" LIMIT ")
+        .ok_or_else(|| "tool SQL did not contain an outer LIMIT clause".to_owned())?;
+    let limited_body = sql[..limit_idx].trim_end();
+    let (include_prefix, query_body) = split_leading_perfetto_include_statements(limited_body);
+    if query_body.trim().is_empty() {
+        return Err("tool SQL did not contain a countable SELECT body".to_owned());
+    }
+    Ok(format!(
+        "{include_prefix} SELECT COUNT(*) AS row_count FROM ({query_body})"
+    ))
+}
+
+fn split_leading_perfetto_include_statements(sql: &str) -> (&str, &str) {
+    let mut rest_start = 0;
+    loop {
+        let rest = &sql[rest_start..];
+        let leading_ws = rest.len() - rest.trim_start().len();
+        let candidate_start = rest_start + leading_ws;
+        let candidate = &sql[candidate_start..];
+        if !candidate.starts_with("INCLUDE PERFETTO MODULE ") {
+            return (&sql[..rest_start], &sql[rest_start..]);
+        }
+        let Some(semi_rel) = candidate.find(';') else {
+            return (&sql[..rest_start], &sql[rest_start..]);
+        };
+        rest_start = candidate_start + semi_rel + 1;
+    }
+}
+
+async fn query_exact_row_count_for_limited_tool_sql(
+    client: &TraceProcessorClient,
+    sql: &str,
+    tool_name: &str,
+) -> Result<usize, String> {
+    let count_sql = count_sql_for_limited_query(sql)?;
+    let decoded = client
+        .query_with_options(&count_sql, DecodeQueryOptions { max_rows: Some(1) })
+        .await
+        .map_err(|e| format_chrome_tool_error(tool_name, e))?;
+    decoded_row_count(&decoded.table, tool_name)
 }
 
 #[tool_router(router = tool_router)]
@@ -842,7 +887,18 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page-load resource hotspots", e))?;
-        format_chrome_tool_response_with_probe_limit(table, effective_limit, params.max_string_len)
+        let row_count = query_exact_row_count_for_limited_tool_sql(
+            &client,
+            &sql,
+            "Chrome page-load resource hotspots count",
+        )
+        .await?;
+        format_chrome_tool_response_with_probe_limit_and_known_row_count(
+            table,
+            effective_limit,
+            row_count,
+            params.max_string_len,
+        )
     }
 
     #[tool(
@@ -911,9 +967,16 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page-load resource summary", e))?;
-        format_chrome_resource_summary_response_with_probe_limit(
+        let row_count = query_exact_row_count_for_limited_tool_sql(
+            &client,
+            &sql,
+            "Chrome page-load resource summary count",
+        )
+        .await?;
+        format_chrome_resource_summary_response_with_probe_limit_and_known_row_count(
             table,
             effective_limit,
+            row_count,
             params.max_string_len,
             evidence,
         )
@@ -989,7 +1052,18 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page-load resource pipeline", e))?;
-        format_chrome_tool_response_with_probe_limit(table, effective_limit, params.max_string_len)
+        let row_count = query_exact_row_count_for_limited_tool_sql(
+            &client,
+            &sql,
+            "Chrome page-load resource pipeline count",
+        )
+        .await?;
+        format_chrome_tool_response_with_probe_limit_and_known_row_count(
+            table,
+            effective_limit,
+            row_count,
+            params.max_string_len,
+        )
     }
 
     #[tool(
@@ -1057,7 +1131,18 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome page-load script hotspots", e))?;
-        format_chrome_tool_response_with_probe_limit(table, effective_limit, params.max_string_len)
+        let row_count = query_exact_row_count_for_limited_tool_sql(
+            &client,
+            &sql,
+            "Chrome page-load script hotspots count",
+        )
+        .await?;
+        format_chrome_tool_response_with_probe_limit_and_known_row_count(
+            table,
+            effective_limit,
+            row_count,
+            params.max_string_len,
+        )
     }
 
     #[tool(
@@ -1161,7 +1246,18 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(|e| format_chrome_tool_error("Chrome main-thread hotspots", e))?;
-        format_chrome_tool_response_with_probe_limit(table, effective_limit, params.max_string_len)
+        let row_count = query_exact_row_count_for_limited_tool_sql(
+            &client,
+            &sql,
+            "Chrome main-thread hotspots count",
+        )
+        .await?;
+        format_chrome_tool_response_with_probe_limit_and_known_row_count(
+            table,
+            effective_limit,
+            row_count,
+            params.max_string_len,
+        )
     }
 
     #[tool(
@@ -1255,12 +1351,24 @@ impl PerfettoMcpServer {
             .query(&sql)
             .await
             .map_err(format_slice_descendants_tool_error)?;
-        format_slice_descendants_tool_response_with_redaction(
-            table,
-            effective_limit as usize,
+        let count_sql = count_sql_for_limited_query(&sql).map_err(|e| {
+            format_slice_descendants_tool_error(PerfettoError::InvalidParam(e.to_owned()))
+        })?;
+        let row_count = client
+            .query_with_options(&count_sql, DecodeQueryOptions { max_rows: Some(1) })
+            .await
+            .map_err(format_slice_descendants_tool_error)
+            .and_then(|decoded| decoded_row_count(&decoded.table, "slice_descendants_breakdown"))?;
+        let response_meta = SliceDescendantsResponseMeta {
+            effective_limit: effective_limit as usize,
+            row_count: Some(row_count),
             applied_filters,
             missing_root_ids,
             incomplete_descendant_count,
+        };
+        format_slice_descendants_tool_response_with_known_row_count_and_redaction(
+            table,
+            response_meta,
             max_string_len,
             default_redact_strings(),
         )
