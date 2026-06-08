@@ -30,9 +30,11 @@ pub(super) fn pragma_row_to_column_info(
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         == 0;
+    let primary_key = table.cell(i, "pk").and_then(|v| v.as_i64()).unwrap_or(0) > 0;
     Ok(ColumnInfo {
         name,
         data_type,
         nullable,
+        primary_key,
     })
 }

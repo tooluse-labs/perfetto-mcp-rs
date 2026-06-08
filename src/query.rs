@@ -155,9 +155,7 @@ pub fn decode_query_result_with_options(
                 }
                 Ok(CellType::CellFloat64) => {
                     let v = float64_iter.next().copied().unwrap_or(0.0);
-                    serde_json::Number::from_f64(v)
-                        .map(Value::Number)
-                        .unwrap_or(Value::Null)
+                    float64_cell_to_value(v)
                 }
                 Ok(CellType::CellString) => {
                     Value::String(string_iter.next().unwrap_or("").to_owned())
@@ -200,6 +198,19 @@ pub fn decode_query_result_with_options(
         row_count_known: true,
         rows_truncated: false,
     })
+}
+
+fn float64_cell_to_value(v: f64) -> Value {
+    if let Some(number) = serde_json::Number::from_f64(v) {
+        return Value::Number(number);
+    }
+    if v.is_nan() {
+        Value::String("float:NaN".to_owned())
+    } else if v.is_sign_negative() {
+        Value::String("float:-Infinity".to_owned())
+    } else {
+        Value::String("float:Infinity".to_owned())
+    }
 }
 
 fn complete_row_count(result: &QueryResult, num_cols: usize) -> usize {
@@ -260,6 +271,36 @@ mod tests {
         assert_eq!(
             table.rows[1],
             vec![Value::from("world"), Value::from(99), Value::from(2.5)]
+        );
+    }
+
+    #[test]
+    fn decode_non_finite_float64_cells_as_typed_strings() {
+        let batch = CellsBatch {
+            cells: vec![
+                CellType::CellFloat64 as i32,
+                CellType::CellFloat64 as i32,
+                CellType::CellFloat64 as i32,
+                CellType::CellNull as i32,
+            ],
+            varint_cells: vec![],
+            float64_cells: vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY],
+            blob_cells: vec![],
+            string_cells: None,
+            is_last_batch: Some(true),
+        };
+        let result = make_result(vec!["value"], vec![batch]);
+        let table = decode_query_result(&result).unwrap();
+
+        assert_eq!(
+            table.rows,
+            vec![
+                vec![Value::from("float:NaN")],
+                vec![Value::from("float:Infinity")],
+                vec![Value::from("float:-Infinity")],
+                vec![Value::Null],
+            ],
+            "non-finite floats must not be collapsed into JSON null",
         );
     }
 

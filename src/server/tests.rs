@@ -548,28 +548,61 @@ fn chrome_tool_response_with_known_row_count_only_truncates_when_more_rows_exist
 #[test]
 fn list_threads_response_exposes_exact_count_and_truncation() {
     let table = decoded_table(
-        &["tid", "thread_name", "pid", "upid"],
+        &["tid", "thread_name", "pid", "upid", "machine_id"],
         vec![vec![
             json!(10),
             json!("CrRendererMain"),
             json!(100),
             json!(1),
+            json!(7),
         ]],
     );
 
-    let response = format_list_threads_response(table, 2).expect("serialize");
+    let response = format_list_threads_response(
+        table,
+        3,
+        1,
+        1,
+        vec![
+            ListThreadsProcessCount {
+                pid: 100,
+                upid: 1,
+                machine_id: Some(7),
+                process_name: Some("Renderer".into()),
+                thread_count: 2,
+            },
+            ListThreadsProcessCount {
+                pid: 101,
+                upid: 2,
+                machine_id: None,
+                process_name: Some("Renderer".into()),
+                thread_count: 1,
+            },
+        ],
+    )
+    .expect("serialize");
     let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
     assert_json_key_order(&response, "\"truncated\":", "\"rows\":");
-    assert_eq!(parsed["row_count"], json!(2));
+    assert_eq!(parsed["row_count"], json!(3));
     assert_eq!(parsed["returned_rows"], json!(1));
+    assert_eq!(parsed["offset"], json!(1));
+    assert_eq!(parsed["limit"], json!(1));
     assert_eq!(parsed["truncated"], json!(true));
+    assert_eq!(parsed["has_more"], json!(true));
     assert_eq!(parsed["row_count_known"], json!(true));
+    assert_eq!(
+        parsed["process_counts"],
+        json!([
+            {"pid": 100, "upid": 1, "machine_id": 7, "process_name": "Renderer", "thread_count": 2},
+            {"pid": 101, "upid": 2, "machine_id": null, "process_name": "Renderer", "thread_count": 1}
+        ])
+    );
     assert!(
         parsed["note"]
             .as_str()
             .expect("note string")
-            .contains("2000-row cap"),
+            .contains("per-upid thread counts"),
         "note must explain list_threads truncation: {parsed}",
     );
 }
@@ -577,21 +610,64 @@ fn list_threads_response_exposes_exact_count_and_truncation() {
 #[test]
 fn list_threads_response_marks_complete_result_not_truncated() {
     let table = decoded_table(
-        &["tid", "thread_name", "pid", "upid"],
+        &["tid", "thread_name", "pid", "upid", "machine_id"],
         vec![vec![
             json!(10),
             json!("CrRendererMain"),
             json!(100),
             json!(1),
+            serde_json::Value::Null,
         ]],
     );
 
-    let response = format_list_threads_response(table, 1).expect("serialize");
+    let response = format_list_threads_response(table, 1, 0, LIST_THREADS_LIMIT, Vec::new())
+        .expect("serialize");
     let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
     assert_eq!(parsed["row_count"], json!(1));
     assert_eq!(parsed["returned_rows"], json!(1));
+    assert_eq!(parsed["offset"], json!(0));
+    assert_eq!(parsed["limit"], json!(LIST_THREADS_LIMIT));
     assert_eq!(parsed["truncated"], json!(false));
+    assert_eq!(parsed["has_more"], json!(false));
+}
+
+#[test]
+fn decode_list_threads_process_counts_rejects_bad_count_rows() {
+    let ok = decoded_table(
+        &["pid", "upid", "machine_id", "process_name", "thread_count"],
+        vec![vec![
+            json!(100),
+            json!(1),
+            json!(7),
+            json!("Renderer"),
+            json!(2),
+        ]],
+    );
+    assert_eq!(
+        decode_list_threads_process_counts(&ok).expect("valid process counts"),
+        vec![ListThreadsProcessCount {
+            pid: 100,
+            upid: 1,
+            machine_id: Some(7),
+            process_name: Some("Renderer".into()),
+            thread_count: 2,
+        }]
+    );
+
+    let bad = decoded_table(
+        &["pid", "upid", "machine_id", "process_name", "thread_count"],
+        vec![vec![
+            json!(100),
+            json!(1),
+            json!(null),
+            json!("Renderer"),
+            json!(-1),
+        ]],
+    );
+    let err =
+        decode_list_threads_process_counts(&bad).expect_err("negative thread_count must reject");
+    assert!(err.contains("negative thread_count"), "got: {err}");
 }
 
 #[test]
@@ -804,6 +880,7 @@ fn slice_descendants_response_echoes_summary_bounds_before_rows() {
         DEFAULT_SLICE_DESCENDANTS_LIMIT as usize,
         applied_filters,
         Vec::new(),
+        3,
         None,
         false,
     )
@@ -829,6 +906,11 @@ fn slice_descendants_response_echoes_summary_bounds_before_rows() {
         json!([] as [i64; 0]),
         "missing_root_ids must be present and empty when all roots existed: {parsed}",
     );
+    assert_eq!(
+        parsed["incomplete_descendant_count"],
+        json!(3),
+        "incomplete descendants must be visible even though duration rows exclude them: {parsed}",
+    );
     assert!(
         parsed["note"]
             .as_str()
@@ -842,6 +924,13 @@ fn slice_descendants_response_echoes_summary_bounds_before_rows() {
             .expect("note string")
             .contains("do not sum it across rows/depths"),
         "note must warn that inclusive totals overlap across depths: {parsed}",
+    );
+    assert!(
+        parsed["note"]
+            .as_str()
+            .expect("note string")
+            .contains("incomplete_descendant_count"),
+        "note must explain incomplete descendant count: {parsed}",
     );
 }
 
@@ -860,6 +949,7 @@ fn slice_descendants_response_includes_missing_root_ids() {
         DEFAULT_SLICE_DESCENDANTS_LIMIT as usize,
         applied_filters,
         vec![42, 99],
+        0,
         None,
         false,
     )
@@ -976,6 +1066,13 @@ fn execute_sql_head_limits_returned_rows_and_marks_truncation() {
             .expect("note string")
             .contains("blob:hex:<hex>"),
         "note must document blob cell encoding: {parsed}",
+    );
+    assert!(
+        parsed["note"]
+            .as_str()
+            .expect("note string")
+            .contains("float:NaN"),
+        "note must document non-finite float encoding: {parsed}",
     );
 }
 
@@ -2225,9 +2322,17 @@ fn chrome_trace_params_accept_stringified_numerics() {
 /// schema. Pin this against the actual `tools/list` payload for
 /// `chrome_main_thread_hotspots`.
 #[test]
-fn schema_for_chrome_hotspots_advertises_strict_numeric_types() {
+fn schema_for_numeric_params_advertises_strict_numeric_types() {
     let server = test_server();
     for (tool_name, strict_pairs) in [
+        (
+            "list_threads_in_process",
+            vec![
+                ("upid", "integer"),
+                ("limit", "integer"),
+                ("offset", "integer"),
+            ],
+        ),
         (
             "chrome_main_thread_hotspots",
             vec![
@@ -2541,7 +2646,7 @@ fn chrome_main_thread_hotspots_sql_no_filter_runs_all_main_threads() {
     assert!(sql.contains("LEFT JOIN thread t ON ct.utid = t.utid"));
     assert!(sql.contains("LEFT JOIN process p ON ct.upid = p.upid"));
     assert!(sql.contains("WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main')"));
-    assert!(sql.contains("AND ct.dur > 16000000"));
+    assert!(sql.contains("AND ct.dur >= 16000000"));
     assert!(
         sql.contains("ct.dur / 1e6 AS dur_ms")
             && sql.contains("ROUND(ct.dur / 1e6, 3) AS overlap_dur_ms"),
@@ -2670,7 +2775,7 @@ fn chrome_main_thread_hotspots_sql_with_raw_window_emits_ts_filters() {
     assert!(sql.contains("AND ct.ts + ct.dur > 1000"), "got: {sql}");
     assert!(sql.contains("AND ct.ts < 2000"), "got: {sql}");
     assert!(
-        sql.contains("AND (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) > 16000000"),
+        sql.contains("AND (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) >= 16000000"),
         "windowed min_dur_ms must filter clipped overlap duration, got: {sql}",
     );
     assert!(
@@ -2808,18 +2913,17 @@ fn chrome_main_thread_hotspots_sql_with_min_dur_ms_emits_threshold() {
     })
     .expect("min_dur_ms builder must succeed");
     assert!(
-        sql.contains("AND ct.dur > 33000000"),
+        sql.contains("AND ct.dur >= 33000000"),
         "min_dur_ms must convert ms→ns, got: {sql}",
     );
     assert!(
-        !sql.contains("AND ct.dur > 16000000"),
+        !sql.contains("AND ct.dur >= 16000000"),
         "explicit min_dur_ms must replace the 16 ms default, got: {sql}",
     );
 }
 
 /// `min_dur_ms = 0.0` is the explicit "show me everything" path — emits a
-/// zero overlap-duration threshold so SQL still runs but only filters out zero-duration rows
-/// (which `chrome_tasks` shouldn't have anyway).
+/// zero overlap-duration threshold so zero-duration rows remain visible too.
 #[test]
 fn chrome_main_thread_hotspots_sql_with_min_dur_ms_zero_emits_zero_threshold() {
     let sql = chrome_main_thread_hotspots_sql(ChromeMainThreadHotspotsFilters {
@@ -2827,7 +2931,7 @@ fn chrome_main_thread_hotspots_sql_with_min_dur_ms_zero_emits_zero_threshold() {
         ..Default::default()
     })
     .expect("zero threshold must be accepted");
-    assert!(sql.contains("AND ct.dur > 0"), "got: {sql}");
+    assert!(sql.contains("AND ct.dur >= 0"), "got: {sql}");
 }
 
 #[test]
@@ -2885,7 +2989,7 @@ fn chrome_main_thread_hotspots_sql_accepts_min_dur_ms_just_under_i64_ns_overflow
     })
     .expect("near-boundary min_dur_ms must accept");
     assert!(
-        sql.contains("AND ct.dur > 9000000000000000000"),
+        sql.contains("AND ct.dur >= 9000000000000000000"),
         "9e12 ms must convert to 9e18 ns in the WHERE clause, got: {sql}",
     );
 }
@@ -3680,6 +3784,8 @@ fn list_threads_in_process_requires_one_of_upid_or_process_name() {
             .list_threads_in_process(Parameters(ListThreadsInProcessParams {
                 upid: None,
                 process_name: None,
+                limit: None,
+                offset: None,
             }))
             .await;
         let err = r.expect_err("must reject when neither upid nor process_name is set");
@@ -3689,6 +3795,17 @@ fn list_threads_in_process_requires_one_of_upid_or_process_name() {
             "error must mention process_name, got: {err}",
         );
     });
+}
+
+#[test]
+fn list_threads_in_process_params_accept_limit_offset_numeric_strings() {
+    let p: ListThreadsInProcessParams =
+        serde_json::from_str(r#"{"process_name": "Renderer", "limit": "50", "offset": "100"}"#)
+            .expect("stringified pagination params should deserialize");
+    assert_eq!(p.upid, None);
+    assert_eq!(p.process_name.as_deref(), Some("Renderer"));
+    assert_eq!(p.limit, Some(50));
+    assert_eq!(p.offset, Some(100));
 }
 
 #[test]
@@ -3708,6 +3825,7 @@ fn table_info_serialize_uses_renamed_type_field() {
             name: "id".into(),
             data_type: "INTEGER".into(),
             nullable: false,
+            primary_key: true,
         }],
     };
     let value = serde_json::to_value(&info).expect("serialize");
@@ -3715,10 +3833,32 @@ fn table_info_serialize_uses_renamed_type_field() {
         value,
         json!({
             "table": "thread_slice",
-            "columns": [{"name": "id", "type": "INTEGER", "nullable": false}],
+            "columns": [{"name": "id", "type": "INTEGER", "nullable": false, "primary_key": true}],
         }),
-        "ColumnInfo.data_type must serialize as `type` (serde rename)",
+        "ColumnInfo.data_type must serialize as `type` and expose primary_key",
     );
+}
+
+#[test]
+fn decoded_table_has_column_matches_pragma_name_rows() {
+    let pragma = DecodedTable {
+        columns: vec!["cid".into(), "name".into(), "type".into()],
+        rows: vec![
+            vec![
+                serde_json::Value::from(0),
+                serde_json::Value::from("upid"),
+                serde_json::Value::from("INTEGER"),
+            ],
+            vec![
+                serde_json::Value::from(1),
+                serde_json::Value::from("machine_id"),
+                serde_json::Value::from("INTEGER"),
+            ],
+        ],
+    };
+
+    assert!(decoded_table_has_column(&pragma, "machine_id"));
+    assert!(!decoded_table_has_column(&pragma, "missing_column"));
 }
 
 /// PRAGMA table_info returns notnull = 0 for nullable, 1 for NOT NULL.
@@ -3728,16 +3868,18 @@ fn table_info_serialize_uses_renamed_type_field() {
 #[test]
 fn pragma_row_to_column_info_inverts_notnull() {
     let pragma = DecodedTable {
-        columns: vec!["name".into(), "type".into(), "notnull".into()],
+        columns: vec!["name".into(), "type".into(), "notnull".into(), "pk".into()],
         rows: vec![
             vec![
                 serde_json::Value::from("a"),
                 serde_json::Value::from("INTEGER"),
                 serde_json::Value::from(0),
+                serde_json::Value::from(0),
             ],
             vec![
                 serde_json::Value::from("b"),
                 serde_json::Value::from("TEXT"),
+                serde_json::Value::from(1),
                 serde_json::Value::from(1),
             ],
         ],
@@ -3750,11 +3892,19 @@ fn pragma_row_to_column_info_inverts_notnull() {
         nullable_row.nullable,
         "notnull = 0 must yield nullable = true",
     );
+    assert!(
+        !nullable_row.primary_key,
+        "pk = 0 must yield primary_key = false",
+    );
     assert_eq!(not_null_row.name, "b");
     assert_eq!(not_null_row.data_type, "TEXT");
     assert!(
         !not_null_row.nullable,
         "notnull = 1 must yield nullable = false",
+    );
+    assert!(
+        not_null_row.primary_key,
+        "pk = 1 must yield primary_key = true",
     );
 }
 

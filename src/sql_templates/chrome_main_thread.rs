@@ -107,7 +107,7 @@ pub fn chrome_main_thread_hotspots_sql(
     }
     sql.push_str(&format!(
         "WHERE (t.is_main_thread = 1 OR ct.thread_name GLOB 'Cr*Main') \
-           AND {overlap_dur_expr} > {min_dur_ns}"
+           AND {overlap_dur_expr} >= {min_dur_ns}"
     ));
     if effective_phase.is_some() {
         sql.push_str(

@@ -119,7 +119,7 @@ pub(crate) fn trace_file_sample_sha256(path: &Path, size_bytes: u64) -> Result<S
     })?;
     let mut hasher = Sha256::new();
 
-    if size_bytes <= TRACE_FINGERPRINT_SAMPLE_BYTES * 2 {
+    if size_bytes <= TRACE_FINGERPRINT_SAMPLE_BYTES * 3 {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).with_context(|| {
             format!(
@@ -134,6 +134,22 @@ pub(crate) fn trace_file_sample_sha256(path: &Path, size_bytes: u64) -> Result<S
             format!("failed to read trace fingerprint head: {}", path.display())
         })?;
         hasher.update(&first);
+
+        let middle_offset = (size_bytes / 2).saturating_sub(TRACE_FINGERPRINT_SAMPLE_BYTES / 2);
+        let mut middle = vec![0_u8; TRACE_FINGERPRINT_SAMPLE_BYTES as usize];
+        file.seek(SeekFrom::Start(middle_offset)).with_context(|| {
+            format!(
+                "failed to seek trace fingerprint middle: {}",
+                path.display()
+            )
+        })?;
+        file.read_exact(&mut middle).with_context(|| {
+            format!(
+                "failed to read trace fingerprint middle: {}",
+                path.display()
+            )
+        })?;
+        hasher.update(&middle);
 
         let mut last = vec![0_u8; TRACE_FINGERPRINT_SAMPLE_BYTES as usize];
         file.seek(SeekFrom::End(-(TRACE_FINGERPRINT_SAMPLE_BYTES as i64)))
@@ -1858,6 +1874,30 @@ mod tests {
         assert_ne!(
             first, second,
             "same-size content changes must alter the trace fingerprint sample",
+        );
+    }
+
+    #[test]
+    fn trace_file_sample_hash_detects_middle_only_large_file_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let trace = tmp.path().join("large-same-size.perfetto-trace");
+        let size = (TRACE_FINGERPRINT_SAMPLE_BYTES * 3 + 1) as usize;
+        let middle = size / 2;
+        let mut first_content = vec![b'a'; size];
+        first_content[middle] = b'x';
+        std::fs::write(&trace, &first_content).expect("write first large content");
+        let first = trace_file_sample_sha256(&trace, size as u64)
+            .expect("hash first large same-size trace content");
+
+        let mut second_content = first_content;
+        second_content[middle] = b'y';
+        std::fs::write(&trace, &second_content).expect("write second large content");
+        let second = trace_file_sample_sha256(&trace, size as u64)
+            .expect("hash second large same-size trace content");
+
+        assert_ne!(
+            first, second,
+            "large same-size middle-only changes must alter the trace fingerprint sample",
         );
     }
 

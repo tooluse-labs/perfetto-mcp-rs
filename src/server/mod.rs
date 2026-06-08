@@ -20,13 +20,13 @@ use tokio::sync::Mutex;
 use crate::params::*;
 use crate::sql_templates::*;
 use crate::stdlib_catalog::{STDLIB_QUICKREF, STDLIB_QUICKREF_MIME_TYPE, STDLIB_QUICKREF_URI};
+use crate::tp_client::TraceProcessorClient;
 use crate::tp_manager::{
     trace_file_platform_fingerprint, trace_file_sample_sha256, TraceProcessorManager,
 };
 
 #[cfg(test)]
 use crate::error::{PerfettoError, QueryErrorKind, MAX_ROWS};
-#[cfg(test)]
 use crate::query::DecodedTable;
 #[cfg(test)]
 use crate::stdlib_catalog::STDLIB_MODULE_LIST;
@@ -442,7 +442,7 @@ impl PerfettoMcpServer {
     #[tool(
         name = "list_table_structure",
         description = "Show the columns of a table or view: name, type, nullability, \
-                       primary-key flag.\n\
+                       primary_key flag.\n\
                        \n\
                        Use when: writing or debugging a query — call this immediately \
                        after a `no such column` error to inspect the actual schema \
@@ -522,7 +522,7 @@ impl PerfettoMcpServer {
     #[tool(
         name = "list_processes",
         description = "List every process captured in the trace: upid (trace-internal \
-                       id), pid (OS pid), name, start_ts, end_ts. Read-only.\n\
+                       id), pid, machine_id, name, start_ts, end_ts. Read-only.\n\
                        \n\
                        Use when: entry point for Android and Linux trace analysis, or \
                        picking the right `pid`/`upid` to feed into `list_threads_in_process` \
@@ -556,8 +556,17 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span("no_params".to_owned()).await;
         let client = self.client_for_current().await?;
+        let machine_id_expr = if table_has_column(&client, "process", "machine_id").await? {
+            "machine_id"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+            "SELECT upid, pid, {machine_id_expr} AS machine_id, name, start_ts, end_ts \
+             FROM process ORDER BY start_ts"
+        );
         let table = client
-            .query("SELECT upid, pid, name, start_ts, end_ts FROM process ORDER BY start_ts")
+            .query(&sql)
             .await
             .map_err(|e| format!("Failed to list processes: {e}"))?;
         serde_json::to_string(&table).map_err(|e| format!("Failed to serialize results: {e}"))
@@ -565,29 +574,27 @@ impl PerfettoMcpServer {
 
     #[tool(
         name = "list_threads_in_process",
-        description = "List threads inside one process: tid, thread_name, pid, upid. \
-                       Limit 2000 rows.\n\
+        description = "List threads in one process or same-named process set: \
+                       tid, thread_name, pid, upid, machine_id. Limit 2000, cap 5000.\n\
                        \n\
-                       Use when: drilling into a specific process picked from \
-                       `list_processes` — e.g. finding a renderer's compositor thread, \
-                       or auditing all threads under system_server.\n\
+                       Use when: drilling into a process from `list_processes`.\n\
                        \n\
-                       Don't use for: enumerating ALL threads across the whole trace — \
-                       use `execute_sql` against the `thread` table for that.\n\
+                       Don't use for: ALL trace threads — use `execute_sql` on `thread`.\n\
                        \n\
                        Parameters: pass either `upid` (trace-internal id, precise — \
                        prefer when multiple processes share a name like 'Renderer') or \
-                       `process_name` (exact match). `upid` wins when both are set.\n\
+                       `process_name` (exact match). `upid` wins when both are set. \
+                       Optional `limit` and `offset` page large result sets; both \
+                       accept numbers or numeric strings.\n\
                        \n\
-                       Output includes exact `row_count`, `returned_rows`, and \
-                       `truncated`; truncated rows are first 2000 by pid/tid.\n\
+                       Output: exact `row_count`, `returned_rows`, `truncated`/`has_more`; \
+                       rows are ordered by pid/tid. \
+                       `process_counts` reports per-upid counts for same-name fan-out.\n\
                        \n\
                        Empty result: returned as an error pointing at `list_processes` \
                        for available candidates.\n\
                        \n\
-                       When the 2000-row cap is hit (system_server, Chrome \
-                       renderer-fork): drill down via `execute_sql` against the `thread` \
-                       table directly.",
+                       When `truncated=true`, increase `offset` or drill down with `upid`.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -606,9 +613,11 @@ impl PerfettoMcpServer {
         Parameters(params): Parameters<ListThreadsInProcessParams>,
     ) -> Result<String, String> {
         self.record_tool_span(format!(
-            "upid_set={},process_name_set={}",
+            "upid_set={},process_name_set={},limit_set={},offset_set={}",
             params.upid.is_some(),
-            params.process_name.is_some()
+            params.process_name.is_some(),
+            params.limit.is_some(),
+            params.offset.is_some()
         ))
         .await;
         // Validate inputs BEFORE opening the trace — failing fast on bad
@@ -640,6 +649,12 @@ impl PerfettoMcpServer {
             }
         };
         let client = self.client_for_current().await?;
+        let process_has_machine_id = table_has_column(&client, "process", "machine_id").await?;
+        let machine_id_expr = if process_has_machine_id {
+            "p.machine_id"
+        } else {
+            "NULL"
+        };
         let count_sql = format!("SELECT COUNT(*) AS row_count {from_where}");
         let count_table = client
             .query(&count_sql)
@@ -652,17 +667,32 @@ impl PerfettoMcpServer {
                  to see available processes."
             ));
         }
+        let process_counts_sql = format!(
+            "SELECT p.pid, p.upid, {machine_id_expr} AS machine_id, \
+                    p.name AS process_name, COUNT(*) AS thread_count \
+             {from_where} \
+             GROUP BY p.pid, p.upid, {machine_id_expr}, p.name \
+             ORDER BY p.pid, p.upid"
+        );
+        let process_counts_table = client
+            .query(&process_counts_sql)
+            .await
+            .map_err(|e| format!("Failed to count threads by process: {e}"))?;
+        let process_counts = decode_list_threads_process_counts(&process_counts_table)?;
+        let effective_limit = bounded_tool_limit(params.limit, LIST_THREADS_LIMIT)?;
+        let offset = params.offset.unwrap_or(0) as usize;
         let sql = format!(
-            "SELECT t.tid, t.name AS thread_name, p.pid, p.upid \
+            "SELECT t.tid, t.name AS thread_name, p.pid, p.upid, \
+                    {machine_id_expr} AS machine_id \
              {from_where} \
              ORDER BY p.pid, t.tid \
-             LIMIT {LIST_THREADS_LIMIT}"
+             LIMIT {effective_limit} OFFSET {offset}"
         );
         let table = client
             .query(&sql)
             .await
             .map_err(|e| format!("Failed to list threads: {e}"))?;
-        format_list_threads_response(table, row_count)
+        format_list_threads_response(table, row_count, offset, effective_limit, process_counts)
     }
 
     #[tool(
@@ -1188,7 +1218,9 @@ impl PerfettoMcpServer {
                        `self_ms` (direct-child time subtracted, clamped at zero), \
                        `max_ms`, `first_ts_ns` (raw \
                        nanoseconds, not ms), `example_slice_id` (longest-duration \
-                       descendant per group), and optionally `example_args`.",
+                       descendant per group), and optionally `example_args`. \
+                       `incomplete_descendant_count` counts dur<0 descendants excluded \
+                       from duration aggregates.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1240,6 +1272,13 @@ impl PerfettoMcpServer {
                 missing_root_ids.len()
             ));
         }
+        let incomplete_descendant_count = fetch_incomplete_slice_descendant_count(
+            &client,
+            &deduped_root_ids,
+            applied_filters.max_depth,
+        )
+        .await
+        .map_err(format_slice_descendants_tool_error)?;
 
         let sql = slice_descendants_breakdown_sql(SliceDescendantsBreakdownFilters {
             slice_ids: &params.slice_ids,
@@ -1259,6 +1298,7 @@ impl PerfettoMcpServer {
             effective_limit as usize,
             applied_filters,
             missing_root_ids,
+            incomplete_descendant_count,
             max_string_len,
             default_redact_strings(),
         )
@@ -1477,6 +1517,24 @@ impl PerfettoMcpServer {
             .await
             .map_err(|e| format!("Failed to open trace {trace_path:?}: {e}"))
     }
+}
+
+async fn table_has_column(
+    client: &TraceProcessorClient,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, String> {
+    let sql = format!("PRAGMA table_info('{table_name}')");
+    let table = client
+        .query(&sql)
+        .await
+        .map_err(|e| format!("Failed to inspect table {table_name:?}: {e}"))?;
+    Ok(decoded_table_has_column(&table, column_name))
+}
+
+fn decoded_table_has_column(table: &DecodedTable, column_name: &str) -> bool {
+    (0..table.len())
+        .any(|i| table.cell(i, "name").and_then(|value| value.as_str()) == Some(column_name))
 }
 
 fn trace_schema_cache_key(trace_path: &str) -> Result<SchemaCacheTraceKey, String> {

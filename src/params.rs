@@ -209,6 +209,14 @@ pub struct ListThreadsInProcessParams {
     /// "/system/bin/init"). Either this or `upid` must be provided.
     #[serde(default)]
     pub process_name: Option<String>,
+    /// Optional max rows to return. Defaults to 2000, capped at 5000.
+    /// Accepts both numbers and numeric strings. Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+    /// Optional row offset for pagination. Defaults to 0. Accepts both
+    /// numbers and numeric strings.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -562,9 +570,9 @@ pub struct TableList {
 }
 
 /// Output of `list_table_structure`. Mirrors the analyst-relevant subset of
-/// SQLite's `PRAGMA table_info`. `cid`, `dflt_value`, and `pk` are omitted
-/// because nothing in the analysis path needs them today; trivial to add
-/// later if a caller surfaces a need.
+/// SQLite's `PRAGMA table_info`. `cid` and `dflt_value` are omitted because
+/// nothing in the analysis path needs them today; trivial to add later if a
+/// caller surfaces a need.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct TableInfo {
     pub table: String,
@@ -580,6 +588,8 @@ pub struct ColumnInfo {
     pub data_type: String,
     /// Inverse of SQLite's `notnull` flag: `nullable = (notnull == 0)`.
     pub nullable: bool,
+    /// True when SQLite's `pk` flag is non-zero for this column.
+    pub primary_key: bool,
 }
 
 /// Tunable filters for `chrome_main_thread_hotspots_sql`. All fields are

@@ -18,11 +18,15 @@ pub(super) const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 pub(super) const EXECUTE_SQL_SHAPING_NOTE: &str =
     "row_count is exact post-SQL decoded rows when row_count_known=true; \
      head/limit only trims returned tool rows, is capped at 5000, and does not rewrite SQL; \
-     full blob cells render as blob:hex:<hex>; truncated blobs keep the prefix and include remaining-byte count.";
+     full blob cells render as blob:hex:<hex>; truncated blobs keep the prefix and include \
+     remaining-byte count; non-finite floats render as float:NaN/float:Infinity.";
 pub(super) const CHROME_TOOL_SHAPING_NOTE: &str =
-    "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened; full blob cells use blob:hex:<hex>.";
+    "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened; \
+     full blob cells use blob:hex:<hex>; non-finite floats use float:* strings.";
 pub(super) const CHROME_TOOL_KNOWN_ROW_COUNT_NOTE: &str =
-    "row_count is exact for the tool query; truncated=true means more rows exist than returned; string_truncated=cell text shortened; full blob cells use blob:hex:<hex>.";
+    "row_count is exact for the tool query; truncated=true means more rows exist than returned; \
+     string_truncated=cell text shortened; full blob cells use blob:hex:<hex>; \
+     non-finite floats use float:* strings.";
 pub(super) const SLICE_DESCENDANTS_BREAKDOWN_SCOPE: &str = "descendants only; root slices excluded";
 pub(super) const SLICE_DESCENDANTS_SHAPING_NOTE: &str =
     "slice_count, inclusive_total_ms, self_ms, and max_ms include only descendants matching \
@@ -31,13 +35,26 @@ pub(super) const SLICE_DESCENDANTS_SHAPING_NOTE: &str =
      inclusive durations per descendant slice and is clamped at zero; limit caps returned \
      groups; example_slice_id is the longest-duration descendant per group (ties broken by \
      smallest id); first_ts_ns is raw nanoseconds; missing_root_ids lists requested slice_ids \
-     that do not exist in the loaded trace; example_args, when present, comes only from \
-     example_slice_id.";
+     that do not exist in the loaded trace; incomplete_descendant_count counts dur<0 \
+     descendants excluded from duration aggregates; example_args, when present, comes only \
+     from example_slice_id.";
 pub(super) const REDACTION_POLICY_NOTE: &str =
     "execute_sql and Chrome dedicated-tool string cells may contain <redacted>; this is server-side policy, not a tool parameter.";
 pub(super) const LIST_THREADS_LIMIT: usize = 2000;
 pub(super) const LIST_THREADS_SHAPING_NOTE: &str =
-    "row_count is exact for the selected process set; truncated=true means the 2000-row cap was hit. Use upid for one process or execute_sql for custom pagination.";
+    "row_count is exact for the selected process set; offset/limit identify the returned page; \
+     truncated=true/has_more=true means more rows exist after this page; process_counts shows \
+     per-upid thread counts so process_name queries do not hide same-name process fan-out; \
+     machine_id is null when the trace schema lacks it.";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(super) struct ListThreadsProcessCount {
+    pub(super) pid: i64,
+    pub(super) upid: i64,
+    pub(super) machine_id: Option<i64>,
+    pub(super) process_name: Option<String>,
+    pub(super) thread_count: usize,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(super) struct RedactionPolicy {
@@ -159,8 +176,12 @@ pub(super) struct ListThreadsRowsResponse {
     pub(super) columns: Vec<String>,
     pub(super) row_count: usize,
     pub(super) returned_rows: usize,
+    pub(super) offset: usize,
+    pub(super) limit: usize,
     pub(super) truncated: bool,
+    pub(super) has_more: bool,
     pub(super) row_count_known: bool,
+    pub(super) process_counts: Vec<ListThreadsProcessCount>,
     pub(super) note: &'static str,
     pub(super) rows: Vec<Vec<serde_json::Value>>,
 }
@@ -217,6 +238,7 @@ pub(super) struct SliceDescendantsRowsResponse {
     /// table. Always present in the response (empty when all roots existed)
     /// so LLM callers can tell "no descendants" apart from "stale id".
     pub(super) missing_root_ids: Vec<i64>,
+    pub(super) incomplete_descendant_count: usize,
     pub(super) note: &'static str,
     pub(super) rows: Vec<Vec<serde_json::Value>>,
 }
@@ -367,18 +389,68 @@ pub(super) fn format_chrome_tool_response_with_known_row_count_and_redaction(
 pub(super) fn format_list_threads_response(
     table: DecodedTable,
     row_count: usize,
+    offset: usize,
+    limit: usize,
+    process_counts: Vec<ListThreadsProcessCount>,
 ) -> Result<String, String> {
     let returned_rows = table.rows.len();
+    let has_more = row_count > offset.saturating_add(returned_rows);
     serde_json::to_string(&ListThreadsRowsResponse {
         columns: table.columns,
         row_count,
         returned_rows,
-        truncated: row_count > returned_rows,
+        offset,
+        limit,
+        truncated: has_more,
+        has_more,
         row_count_known: true,
+        process_counts,
         note: LIST_THREADS_SHAPING_NOTE,
         rows: table.rows,
     })
     .map_err(|e| format!("Failed to serialize results: {e}"))
+}
+
+pub(super) fn decode_list_threads_process_counts(
+    table: &DecodedTable,
+) -> Result<Vec<ListThreadsProcessCount>, String> {
+    (0..table.len())
+        .map(|i| {
+            let pid = decoded_table_i64_cell_at(table, i, "pid", "list_threads_process_counts")?;
+            let upid = decoded_table_i64_cell_at(table, i, "upid", "list_threads_process_counts")?;
+            let machine_id = decoded_table_optional_i64_cell_at(
+                table,
+                i,
+                "machine_id",
+                "list_threads_process_counts",
+            )?;
+            let process_name = match table.cell(i, "process_name") {
+                Some(serde_json::Value::Null) | None => None,
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| {
+                            format!(
+                        "list_threads_process_counts expected string/null process_name at row {i}"
+                    )
+                        })?
+                        .to_owned(),
+                ),
+            };
+            let thread_count =
+                decoded_table_i64_cell_at(table, i, "thread_count", "list_threads_process_counts")?;
+            let thread_count = usize::try_from(thread_count).map_err(|_| {
+                format!("list_threads_process_counts row {i} has negative thread_count")
+            })?;
+            Ok(ListThreadsProcessCount {
+                pid,
+                upid,
+                machine_id,
+                process_name,
+                thread_count,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn format_chrome_resource_summary_response(
@@ -527,6 +599,38 @@ pub(super) fn decoded_table_i64_cell(table: &DecodedTable, col: &str) -> Option<
     })
 }
 
+pub(super) fn decoded_table_i64_cell_at(
+    table: &DecodedTable,
+    row: usize,
+    col: &str,
+    context: &str,
+) -> Result<i64, String> {
+    table
+        .cell(row, col)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+        })
+        .ok_or_else(|| format!("{context} expected integer `{col}` at row {row}"))
+}
+
+pub(super) fn decoded_table_optional_i64_cell_at(
+    table: &DecodedTable,
+    row: usize,
+    col: &str,
+    context: &str,
+) -> Result<Option<i64>, String> {
+    match table.cell(row, col) {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+            .map(Some)
+            .ok_or_else(|| format!("{context} expected integer/null `{col}` at row {row}")),
+    }
+}
+
 pub(super) fn slice_descendants_applied_filters(
     params: &SliceDescendantsBreakdownParams,
     effective_limit: u32,
@@ -548,6 +652,7 @@ pub(super) fn format_slice_descendants_tool_response_with_redaction(
     effective_limit: usize,
     applied_filters: SliceDescendantsAppliedFilters,
     missing_root_ids: Vec<i64>,
+    incomplete_descendant_count: usize,
     max_string_len: Option<usize>,
     redact_strings: bool,
 ) -> Result<String, String> {
@@ -584,6 +689,7 @@ pub(super) fn format_slice_descendants_tool_response_with_redaction(
         summary_scope: SLICE_DESCENDANTS_BREAKDOWN_SCOPE,
         applied_filters,
         missing_root_ids,
+        incomplete_descendant_count,
         note: SLICE_DESCENDANTS_SHAPING_NOTE,
         rows,
     })
@@ -641,6 +747,63 @@ pub(super) async fn fetch_missing_slice_ids(
         .collect::<Vec<_>>();
     tracing::Span::current().record("missing_root_count", missing.len());
     Ok(missing)
+}
+
+#[tracing::instrument(
+    level = "debug",
+    name = "slice_descendants.incomplete_descendants",
+    skip(client, deduped_root_ids),
+    fields(root_count = deduped_root_ids.len(), incomplete_descendant_count = tracing::field::Empty)
+)]
+pub(super) async fn fetch_incomplete_slice_descendant_count(
+    client: &crate::tp_client::TraceProcessorClient,
+    deduped_root_ids: &[i64],
+    max_depth: u32,
+) -> Result<usize, PerfettoError> {
+    if deduped_root_ids.is_empty() {
+        tracing::Span::current().record("incomplete_descendant_count", 0);
+        return Ok(0);
+    }
+    let roots = deduped_root_ids
+        .iter()
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH RECURSIVE \
+           roots(root_id) AS (VALUES {roots}), \
+           descendants(root_id, slice_id, depth) AS ( \
+             SELECT r.root_id, s.id AS slice_id, 0 AS depth \
+             FROM roots r \
+             JOIN slice s ON s.id = r.root_id \
+             UNION ALL \
+             SELECT d.root_id, child.id AS slice_id, d.depth + 1 AS depth \
+             FROM descendants d \
+             JOIN slice child ON child.parent_id = d.slice_id \
+             WHERE d.depth < {max_depth} \
+           ) \
+         SELECT COUNT(*) AS incomplete_descendant_count \
+         FROM descendants d \
+         JOIN slice s ON s.id = d.slice_id \
+         WHERE d.depth > 0 AND s.dur < 0"
+    );
+    let table = client.query(&sql).await?;
+    let count = decoded_table_i64_cell_at(
+        &table,
+        0,
+        "incomplete_descendant_count",
+        "slice_descendants_incomplete_count",
+    )
+    .map_err(|message| PerfettoError::QueryError {
+        message,
+        kind: crate::error::QueryErrorKind::Other,
+    })?;
+    let count = usize::try_from(count).map_err(|_| PerfettoError::QueryError {
+        message: "slice_descendants_incomplete_count returned negative count".to_owned(),
+        kind: crate::error::QueryErrorKind::Other,
+    })?;
+    tracing::Span::current().record("incomplete_descendant_count", count);
+    Ok(count)
 }
 
 #[cfg(test)]
