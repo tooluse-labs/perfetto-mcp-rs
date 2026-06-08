@@ -206,7 +206,7 @@ pub(super) struct ChromeResourceTimingEvidence {
     pub(super) network_phase_slice_count: i64,
     pub(super) network_phase_arg_count: i64,
     pub(super) incomplete_duration_resource_slice_count: i64,
-    pub(super) incomplete_duration_resource_slices_included: bool,
+    pub(super) incomplete_duration_resource_slices_are_candidates: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -660,7 +660,7 @@ pub(super) fn chrome_resource_timing_evidence_from_probe(
             network_phase_slice_count,
             network_phase_arg_count,
             incomplete_duration_resource_slice_count,
-            incomplete_duration_resource_slices_included: true,
+            incomplete_duration_resource_slices_are_candidates: true,
         }
     } else {
         ChromeResourceTimingEvidence {
@@ -692,7 +692,7 @@ pub(super) fn chrome_resource_timing_evidence_from_probe(
             network_phase_slice_count,
             network_phase_arg_count,
             incomplete_duration_resource_slice_count,
-            incomplete_duration_resource_slices_included: true,
+            incomplete_duration_resource_slices_are_candidates: true,
         }
     }
 }

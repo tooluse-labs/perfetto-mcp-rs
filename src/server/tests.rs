@@ -797,7 +797,7 @@ fn resource_summary_response_carries_attribution_evidence_before_rows() {
         network_phase_slice_count: 0,
         network_phase_arg_count: 0,
         incomplete_duration_resource_slice_count: 1,
-        incomplete_duration_resource_slices_included: true,
+        incomplete_duration_resource_slices_are_candidates: true,
     };
 
     let response = format_chrome_resource_summary_response_with_redaction(
@@ -828,6 +828,16 @@ fn resource_summary_response_carries_attribution_evidence_before_rows() {
         json!(1)
     );
     assert_eq!(
+        parsed["resource_timing_evidence"]["incomplete_duration_resource_slices_are_candidates"],
+        json!(true)
+    );
+    assert!(
+        parsed["resource_timing_evidence"]
+            .get("incomplete_duration_resource_slices_included")
+            .is_none(),
+        "response must not imply every incomplete duration slice appears in rows: {parsed}",
+    );
+    assert_eq!(
         parsed["rows"],
         json!([["https://example.test/app.js", 123.0]])
     );
@@ -849,7 +859,7 @@ fn resource_timing_evidence_probe_distinguishes_absent_and_present_phase_hints()
     assert_eq!(absent_evidence.phase_breakdown, "absent");
     assert!(absent_evidence.unsafe_inferences.contains(&"download"));
     assert_eq!(absent_evidence.incomplete_duration_resource_slice_count, 2);
-    assert!(absent_evidence.incomplete_duration_resource_slices_included);
+    assert!(absent_evidence.incomplete_duration_resource_slices_are_candidates);
 
     let present = decoded_table(
         &[
