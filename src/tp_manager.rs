@@ -77,17 +77,49 @@ struct TraceFileFingerprint {
     sample_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceFileMetadataSnapshot {
+    size_bytes: u64,
+    modified: Option<SystemTime>,
+    platform: Option<String>,
+}
+
 impl TraceFileFingerprint {
     fn from_path(path: &Path) -> Result<Self> {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("failed to stat trace file: {}", path.display()))?;
+        let before = trace_file_metadata_snapshot(path)?;
+        let sample_sha256 = trace_file_sample_sha256(path, before.size_bytes)?;
+        ensure_trace_file_metadata_stable(path, &before)?;
         Ok(Self {
-            size_bytes: metadata.len(),
-            modified: metadata.modified().ok(),
-            platform: trace_file_platform_fingerprint(&metadata),
-            sample_sha256: trace_file_sample_sha256(path, metadata.len())?,
+            size_bytes: before.size_bytes,
+            modified: before.modified,
+            platform: before.platform,
+            sample_sha256,
         })
     }
+}
+
+fn trace_file_metadata_snapshot(path: &Path) -> Result<TraceFileMetadataSnapshot> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat trace file: {}", path.display()))?;
+    Ok(TraceFileMetadataSnapshot {
+        size_bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        platform: trace_file_platform_fingerprint(&metadata),
+    })
+}
+
+fn ensure_trace_file_metadata_stable(
+    path: &Path,
+    before: &TraceFileMetadataSnapshot,
+) -> Result<()> {
+    let after = trace_file_metadata_snapshot(path)?;
+    if &after != before {
+        bail!(
+            "trace file changed while fingerprinting {}; retry after the write completes",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn trace_file_platform_fingerprint(metadata: &std::fs::Metadata) -> Option<String> {
@@ -1874,6 +1906,23 @@ mod tests {
         assert_ne!(
             first, second,
             "same-size content changes must alter the trace fingerprint sample",
+        );
+    }
+
+    #[test]
+    fn trace_file_fingerprint_rejects_metadata_changed_during_sampling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let trace = tmp.path().join("changing.perfetto-trace");
+        std::fs::write(&trace, b"before").expect("write initial content");
+        let before = trace_file_metadata_snapshot(&trace).expect("snapshot initial metadata");
+
+        std::fs::write(&trace, b"after-with-different-size").expect("change trace content");
+        let err = ensure_trace_file_metadata_stable(&trace, &before)
+            .expect_err("metadata changes during fingerprinting must be rejected");
+
+        assert!(
+            err.to_string().contains("changed while fingerprinting"),
+            "error should explain retryable trace write race, got: {err}",
         );
     }
 
