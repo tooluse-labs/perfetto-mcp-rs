@@ -2571,6 +2571,11 @@ fn schema_discovery_tools_warn_against_execute_sql_misuse() {
             "{tool_name} description must say it is a separate MCP tool to \
                  prevent the LLM from treating it as a virtual table, got: {desc}",
         );
+        assert!(
+            desc.contains("INCLUDE"),
+            "{tool_name} description must mention INCLUDE so stdlib views are not \
+                 mistaken for missing base tables, got: {desc}",
+        );
     }
 }
 

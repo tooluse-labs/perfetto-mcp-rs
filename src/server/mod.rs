@@ -376,9 +376,9 @@ impl PerfettoMcpServer {
                        table family). Without it, internal stdlib tables (`_*`) \
                        are hidden.\n\
                        \n\
-                       Empty result: no tables matched the pattern. If a doc-listed \
-                       table is missing, retry with an explicit pattern in case \
-                       it's marked internal.\n\
+                       Empty result: no tables matched. For stdlib views, run \
+                       `execute_sql` with `INCLUDE PERFETTO MODULE ...` first; \
+                       otherwise retry an explicit pattern for internal tables.\n\
                        \n\
                        Errors when: no trace is loaded — call `load_trace` first.",
         annotations(
@@ -469,7 +469,7 @@ impl PerfettoMcpServer {
                        accepts the alias `name` (v0.11.3+).\n\
                        \n\
                        Errors when: the table doesn't exist or has no columns. Call \
-                       `list_tables` first if uncertain about the name.",
+                       `list_tables` first; stdlib views may need an `INCLUDE` first.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -510,7 +510,10 @@ impl PerfettoMcpServer {
             .map_err(|e| format!("Failed to get table structure: {e}"))?;
 
         if pragma.is_empty() {
-            return Err(format!("Table '{table_name}' not found or has no columns."));
+            return Err(format!(
+                "Table '{table_name}' not found or has no columns. If this is a stdlib view, \
+                 run `execute_sql` with `INCLUDE PERFETTO MODULE ...` first, then retry."
+            ));
         }
 
         let columns = (0..pragma.len())
