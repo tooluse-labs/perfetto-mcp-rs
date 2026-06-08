@@ -1623,6 +1623,43 @@ fn execute_sql_redact_strings_masks_query_signatures_and_encoded_values() {
 }
 
 #[test]
+fn execute_sql_redact_strings_masks_identity_query_values() {
+    let table = decoded_table(
+        &["plain", "encoded_nested", "boundary_false_positive"],
+        vec![vec![
+            json!("https://example.test/profile?email=alice@example.test&username=alice&ok=1"),
+            json!("payload=email%3Dalice%40example.test%26account%3Dteam-a%26safe%3Dkeep"),
+            json!("https://example.test/?reply_email=team@example.test&accounting=keep"),
+        ]],
+    );
+    let params = execute_sql_params("SELECT url_args");
+
+    let response =
+        format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    let plain = parsed["rows"][0][0].as_str().expect("plain URL");
+    assert!(
+        plain.starts_with("https://example.test/profile?email=<redacted:")
+            && plain.contains(">&username=<redacted:")
+            && plain.ends_with(">&ok=1"),
+        "identity query values must be redacted without collapsing structure: {plain}",
+    );
+    let encoded = parsed["rows"][0][1].as_str().expect("encoded nested args");
+    assert!(
+        encoded.starts_with("payload=email%3D<redacted:")
+            && encoded.contains(">%26account%3D<redacted:")
+            && encoded.ends_with(">%26safe%3Dkeep"),
+        "encoded identity assignments must preserve %26 delimiters: {encoded}",
+    );
+    assert_eq!(
+        parsed["rows"][0][2],
+        json!("https://example.test/?reply_email=team@example.test&accounting=keep")
+    );
+    assert_eq!(parsed["redacted"], json!(true));
+}
+
+#[test]
 fn execute_sql_redact_strings_respects_query_key_boundaries() {
     let table = decoded_table(
         &["false_positive", "encoded_false_positive", "mixed"],

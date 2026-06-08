@@ -1474,6 +1474,12 @@ pub(super) fn redact_sensitive_assignments(s: &str) -> (String, bool) {
         "session",
         "sessionid",
         "sid",
+        "email",
+        "e_mail",
+        "username",
+        "user_name",
+        "login",
+        "account",
         "signature",
         "sig",
         "sign",
@@ -1629,6 +1635,9 @@ pub(super) fn has_sensitive_key_boundary(s: &str, key_start: usize, encoded_mark
     let Some(prev) = s[..key_start].chars().next_back() else {
         return true;
     };
+    if encoded_marker && prev == '=' {
+        return true;
+    }
     matches!(
         prev,
         '?' | '&' | ';' | ' ' | '\t' | '\r' | '\n' | '"' | '\'' | '(' | '[' | '{' | '<' | ','
