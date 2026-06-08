@@ -166,6 +166,9 @@ fn decoded_row_count(table: &crate::query::DecodedTable, tool_name: &str) -> Res
 }
 
 fn count_sql_for_limited_query(sql: &str) -> Result<String, String> {
+    // Tool SQL builders append the display LIMIT as the final clause. Strip
+    // only that outer cap so COUNT(*) sees the exact grouped population while
+    // preserving any semantic LIMIT inside CTEs/subqueries.
     let limit_idx = sql
         .rfind(" LIMIT ")
         .ok_or_else(|| "tool SQL did not contain an outer LIMIT clause".to_owned())?;
