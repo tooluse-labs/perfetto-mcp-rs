@@ -121,7 +121,7 @@ pub fn decode_query_result_with_options(
         });
     }
 
-    let row_count = complete_row_count(result, num_cols);
+    let row_count = complete_row_count(result, num_cols)?;
     if options.max_rows == Some(0) {
         return Ok(DecodedQueryResult {
             table: DecodedTable {
@@ -213,16 +213,22 @@ fn float64_cell_to_value(v: f64) -> Value {
     }
 }
 
-fn complete_row_count(result: &QueryResult, num_cols: usize) -> usize {
+fn complete_row_count(result: &QueryResult, num_cols: usize) -> Result<usize, PerfettoError> {
     if num_cols == 0 {
-        return 0;
+        return Ok(0);
     }
-    result
-        .batch
-        .iter()
-        .map(|batch| batch.cells.len())
-        .sum::<usize>()
-        / num_cols
+    let mut row_count = 0;
+    for (batch_idx, batch) in result.batch.iter().enumerate() {
+        let cell_count = batch.cells.len();
+        if cell_count % num_cols != 0 {
+            return Err(PerfettoError::Other(anyhow::anyhow!(
+                "trace_processor returned an incomplete row in batch {batch_idx}: \
+                 {cell_count} cells for {num_cols} columns"
+            )));
+        }
+        row_count += cell_count / num_cols;
+    }
+    Ok(row_count)
 }
 
 #[cfg(test)]
@@ -499,6 +505,28 @@ mod tests {
         assert!(decoded.rows_truncated);
         assert_eq!(decoded.table.columns, vec!["n"]);
         assert!(decoded.table.rows.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_incomplete_row_cells_instead_of_rounding_down_count() {
+        let batch = CellsBatch {
+            cells: vec![CellType::CellVarint as i32],
+            varint_cells: vec![1],
+            float64_cells: vec![],
+            blob_cells: vec![],
+            string_cells: None,
+            is_last_batch: Some(true),
+        };
+        let result = make_result(vec!["a", "b"], vec![batch]);
+
+        let err =
+            decode_query_result_with_options(&result, DecodeQueryOptions { max_rows: Some(0) })
+                .expect_err("incomplete rows must fail before row_count is reported");
+        assert!(
+            err.to_string().contains("incomplete row")
+                && err.to_string().contains("1 cells for 2 columns"),
+            "got: {err}",
+        );
     }
 
     #[test]
