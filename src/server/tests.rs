@@ -1552,6 +1552,21 @@ fn execute_sql_redact_strings_masks_common_sensitive_values() {
 }
 
 #[test]
+fn redacted_assignment_value_uses_stable_12_hex_digest_prefix() {
+    let redacted = redacted_assignment_value("secret-token");
+    assert!(redacted.starts_with("<redacted:"), "got: {redacted}");
+    assert!(redacted.ends_with('>'), "got: {redacted}");
+    let digest = &redacted["<redacted:".len()..redacted.len() - 1];
+    assert_eq!(digest.len(), 12, "got: {redacted}");
+    assert!(
+        digest.as_bytes().iter().all(u8::is_ascii_hexdigit),
+        "got: {redacted}",
+    );
+    assert_eq!(redacted_assignment_value("secret-token"), redacted);
+    assert_ne!(redacted_assignment_value("different-token"), redacted);
+}
+
+#[test]
 fn execute_sql_redact_strings_handles_token_at_eof() {
     let table = decoded_table(
         &["url"],

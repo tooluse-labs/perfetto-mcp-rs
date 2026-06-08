@@ -49,6 +49,7 @@ pub(super) const SLICE_DESCENDANTS_SHAPING_NOTE: &str =
      from example_slice_id.";
 pub(super) const REDACTION_POLICY_NOTE: &str =
     "execute_sql and Chrome dedicated-tool string cells may contain <redacted>; this is server-side policy, not a tool parameter.";
+const REDACTION_HASH_HEX_CHARS: usize = 12;
 pub(super) const LIST_THREADS_LIMIT: usize = 2000;
 pub(super) const LIST_THREADS_SHAPING_NOTE: &str =
     "row_count is exact for the selected process set; offset/limit identify the returned page; \
@@ -1613,7 +1614,7 @@ pub(super) fn redacted_assignment_value(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     let digest = hex::encode(hasher.finalize());
-    format!("<redacted:{}>", &digest[..8])
+    format!("<redacted:{}>", &digest[..REDACTION_HASH_HEX_CHARS])
 }
 
 pub(super) fn has_sensitive_key_boundary(s: &str, key_start: usize, encoded_marker: bool) -> bool {
