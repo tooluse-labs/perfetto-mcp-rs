@@ -29,8 +29,12 @@ use perfetto_mcp_rs::sql_templates::{
     chrome_main_thread_hotspots_sql, chrome_page_load_resource_hotspots_sql,
     chrome_page_load_resource_pipeline_sql, chrome_page_load_resource_summary_sql,
     chrome_page_load_resource_timing_evidence_sql, chrome_page_load_script_hotspots_sql,
-    CHROME_PAGE_LOAD_SUMMARY_SQL, CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_SQL,
-    CHROME_TRACE_PREFLIGHT_SQL, CHROME_WEB_CONTENT_INTERACTIONS_SQL,
+    chrome_page_load_summary_sql, chrome_scroll_jank_summary_sql, chrome_startup_summary_sql,
+    chrome_web_content_interactions_sql, CHROME_PAGE_LOAD_SUMMARY_COUNT_SQL,
+    CHROME_PAGE_LOAD_SUMMARY_SQL, CHROME_SCROLL_JANK_SUMMARY_COUNT_SQL,
+    CHROME_SCROLL_JANK_SUMMARY_SQL, CHROME_STARTUP_SUMMARY_COUNT_SQL, CHROME_STARTUP_SUMMARY_SQL,
+    CHROME_TRACE_PREFLIGHT_SQL, CHROME_WEB_CONTENT_INTERACTIONS_COUNT_SQL,
+    CHROME_WEB_CONTENT_INTERACTIONS_SQL,
 };
 use perfetto_mcp_rs::tp_manager::TraceProcessorManager;
 
@@ -50,10 +54,28 @@ fn e2e_chrome_scroll_jank_summary_against_fixture() {
             .query(CHROME_SCROLL_JANK_SUMMARY_SQL)
             .await
             .expect("chrome scroll jank query must succeed on scroll_jank.pftrace");
+        let limited = client
+            .query(&chrome_scroll_jank_summary_sql(5))
+            .await
+            .expect("dynamic chrome scroll jank query must succeed");
+        let count = client
+            .query(CHROME_SCROLL_JANK_SUMMARY_COUNT_SQL)
+            .await
+            .expect("chrome scroll jank count query must succeed");
 
         assert!(
             !table.is_empty(),
             "scroll_jank.pftrace must yield at least one chrome_janky_frames row",
+        );
+        assert_eq!(
+            limited.len(),
+            5,
+            "dynamic scroll jank LIMIT 5 must cap the six-row fixture",
+        );
+        assert_eq!(
+            count.cell(0, "row_count").and_then(|v| v.as_i64()),
+            Some(6),
+            "scroll_jank.pftrace fixture row_count must stay pinned",
         );
         for i in 0..table.len() {
             assert!(
@@ -88,10 +110,28 @@ fn e2e_chrome_page_load_summary_against_fixture() {
             .query(CHROME_PAGE_LOAD_SUMMARY_SQL)
             .await
             .expect("chrome page load query must succeed on page_loads.pftrace");
+        let limited = client
+            .query(&chrome_page_load_summary_sql(5))
+            .await
+            .expect("dynamic chrome page load summary query must succeed");
+        let count = client
+            .query(CHROME_PAGE_LOAD_SUMMARY_COUNT_SQL)
+            .await
+            .expect("chrome page load summary count query must succeed");
 
         assert!(
             !table.is_empty(),
             "page_loads.pftrace must yield at least one chrome_page_loads row",
+        );
+        assert_eq!(
+            limited.len(),
+            5,
+            "dynamic page-load LIMIT 5 must cap the eight-row fixture",
+        );
+        assert_eq!(
+            count.cell(0, "row_count").and_then(|v| v.as_i64()),
+            Some(8),
+            "page_loads.pftrace fixture row_count must stay pinned",
         );
         for i in 0..table.len() {
             assert!(table.cell(i, "id").is_some(), "row {i} missing id column",);
@@ -509,9 +549,26 @@ fn e2e_chrome_startup_summary_sql_runs_cleanly() {
             .query(CHROME_STARTUP_SUMMARY_SQL)
             .await
             .expect("chrome startup SQL must resolve against the chrome.startups module");
+        let dynamic = client
+            .query(&chrome_startup_summary_sql(5))
+            .await
+            .expect("dynamic chrome startup SQL must resolve");
+        let count = client
+            .query(CHROME_STARTUP_SUMMARY_COUNT_SQL)
+            .await
+            .expect("chrome startup count SQL must resolve");
 
         // Row count not asserted — fixture has no startup data. Field shape
         // verified only when rows exist.
+        assert_eq!(
+            count.cell(0, "row_count").and_then(|v| v.as_i64()),
+            Some(table.len() as i64),
+            "startup count SQL must agree with fixture rows",
+        );
+        assert!(
+            dynamic.len() <= 5,
+            "dynamic startup LIMIT 5 must cap returned rows"
+        );
         for i in 0..table.len() {
             assert!(table.cell(i, "name").is_some(), "row {i} missing name");
             assert!(
@@ -541,7 +598,24 @@ fn e2e_chrome_web_content_interactions_sql_runs_cleanly() {
             .query(CHROME_WEB_CONTENT_INTERACTIONS_SQL)
             .await
             .expect("chrome.web_content_interactions module must resolve");
+        let dynamic = client
+            .query(&chrome_web_content_interactions_sql(5))
+            .await
+            .expect("dynamic chrome.web_content_interactions SQL must resolve");
+        let count = client
+            .query(CHROME_WEB_CONTENT_INTERACTIONS_COUNT_SQL)
+            .await
+            .expect("chrome.web_content_interactions count SQL must resolve");
 
+        assert_eq!(
+            count.cell(0, "row_count").and_then(|v| v.as_i64()),
+            Some(table.len() as i64),
+            "web interaction count SQL must agree with fixture rows",
+        );
+        assert!(
+            dynamic.len() <= 5,
+            "dynamic interaction LIMIT 5 must cap returned rows"
+        );
         for i in 0..table.len() {
             assert!(
                 table.cell(i, "interaction_type").is_some(),

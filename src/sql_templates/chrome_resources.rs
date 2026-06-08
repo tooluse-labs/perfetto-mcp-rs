@@ -331,6 +331,16 @@ pub fn chrome_page_load_resource_summary_sql(
     } else {
         chrome_page_load_raw_window_navigation_url_expr(page_window)
     };
+    let navigation_match_count_expr = if page_window.phase.is_some() {
+        "1".to_owned()
+    } else {
+        chrome_page_load_raw_window_navigation_count_expr(page_window)
+    };
+    let navigation_context_status_expr = if page_window.phase.is_some() {
+        "'explicit_page_load_window'".to_owned()
+    } else {
+        chrome_page_load_raw_window_navigation_status_expr(page_window)
+    };
     let url_host_expr = chrome_resource_url_host_expr("rr.url_key");
     let nav_origin_expr =
         chrome_resource_url_origin_expr("COALESCE((SELECT nav_url FROM navigation_context), '')");
@@ -344,6 +354,8 @@ pub fn chrome_page_load_resource_summary_sql(
         ", navigation_context AS ( \
            SELECT \
              {nav_url_expr} AS nav_url, \
+             {navigation_match_count_expr} AS navigation_match_count, \
+             {navigation_context_status_expr} AS navigation_context_status, \
              GROUP_CONCAT(DISTINCT CASE \
                WHEN process_name = 'Renderer' THEN upid \
              END) AS target_renderer_upids \
@@ -361,9 +373,14 @@ pub fn chrome_page_load_resource_summary_sql(
              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS example_url, \
             {url_host_expr} AS url_host, \
             {url_origin_expr} AS url_origin, \
+            (SELECT nav_url FROM navigation_context) AS navigation_url, \
+            (SELECT navigation_context_status FROM navigation_context) AS navigation_context_status, \
+            (SELECT navigation_match_count FROM navigation_context) AS navigation_match_count, \
             CASE \
               WHEN rr.url_key GLOB 'chrome://*' OR rr.url_key GLOB 'chrome-extension://*' \
                 THEN 'browser_ui_or_extension' \
+              WHEN (SELECT navigation_context_status FROM navigation_context) IN ('none', 'ambiguous') \
+                THEN 'unknown' \
               WHEN (SELECT nav_url FROM navigation_context) IS NULL THEN 'unknown' \
               WHEN rr.url_key = {nav_url_key_expr} \
                 THEN 'navigation_url' \
@@ -373,6 +390,8 @@ pub fn chrome_page_load_resource_summary_sql(
               ELSE 'unknown' \
             END AS relation_to_navigation, \
             CASE \
+              WHEN (SELECT navigation_context_status FROM navigation_context) IN ('none', 'ambiguous') \
+                THEN 'unknown' \
               WHEN (SELECT target_renderer_upids FROM navigation_context) IS NULL \
                 THEN 'unknown' \
               WHEN MAX(CASE WHEN INSTR( \
@@ -384,6 +403,36 @@ pub fn chrome_page_load_resource_summary_sql(
                 THEN 'other_renderer' \
               ELSE 'browser_or_service_only' \
             END AS renderer_relation, \
+            CASE \
+              WHEN (SELECT navigation_context_status FROM navigation_context) IN ('none', 'ambiguous') \
+                THEN 'low' \
+              WHEN (SELECT target_renderer_upids FROM navigation_context) IS NULL \
+                THEN 'low' \
+              WHEN MAX(CASE WHEN INSTR( \
+                  ',' || (SELECT target_renderer_upids FROM navigation_context) || ',', \
+                  ',' || rr.upid || ',' \
+                ) > 0 THEN 1 ELSE 0 END) = 1 \
+                THEN 'medium' \
+              WHEN MAX(CASE WHEN rr.process_name = 'Renderer' THEN 1 ELSE 0 END) = 1 \
+                THEN 'medium' \
+              ELSE 'low' \
+            END AS renderer_relation_confidence, \
+            CASE \
+              WHEN (SELECT navigation_context_status FROM navigation_context) = 'ambiguous' \
+                THEN 'ambiguous_navigation_context' \
+              WHEN (SELECT navigation_context_status FROM navigation_context) = 'none' \
+                THEN 'no_navigation_context' \
+              WHEN (SELECT target_renderer_upids FROM navigation_context) IS NULL \
+                THEN 'no_renderer_navigation_candidate' \
+              WHEN MAX(CASE WHEN INSTR( \
+                  ',' || (SELECT target_renderer_upids FROM navigation_context) || ',', \
+                  ',' || rr.upid || ',' \
+                ) > 0 THEN 1 ELSE 0 END) = 1 \
+                THEN 'navigation_url_renderer_candidate_upid_match' \
+              WHEN MAX(CASE WHEN rr.process_name = 'Renderer' THEN 1 ELSE 0 END) = 1 \
+                THEN 'renderer_process_without_navigation_match' \
+              ELSE 'browser_or_service_only' \
+            END AS renderer_relation_source, \
             (SELECT target_renderer_upids FROM navigation_context) AS target_renderer_upids, \
             COUNT(*) AS slice_count, \
             (SELECT r2.name FROM resource_rows r2 \
@@ -865,8 +914,7 @@ pub(super) fn chrome_url_arg_priority_expr(args_alias: &str) -> String {
     )
 }
 
-fn chrome_page_load_raw_window_navigation_url_expr(page_window: ChromePageLoadWindowSql) -> String {
-    const NAV_END_EXPR: &str = "NULLIF(MAX( \
+const RAW_WINDOW_NAV_END_EXPR: &str = "NULLIF(MAX( \
         COALESCE(load_event_ts, -1), \
         COALESCE(fcp_ts, -1), \
         COALESCE(lcp_ts, -1), \
@@ -876,21 +924,11 @@ fn chrome_page_load_raw_window_navigation_url_expr(page_window: ChromePageLoadWi
         COALESCE(mark_interactive_ts, -1) \
     ), -1)";
 
-    if page_window.start_ts_ns.is_none() && page_window.end_ts_ns.is_none() {
+fn chrome_page_load_raw_window_navigation_url_expr(page_window: ChromePageLoadWindowSql) -> String {
+    let Some(predicates) = chrome_page_load_raw_window_navigation_predicates(page_window) else {
         return "(SELECT url FROM chrome_page_loads ORDER BY navigation_start_ts DESC LIMIT 1)"
             .to_owned();
-    }
-
-    let mut predicates = vec![
-        "navigation_start_ts IS NOT NULL".to_owned(),
-        format!("{NAV_END_EXPR} IS NOT NULL"),
-    ];
-    if let Some(end) = page_window.end_ts_ns {
-        predicates.push(format!("navigation_start_ts < {end}"));
-    }
-    if let Some(start) = page_window.start_ts_ns {
-        predicates.push(format!("{NAV_END_EXPR} > {start}"));
-    }
+    };
 
     format!(
         "(SELECT url FROM chrome_page_loads \
@@ -898,6 +936,53 @@ fn chrome_page_load_raw_window_navigation_url_expr(page_window: ChromePageLoadWi
          ORDER BY navigation_start_ts DESC LIMIT 1)",
         predicates.join(" AND ")
     )
+}
+
+fn chrome_page_load_raw_window_navigation_count_expr(
+    page_window: ChromePageLoadWindowSql,
+) -> String {
+    let Some(predicates) = chrome_page_load_raw_window_navigation_predicates(page_window) else {
+        return "1".to_owned();
+    };
+    format!(
+        "(SELECT COUNT(*) FROM chrome_page_loads WHERE {})",
+        predicates.join(" AND ")
+    )
+}
+
+fn chrome_page_load_raw_window_navigation_status_expr(
+    page_window: ChromePageLoadWindowSql,
+) -> String {
+    let Some(_) = chrome_page_load_raw_window_navigation_predicates(page_window) else {
+        return "'latest_navigation_fallback'".to_owned();
+    };
+    let count_expr = chrome_page_load_raw_window_navigation_count_expr(page_window);
+    format!(
+        "CASE \
+           WHEN {count_expr} = 0 THEN 'none' \
+           WHEN {count_expr} = 1 THEN 'single' \
+           ELSE 'ambiguous' \
+         END"
+    )
+}
+
+fn chrome_page_load_raw_window_navigation_predicates(
+    page_window: ChromePageLoadWindowSql,
+) -> Option<Vec<String>> {
+    if page_window.start_ts_ns.is_none() && page_window.end_ts_ns.is_none() {
+        return None;
+    }
+    let mut predicates = vec![
+        "navigation_start_ts IS NOT NULL".to_owned(),
+        format!("{RAW_WINDOW_NAV_END_EXPR} IS NOT NULL"),
+    ];
+    if let Some(end) = page_window.end_ts_ns {
+        predicates.push(format!("navigation_start_ts < {end}"));
+    }
+    if let Some(start) = page_window.start_ts_ns {
+        predicates.push(format!("{RAW_WINDOW_NAV_END_EXPR} > {start}"));
+    }
+    Some(predicates)
 }
 
 fn chrome_resource_url_authority_expr(url_expr: &str) -> String {

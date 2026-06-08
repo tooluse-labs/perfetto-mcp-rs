@@ -575,6 +575,37 @@ fn list_threads_response_exposes_exact_count_and_truncation() {
 }
 
 #[test]
+fn list_threads_response_marks_complete_result_not_truncated() {
+    let table = decoded_table(
+        &["tid", "thread_name", "pid", "upid"],
+        vec![vec![
+            json!(10),
+            json!("CrRendererMain"),
+            json!(100),
+            json!(1),
+        ]],
+    );
+
+    let response = format_list_threads_response(table, 1).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    assert_eq!(parsed["row_count"], json!(1));
+    assert_eq!(parsed["returned_rows"], json!(1));
+    assert_eq!(parsed["truncated"], json!(false));
+}
+
+#[test]
+fn decoded_row_count_rejects_missing_or_invalid_count_cell() {
+    let missing = decoded_table(&["n"], vec![vec![json!(1)]]);
+    let err = decoded_row_count(&missing, "test_count").expect_err("missing count must reject");
+    assert!(err.contains("row_count"), "got: {err}");
+
+    let invalid = decoded_table(&["row_count"], vec![vec![json!("not-a-number")]]);
+    let err = decoded_row_count(&invalid, "test_count").expect_err("invalid count must reject");
+    assert!(err.contains("row_count"), "got: {err}");
+}
+
+#[test]
 fn chrome_tool_response_uses_server_side_string_redaction() {
     let table = decoded_table(
         &["url"],
@@ -592,9 +623,11 @@ fn chrome_tool_response_uses_server_side_string_redaction() {
     .expect("serialize");
     let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
-    assert_eq!(
-        parsed["rows"][0][0],
-        json!("https://px.effirst.com/api/v1/otelconfig?wpk-header=<redacted>&ok=1")
+    let redacted_url = parsed["rows"][0][0].as_str().expect("redacted URL");
+    assert!(
+        redacted_url.starts_with("https://px.effirst.com/api/v1/otelconfig?wpk-header=<redacted:")
+            && redacted_url.ends_with(">&ok=1"),
+        "sensitive URL value must be redacted with a stable placeholder: {redacted_url}",
     );
     assert_eq!(parsed["redacted"], json!(true));
     assert_eq!(parsed["string_truncated"], json!(false));
@@ -937,6 +970,13 @@ fn execute_sql_head_limits_returned_rows_and_marks_truncation() {
             .contains("capped at 5000"),
         "note must explain the output row cap: {parsed}",
     );
+    assert!(
+        parsed["note"]
+            .as_str()
+            .expect("note string")
+            .contains("blob:hex:<hex>"),
+        "note must document blob cell encoding: {parsed}",
+    );
 }
 
 #[test]
@@ -1106,6 +1146,27 @@ fn execute_sql_max_string_len_truncates_returned_cells() {
 }
 
 #[test]
+fn execute_sql_max_string_len_truncates_blob_cells_with_type_context() {
+    let table = decoded_table(&["payload"], vec![vec![json!("blob:hex:00abff102030")]]);
+    let mut params = execute_sql_params("SELECT payload");
+    params.max_string_len = Some(13);
+
+    let response =
+        format_execute_sql_response_with_redaction(table, &params, false).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    assert_eq!(parsed["rows"][0][0], json!("blob:hex:00ab...(+4 bytes)"));
+    assert_eq!(parsed["string_truncated"], json!(true));
+    assert!(
+        parsed["note"]
+            .as_str()
+            .expect("note")
+            .contains("truncated blobs keep the prefix"),
+        "note must explain blob truncation: {parsed}",
+    );
+}
+
+#[test]
 fn execute_sql_redact_strings_masks_common_sensitive_values() {
     let table = decoded_table(
         &["header", "path", "url"],
@@ -1129,9 +1190,11 @@ fn execute_sql_redact_strings_masks_common_sensitive_values() {
         parsed["rows"][0][1],
         json!("C:\\Users\\<user>\\AppData\\Local\\Qianwen")
     );
-    assert_eq!(
-        parsed["rows"][0][2],
-        json!("https://example.test/?access_token=<redacted>&ok=1")
+    let redacted_url = parsed["rows"][0][2].as_str().expect("redacted URL");
+    assert!(
+        redacted_url.starts_with("https://example.test/?access_token=<redacted:")
+            && redacted_url.ends_with(">&ok=1"),
+        "access_token must be redacted with a stable placeholder: {redacted_url}",
     );
     assert_eq!(parsed["redacted"], json!(true));
 }
@@ -1150,9 +1213,11 @@ fn execute_sql_redact_strings_handles_token_at_eof() {
         format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
     let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
-    assert_eq!(
-        parsed["rows"][0][0],
-        json!("https://example.test/?access_token=<redacted>")
+    let redacted_url = parsed["rows"][0][0].as_str().expect("redacted URL");
+    assert!(
+        redacted_url.starts_with("https://example.test/?access_token=<redacted:")
+            && redacted_url.ends_with('>'),
+        "access_token at EOF must be redacted with a stable placeholder: {redacted_url}",
     );
     assert_eq!(parsed["redacted"], json!(true));
 }
@@ -1174,13 +1239,18 @@ fn execute_sql_redact_strings_masks_query_signatures_and_encoded_values() {
         format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
     let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
 
-    assert_eq!(
-        parsed["rows"][0][0],
-        json!("https://px.effirst.com/api/v1/jconfig?wpk-header=<redacted>&ok=1")
+    let top_level = parsed["rows"][0][0].as_str().expect("top-level URL");
+    assert!(
+        top_level.starts_with("https://px.effirst.com/api/v1/jconfig?wpk-header=<redacted:")
+            && top_level.ends_with(">&ok=1"),
+        "top-level wpk-header must be redacted with a stable placeholder: {top_level}",
     );
-    assert_eq!(
-        parsed["rows"][0][1],
-        json!("payload=app%3Ddemo%26sign%3D<redacted>%26ud%3D<redacted>%26safe%3Dkeep")
+    let nested = parsed["rows"][0][1].as_str().expect("encoded nested args");
+    assert!(
+        nested.starts_with("payload=app%3Ddemo%26sign%3D<redacted:")
+            && nested.contains(">%26ud%3D<redacted:")
+            && nested.ends_with(">%26safe%3Dkeep"),
+        "encoded sensitive assignments must preserve structure and stable placeholders: {nested}",
     );
     assert_eq!(parsed["redacted"], json!(true));
 }
@@ -1206,11 +1276,97 @@ fn execute_sql_redact_strings_respects_query_key_boundaries() {
         json!("https://example.test/?design=dark&cloud=prod&guid=abc")
     );
     assert_eq!(parsed["rows"][0][1], json!("prefixéésign%3Dabc"));
-    assert_eq!(
-        parsed["rows"][0][2],
-        json!("https://example.test/?design=dark&sign=<redacted>&cloud=prod&uid=<redacted>")
+    let mixed = parsed["rows"][0][2].as_str().expect("mixed URL");
+    assert!(
+        mixed.starts_with("https://example.test/?design=dark&sign=<redacted:")
+            && mixed.contains(">&cloud=prod&uid=<redacted:")
+            && mixed.ends_with('>'),
+        "real sensitive keys must redact without collapsing all values: {mixed}",
     );
     assert_eq!(parsed["redacted"], json!(true));
+}
+
+#[test]
+fn execute_sql_redact_strings_does_not_rewrite_network_url_paths_as_user_paths() {
+    let table = decoded_table(
+        &["cdn_url", "local_path", "file_url"],
+        vec![vec![
+            json!("https://cdn.example.test/Users/avatars/42.png"),
+            json!("/Users/alice/trace.pftrace"),
+            json!("file:///Users/alice/trace.pftrace"),
+        ]],
+    );
+    let params = execute_sql_params("SELECT paths");
+
+    let response =
+        format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+
+    assert_eq!(
+        parsed["rows"][0][0],
+        json!("https://cdn.example.test/Users/avatars/42.png")
+    );
+    assert_eq!(parsed["rows"][0][1], json!("/Users/<user>/trace.pftrace"));
+    assert_eq!(
+        parsed["rows"][0][2],
+        json!("file:///Users/<user>/trace.pftrace")
+    );
+    assert_eq!(parsed["redacted"], json!(true));
+}
+
+#[test]
+fn execute_sql_redact_strings_preserves_low_risk_diagnostic_token_values() {
+    let table = decoded_table(
+        &["url"],
+        vec![vec![json!(
+            "https://example.test/frame?token=main_frame&session=warm&access_token=secret"
+        )]],
+    );
+    let params = execute_sql_params("SELECT url");
+
+    let response =
+        format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+    let url = parsed["rows"][0][0].as_str().expect("redacted URL");
+
+    assert!(
+        url.contains("token=main_frame") && url.contains("session=warm"),
+        "low-risk diagnostic enum values should remain visible: {url}",
+    );
+    assert!(
+        url.contains("access_token=<redacted:"),
+        "high-risk token fields must still redact: {url}",
+    );
+    assert_eq!(parsed["redacted"], json!(true));
+}
+
+#[test]
+fn execute_sql_redact_strings_does_not_treat_suffix_shapes_as_safe_secrets() {
+    let table = decoded_table(
+        &["url"],
+        vec![vec![json!(
+            "https://example.test/?token=evil_worker&session=cold_process&sign=main_frame"
+        )]],
+    );
+    let params = execute_sql_params("SELECT url");
+
+    let response =
+        format_execute_sql_response_with_redaction(table, &params, true).expect("serialize");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("json");
+    let url = parsed["rows"][0][0].as_str().expect("redacted URL");
+
+    assert!(
+        url.contains("token=<redacted:")
+            && url.contains("session=<redacted:")
+            && url.contains("sign=<redacted:"),
+        "suffix-shaped sensitive values must not bypass redaction: {url}",
+    );
+    assert!(
+        !url.contains("evil_worker")
+            && !url.contains("cold_process")
+            && !url.contains("sign=main_frame"),
+        "redaction must remove original sensitive values: {url}",
+    );
 }
 
 #[test]
@@ -2514,6 +2670,10 @@ fn chrome_main_thread_hotspots_sql_with_raw_window_emits_ts_filters() {
     assert!(sql.contains("AND ct.ts + ct.dur > 1000"), "got: {sql}");
     assert!(sql.contains("AND ct.ts < 2000"), "got: {sql}");
     assert!(
+        sql.contains("AND (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) > 16000000"),
+        "windowed min_dur_ms must filter clipped overlap duration, got: {sql}",
+    );
+    assert!(
         sql.contains("ORDER BY (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) DESC, ct.dur DESC"),
         "windowed hotspots must rank by clipped overlap before full duration, got: {sql}",
     );
@@ -2993,8 +3153,19 @@ fn chrome_page_load_resource_summary_sql_groups_by_url() {
         "summary must classify URL relatedness to the navigation URL, got: {sql}",
     );
     assert!(
+        sql.contains("AS navigation_context_status")
+            && sql.contains("AS navigation_match_count")
+            && sql.contains("AS navigation_url"),
+        "summary must expose navigation context evidence for relation labels, got: {sql}",
+    );
+    assert!(
         sql.contains("AS renderer_relation"),
         "summary must classify target vs other renderer involvement, got: {sql}",
+    );
+    assert!(
+        sql.contains("AS renderer_relation_confidence")
+            && sql.contains("AS renderer_relation_source"),
+        "summary must expose renderer relation confidence/source, got: {sql}",
     );
     assert!(
         sql.contains("AS primary_slice_name"),
@@ -3071,6 +3242,14 @@ fn chrome_page_load_resource_summary_sql_scopes_navigation_context_to_raw_window
         "raw-window navigation context must not use latest whole-trace nav, got: {sql}",
     );
     assert!(
+        sql.contains("SELECT COUNT(*) FROM chrome_page_loads WHERE"),
+        "raw-window navigation context must count matching navigations, got: {sql}",
+    );
+    assert!(
+        sql.contains("ELSE 'ambiguous'"),
+        "raw-window navigation context must surface ambiguous multi-navigation windows, got: {sql}",
+    );
+    assert!(
         sql.contains("NULLIF(MAX(") && sql.contains("COALESCE(mark_interactive_ts, -1)"),
         "raw-window navigation context must use the latest non-null page-load marker, got: {sql}",
     );
@@ -3083,8 +3262,16 @@ fn chrome_page_load_resource_summary_sql_scopes_navigation_context_to_raw_window
         "missing raw-window navigation context must not classify same/cross origin, got: {sql}",
     );
     assert!(
+        sql.contains("WHEN (SELECT navigation_context_status FROM navigation_context) IN ('none', 'ambiguous')"),
+        "ambiguous raw-window navigation context must not classify same/cross origin, got: {sql}",
+    );
+    assert!(
         sql.contains("WHEN (SELECT target_renderer_upids FROM navigation_context) IS NULL"),
         "missing target renderer context must not report other_renderer/browser-only, got: {sql}",
+    );
+    assert!(
+        sql.contains("THEN 'ambiguous_navigation_context'"),
+        "renderer relation source must flag ambiguous navigation context, got: {sql}",
     );
 }
 

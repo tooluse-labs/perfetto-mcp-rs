@@ -1,4 +1,5 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::{PerfettoError, MAX_ROWS};
 use crate::params::{
@@ -16,11 +17,12 @@ pub(super) const DEFAULT_TOOL_MAX_STRING_LEN: Option<usize> = None;
 pub(super) const DEFAULT_EXECUTE_SQL_SUMMARY_ROWS: usize = 10;
 pub(super) const EXECUTE_SQL_SHAPING_NOTE: &str =
     "row_count is exact post-SQL decoded rows when row_count_known=true; \
-     head/limit only trims returned tool rows, is capped at 5000, and does not rewrite SQL.";
+     head/limit only trims returned tool rows, is capped at 5000, and does not rewrite SQL; \
+     full blob cells render as blob:hex:<hex>; truncated blobs keep the prefix and include remaining-byte count.";
 pub(super) const CHROME_TOOL_SHAPING_NOTE: &str =
-    "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened.";
+    "row_count unknown; truncated=row cap reached; string_truncated=cell text shortened; full blob cells use blob:hex:<hex>.";
 pub(super) const CHROME_TOOL_KNOWN_ROW_COUNT_NOTE: &str =
-    "row_count is exact for the tool query; truncated=true means more rows exist than returned; string_truncated=cell text shortened.";
+    "row_count is exact for the tool query; truncated=true means more rows exist than returned; string_truncated=cell text shortened; full blob cells use blob:hex:<hex>.";
 pub(super) const SLICE_DESCENDANTS_BREAKDOWN_SCOPE: &str = "descendants only; root slices excluded";
 pub(super) const SLICE_DESCENDANTS_SHAPING_NOTE: &str =
     "slice_count, inclusive_total_ms, self_ms, and max_ms include only descendants matching \
@@ -909,6 +911,22 @@ pub(super) fn truncate_string_cell(s: &str, max_chars: usize) -> (String, bool) 
     if s.chars().count() <= max_chars {
         return (s.to_owned(), false);
     }
+    if let Some(hex) = s
+        .strip_prefix("blob:hex:")
+        .filter(|hex| hex.len() % 2 == 0 && hex.as_bytes().iter().all(u8::is_ascii_hexdigit))
+    {
+        let keep_hex_chars = max_chars.saturating_sub("blob:hex:".len()) / 2 * 2;
+        let keep_hex_chars = keep_hex_chars.min(hex.len() / 2 * 2);
+        let remaining_bytes = hex.len().saturating_sub(keep_hex_chars) / 2;
+        return (
+            format!(
+                "blob:hex:{}...(+{} bytes)",
+                &hex[..keep_hex_chars],
+                remaining_bytes
+            ),
+            true,
+        );
+    }
     let mut out: String = s.chars().take(max_chars).collect();
     out.push_str("...<truncated>");
     (out, true)
@@ -970,7 +988,12 @@ pub(super) fn redact_user_path_segments(s: &str) -> (String, bool) {
     for prefix in ["C:\\Users\\", "C:/Users/", "/Users/", "/home/"] {
         let mut search_from = 0;
         while let Some(rel) = out[search_from..].find(prefix) {
-            let start = search_from + rel + prefix.len();
+            let prefix_start = search_from + rel;
+            if is_network_url_path_context(&out, prefix_start) {
+                search_from = prefix_start + prefix.len();
+                continue;
+            }
+            let start = prefix_start + prefix.len();
             let tail = &out[start..];
             let end = tail
                 .char_indices()
@@ -987,6 +1010,32 @@ pub(super) fn redact_user_path_segments(s: &str) -> (String, bool) {
         }
     }
     (out, changed)
+}
+
+pub(super) fn is_network_url_path_context(s: &str, prefix_start: usize) -> bool {
+    let before = &s[..prefix_start];
+    let Some(scheme_sep) = before.rfind("://") else {
+        return false;
+    };
+    if before[scheme_sep + 3..]
+        .chars()
+        .any(is_string_cell_token_boundary)
+    {
+        return false;
+    }
+    let scheme_start = before[..scheme_sep]
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let scheme = &before[scheme_start..scheme_sep];
+    !scheme.eq_ignore_ascii_case("file")
+}
+
+fn is_string_cell_token_boundary(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\r' | '\n' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ','
+    )
 }
 
 pub(super) fn redact_sensitive_assignments(s: &str) -> (String, bool) {
@@ -1025,7 +1074,8 @@ pub(super) fn redact_sensitive_assignments(s: &str) -> (String, bool) {
     for key in sensitive_keys {
         for separator in ["=", "%3d"] {
             let marker = format!("{key}{separator}");
-            changed |= redact_sensitive_assignment_marker(&mut out, &marker, separator == "%3d");
+            changed |=
+                redact_sensitive_assignment_marker(&mut out, key, &marker, separator == "%3d");
         }
     }
     (out, changed)
@@ -1033,6 +1083,7 @@ pub(super) fn redact_sensitive_assignments(s: &str) -> (String, bool) {
 
 pub(super) fn redact_sensitive_assignment_marker(
     out: &mut String,
+    key: &str,
     marker: &str,
     encoded_marker: bool,
 ) -> bool {
@@ -1054,10 +1105,15 @@ pub(super) fn redact_sensitive_assignment_marker(
 
         let value_start = key_start + marker.len();
         let value_end = sensitive_assignment_value_end(out, value_start, encoded_marker);
-        if value_start < value_end && &out[value_start..value_end] != "<redacted>" {
-            out.replace_range(value_start..value_end, "<redacted>");
+        let value = &out[value_start..value_end];
+        if value_start < value_end
+            && !value.starts_with("<redacted")
+            && should_redact_sensitive_assignment(key, value)
+        {
+            let replacement = redacted_assignment_value(value);
+            out.replace_range(value_start..value_end, &replacement);
             changed = true;
-            search_from = (value_start + "<redacted>".len()).min(out.len());
+            search_from = (value_start + replacement.len()).min(out.len());
         } else if value_end >= out.len() {
             break;
         } else {
@@ -1065,6 +1121,82 @@ pub(super) fn redact_sensitive_assignment_marker(
         }
     }
     changed
+}
+
+pub(super) fn should_redact_sensitive_assignment(key: &str, value: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if matches!(
+        key.as_str(),
+        "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "auth"
+            | "authorization"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "apikey"
+            | "api_key"
+            | "signature"
+            | "sig"
+            | "sign"
+            | "wpk-header"
+            | "access_key"
+            | "accesskey"
+    ) {
+        return true;
+    }
+
+    if matches!(
+        key.as_str(),
+        "ud" | "uid" | "user_id" | "userid" | "device_id" | "deviceid" | "open_id" | "openid"
+    ) {
+        return true;
+    }
+
+    !is_low_risk_diagnostic_assignment_value(&key, value)
+}
+
+pub(super) fn is_low_risk_diagnostic_assignment_value(key: &str, value: &str) -> bool {
+    if !matches!(key, "token" | "session" | "sessionid" | "sid") {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    let simple = lower
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c == '_' || c == '-');
+    if !simple || lower.is_empty() || lower.len() > 32 {
+        return false;
+    }
+
+    const LOW_RISK_VALUES: &[&str] = &[
+        "main_frame",
+        "subframe",
+        "iframe",
+        "frame",
+        "renderer",
+        "browser",
+        "worker",
+        "service_worker",
+        "warm",
+        "cold",
+        "cached",
+        "uncached",
+        "hit",
+        "miss",
+        "true",
+        "false",
+        "initial",
+        "reload",
+    ];
+    LOW_RISK_VALUES.contains(&lower.as_str())
+}
+
+pub(super) fn redacted_assignment_value(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("<redacted:{}>", &digest[..8])
 }
 
 pub(super) fn has_sensitive_key_boundary(s: &str, key_start: usize, encoded_marker: bool) -> bool {

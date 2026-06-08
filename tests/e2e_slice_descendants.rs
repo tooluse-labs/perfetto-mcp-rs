@@ -25,20 +25,11 @@ fn e2e_slice_descendants_breakdown_against_fixture() {
         let trace = Path::new("tests/fixtures/page_loads.pftrace");
 
         let client = manager.get_client(trace).await.expect("spawn tp_shell");
-        let roots = client
-            .query(
-                "SELECT parent_id AS root_id \
-                 FROM slice \
-                 WHERE parent_id IS NOT NULL \
-                   AND dur >= 0 \
-                 LIMIT 1",
-            )
-            .await
-            .expect("fixture must expose slice.parent_id");
-        let root_id = roots
-            .cell(0, "root_id")
-            .and_then(|v| v.as_i64())
-            .expect("page_loads fixture must contain at least one child slice");
+        // Stable nested root in page_loads.pftrace. Its first child
+        // ("Initializing") contains a long descendant chain, so self_ms must
+        // be much smaller than inclusive_total_ms. This catches regressions
+        // where self_dur accidentally becomes inclusive dur again.
+        let root_id = 5617;
 
         let sql = slice_descendants_breakdown_sql(SliceDescendantsBreakdownFilters {
             slice_ids: &[root_id],
@@ -105,5 +96,40 @@ fn e2e_slice_descendants_breakdown_against_fixture() {
                 "row {i} example_slice_id must be non-null when descendants exist: {example:?}",
             );
         }
+
+        let mut found_initializing = false;
+        for i in 0..table.len() {
+            let depth = table.cell(i, "depth").and_then(|v| v.as_i64());
+            let name = table.cell(i, "name").and_then(|v| v.as_str());
+            if depth == Some(1) && name == Some("Initializing") {
+                found_initializing = true;
+                let inclusive = table
+                    .cell(i, "inclusive_total_ms")
+                    .and_then(|v| v.as_f64())
+                    .expect("Initializing inclusive_total_ms must be numeric");
+                let self_ms = table
+                    .cell(i, "self_ms")
+                    .and_then(|v| v.as_f64())
+                    .expect("Initializing self_ms must be numeric");
+
+                assert!(
+                    (inclusive - 712.149).abs() < 0.001,
+                    "fixture inclusive_total_ms drifted; got {inclusive}",
+                );
+                assert!(
+                    (self_ms - 19.429).abs() < 0.001,
+                    "self_ms must subtract direct child inclusive time; got {self_ms}",
+                );
+                assert!(
+                    self_ms < inclusive * 0.05,
+                    "self_ms should be far smaller than inclusive time for nested root; \
+                     got self={self_ms}, inclusive={inclusive}",
+                );
+            }
+        }
+        assert!(
+            found_initializing,
+            "fixture root {root_id} must expose the nested Initializing row"
+        );
     });
 }

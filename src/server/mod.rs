@@ -274,7 +274,8 @@ impl PerfettoMcpServer {
                        Optional output shaping (`head`/`limit`, `columns_only`, \
                        `summary`, `include_row_count`, `max_string_len`) only \
                        changes what this tool returns; it does not rewrite the \
-                       SQL. String results may be redacted by the server privacy \
+                       SQL. Blob cells render as `blob:hex:<hex>`. String results \
+                       may be redacted by the server privacy \
                        policy before they are returned, preserving diagnostic \
                        structure while masking sensitive URL/header/cookie/path \
                        values. Requires `load_trace` to have run first.\n\
@@ -644,9 +645,7 @@ impl PerfettoMcpServer {
             .query(&count_sql)
             .await
             .map_err(|e| format!("Failed to count threads: {e}"))?;
-        let row_count = decoded_table_i64_cell(&count_table, "row_count")
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(0);
+        let row_count = decoded_row_count(&count_table, "list_threads_in_process")?;
         if row_count == 0 {
             return Err(format!(
                 "No threads found for {selector_for_error}. Call list_processes \
@@ -856,7 +855,9 @@ impl PerfettoMcpServer {
         description = "URL-level Chrome resource/request summary for a page-load/raw \
                        window. Returns URL key, slice/process/priority sets, \
                        first/last/span, max_overlap_ms, summed_overlap_ms, \
-                       pct_of_window, example_slice_id, and attribution evidence. \
+                       relation_to_navigation with navigation_context_status, \
+                       renderer_relation with confidence/source, example_slice_id, \
+                       and attribution evidence. \
                        Use before `chrome_page_load_resource_hotspots` for slow \
                        FCP/load; rank by max overlap because summed overlap can \
                        double-count layered slices.",
@@ -1072,7 +1073,7 @@ impl PerfettoMcpServer {
         description = "Top Chrome main-thread tasks by wall duration: id, ts, \
                        name, task_type, thread_name, process_name, upid, pid, \
                        dur_ms, overlap_dur_ms, cpu_pct, thread_dur_ms, \
-                       overlap_thread_dur_ms. Uses `chrome.tasks`, \
+                       overlap_thread_dur_ms (linear estimate). Uses `chrome.tasks`, \
                        `thread.is_main_thread = 1` when available, and Chrome's \
                        `Cr*Main` thread-name convention as a fallback for traces \
                        where thread metadata is incomplete or incorrect. Pass a returned \
@@ -1101,9 +1102,9 @@ impl PerfettoMcpServer {
                          in nanoseconds (`end_ts_ns` exclusive); aliases `start_ts` \
                          / `end_ts` are accepted; intersect page-load windows. \
                          `overlap_dur_ms` is clipped to that window.\n\
-                       - `min_dur_ms`: minimum task duration. Defaults to 16 (one \
-                         60 Hz frame). Pass 0 for ALL tasks; raise to 33 (30 Hz) or \
-                         100 to focus on bigger stutters.\n\
+                       - `min_dur_ms`: minimum full-task duration, or clipped \
+                         overlap duration when a window is set. Defaults to 16 \
+                         ms. Pass 0 for all positive-overlap tasks.\n\
                         - `limit`: max rows (default 100, capped at 5000). Must be > 0 \
                           if set.\n\
                         - `max_string_len`: optional cap for returned string cells. \
