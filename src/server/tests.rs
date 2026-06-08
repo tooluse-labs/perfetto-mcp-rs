@@ -3090,6 +3090,11 @@ fn chrome_main_thread_hotspots_sql_no_filter_runs_all_main_threads() {
         "cpu_pct must be clamped to 0..100%, got: {sql}",
     );
     assert!(
+        sql.contains("END AS full_task_cpu_pct")
+            && sql.contains("ct.thread_dur / 1e6 AS full_task_thread_dur_ms"),
+        "main-thread SQL must expose self-describing full-task CPU aliases, got: {sql}",
+    );
+    assert!(
         sql.contains("AS overlap_cpu_pct")
             && compact.contains(
                 "ROUND(MAX(MIN( ct.thread_dur * ct.dur * 1.0 / ct.dur, ct.dur ), 0.0) * 100.0 / ct.dur, 1)"
@@ -3271,6 +3276,13 @@ fn chrome_main_thread_hotspots_sql_with_raw_window_emits_ts_filters() {
             "ROUND(MAX(MIN( ct.thread_dur * (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) * 1.0 / ct.dur, (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)) ), 0.0) * 100.0 / (MIN(ct.ts + ct.dur, 2000) - MAX(ct.ts, 1000)), 1)"
         ),
         "windowed overlap_cpu_pct must use clipped overlap duration, got: {sql}",
+    );
+    assert!(
+        sql.contains("AS full_task_cpu_pct")
+            && sql.contains("AS overlap_cpu_pct")
+            && sql.contains("AS full_task_thread_dur_ms")
+            && sql.contains("AS overlap_thread_dur_ms"),
+        "windowed output must expose distinct full-task and overlap CPU columns, got: {sql}",
     );
     assert!(
         !sql.contains("hotspot_window"),

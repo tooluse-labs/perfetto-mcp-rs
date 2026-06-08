@@ -1167,8 +1167,8 @@ impl PerfettoMcpServer {
         description = "Top Chrome main-thread tasks by wall duration: id, ts, \
                        name, task_type, thread_name, process_name, upid, pid, \
                        nullable machine_id, dur_ms, overlap_dur_ms, \
-                       cpu_pct/thread_dur_ms (full-task), \
-                       overlap_cpu_pct/overlap_thread_dur_ms (window estimates). \
+                       full_task_cpu_pct/full_task_thread_dur_ms, overlap_cpu_pct/\
+                       overlap_thread_dur_ms; legacy cpu_pct/thread_dur_ms are full-task. \
                        Uses `chrome.tasks`, `thread.is_main_thread = 1`, and \
                        Chrome's `Cr*Main` fallback. Pass a returned \
                        `id` to `slice_descendants_breakdown` for child-slice breakdowns.\n\

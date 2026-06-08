@@ -113,10 +113,14 @@ pub fn chrome_main_thread_hotspots_sql(
            CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
                 THEN MAX(MIN(ROUND(ct.thread_dur * 100.0 / ct.dur, 1), 100.0), 0.0) \
            END AS cpu_pct, \
+           CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
+                THEN MAX(MIN(ROUND(ct.thread_dur * 100.0 / ct.dur, 1), 100.0), 0.0) \
+           END AS full_task_cpu_pct, \
            CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 AND {overlap_dur_expr} > 0 \
                 THEN ROUND({overlap_thread_dur_expr} * 100.0 / {overlap_dur_expr}, 1) \
            END AS overlap_cpu_pct, \
            ct.thread_dur / 1e6 AS thread_dur_ms, \
+           ct.thread_dur / 1e6 AS full_task_thread_dur_ms, \
            CASE WHEN ct.thread_dur IS NOT NULL AND ct.dur > 0 \
                 THEN ROUND({overlap_thread_dur_expr} / 1e6, 3) \
            END AS overlap_thread_dur_ms \
