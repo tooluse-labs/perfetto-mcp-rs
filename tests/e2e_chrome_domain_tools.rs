@@ -9,10 +9,11 @@
 //! - scroll_jank.pftrace: chrome_janky_frames (6 rows) — strong e2e for
 //!   scroll_jank_summary.
 //! - page_loads.pftrace: chrome_page_loads (8 rows) — strong e2e for
-//!   page_load_summary. It has main-thread tasks available via
-//!   `is_main_thread` and/or Chrome `Cr*Main` naming, but zero verified tasks
-//!   exceed the 16 ms threshold the tool filters by, so main_thread_hotspots
-//!   falls back to a weak assertion.
+//!   page_load_summary. It also supports a synthesized multi-navigation raw
+//!   window that strongly covers ambiguous resource-summary attribution. It
+//!   has main-thread tasks available via `is_main_thread` and/or Chrome
+//!   `Cr*Main` naming, but zero verified tasks exceed the 16 ms threshold the
+//!   tool filters by, so main_thread_hotspots falls back to a weak assertion.
 //! - Neither fixture has chrome_startups or chrome_web_content_interactions
 //!   data, so those two tools also use weak assertions. Upgrade to strong
 //!   assertions when fixtures with the relevant event types are added.
@@ -203,10 +204,10 @@ fn e2e_chrome_page_load_resource_hotspots_sql_runs_cleanly() {
 }
 
 #[test]
-fn e2e_chrome_page_load_resource_summary_sql_runs_cleanly() {
-    // Weak assertion: this pins SQL compatibility and the URL-summary response
-    // shape. The fixture is not a slow-resource capture, so row count is not
-    // asserted.
+fn e2e_chrome_page_load_resource_summary_synthetic_ambiguous_window_against_fixture() {
+    // Strong assertion: synthesize a raw window spanning the first two
+    // page-load navigations in the fixture. This exercises the production
+    // ambiguous-navigation branch without carrying a second Chrome trace file.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -232,11 +233,61 @@ fn e2e_chrome_page_load_resource_summary_sql_runs_cleanly() {
             .query(&sql)
             .await
             .expect("chrome page-load resource summary query must succeed");
+        let ambiguous_window = client
+            .query(
+                "INCLUDE PERFETTO MODULE chrome.page_loads; \
+                 WITH ordered AS ( \
+                   SELECT \
+                     navigation_start_ts, \
+                     NULLIF(MAX( \
+                       COALESCE(navigation_start_ts, -1), \
+                       COALESCE(fcp_ts, -1), \
+                       COALESCE(load_event_ts, -1), \
+                       COALESCE(lcp_ts, -1), \
+                       COALESCE(dom_content_loaded_event_ts, -1), \
+                       COALESCE(mark_fully_loaded_ts, -1), \
+                       COALESCE(mark_fully_visible_ts, -1), \
+                       COALESCE(mark_interactive_ts, -1) \
+                     ), -1) AS nav_end, \
+                     ROW_NUMBER() OVER (ORDER BY navigation_start_ts) AS rn \
+                   FROM chrome_page_loads \
+                   WHERE navigation_start_ts IS NOT NULL \
+                 ), bounds AS ( \
+                   SELECT \
+                     (SELECT navigation_start_ts FROM ordered WHERE rn = 1) AS start_ts, \
+                     (SELECT nav_end FROM ordered WHERE rn = 2) AS end_ts \
+                 ) \
+                 SELECT \
+                   start_ts, \
+                   end_ts, \
+                   (SELECT COUNT(*) FROM ordered, bounds \
+                    WHERE navigation_start_ts < bounds.end_ts \
+                      AND nav_end > bounds.start_ts) AS matching_navigation_count \
+                 FROM bounds",
+            )
+            .await
+            .expect("ambiguous raw-window bounds query must succeed");
+        let raw_start_ts = ambiguous_window
+            .cell(0, "start_ts")
+            .and_then(|v| v.as_i64())
+            .expect("ambiguous raw-window start_ts");
+        let raw_end_ts = ambiguous_window
+            .cell(0, "end_ts")
+            .and_then(|v| v.as_i64())
+            .expect("ambiguous raw-window end_ts");
+        assert!(
+            ambiguous_window
+                .cell(0, "matching_navigation_count")
+                .and_then(|v| v.as_i64())
+                .is_some_and(|count| count > 1),
+            "test fixture window must cover multiple navigations",
+        );
+
         let raw_window_sql =
             chrome_page_load_resource_summary_sql(ChromePageLoadResourceSummaryFilters {
                 window: ChromePageLoadWindowFilters {
-                    start_ts_ns: Some(0),
-                    end_ts_ns: Some(10_000_000_000),
+                    start_ts_ns: Some(raw_start_ts),
+                    end_ts_ns: Some(raw_end_ts),
                     ..Default::default()
                 },
                 min_overlap_ms: Some(0.0),
@@ -244,10 +295,51 @@ fn e2e_chrome_page_load_resource_summary_sql_runs_cleanly() {
                 limit: Some(5),
             })
             .expect("raw-window resource summary SQL builder must succeed");
-        client
+        let raw_window_table = client
             .query(&raw_window_sql)
             .await
             .expect("raw-window resource summary query must succeed");
+        assert!(
+            !raw_window_table.is_empty(),
+            "raw-window resource summary should produce rows in page_loads fixture",
+        );
+        for i in 0..raw_window_table.len() {
+            assert_eq!(
+                raw_window_table
+                    .cell(i, "navigation_context_status")
+                    .and_then(|v| v.as_str()),
+                Some("ambiguous"),
+                "raw-window row {i} must surface ambiguous navigation context",
+            );
+            assert!(
+                raw_window_table
+                    .cell(i, "navigation_match_count")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|count| count > 1),
+                "raw-window row {i} must expose >1 matching navigations",
+            );
+            assert_eq!(
+                raw_window_table
+                    .cell(i, "relation_to_navigation")
+                    .and_then(|v| v.as_str()),
+                Some("unknown"),
+                "ambiguous raw-window row {i} must not classify same/cross origin",
+            );
+            assert_eq!(
+                raw_window_table
+                    .cell(i, "renderer_relation_confidence")
+                    .and_then(|v| v.as_str()),
+                Some("low"),
+                "ambiguous raw-window row {i} must mark renderer relation low confidence",
+            );
+            assert_eq!(
+                raw_window_table
+                    .cell(i, "renderer_relation_source")
+                    .and_then(|v| v.as_str()),
+                Some("ambiguous_navigation_context"),
+                "ambiguous raw-window row {i} must explain renderer relation source",
+            );
+        }
         let evidence_sql =
             chrome_page_load_resource_timing_evidence_sql(ChromePageLoadWindowFilters {
                 page_load_id: Some(1),
