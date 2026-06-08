@@ -204,6 +204,84 @@ fn e2e_chrome_page_load_resource_hotspots_sql_runs_cleanly() {
 }
 
 #[test]
+fn e2e_chrome_resource_incomplete_duration_overlaps_raw_window() {
+    // Strong regression: page_loads.pftrace has one URL-bearing incomplete
+    // NavigationRequest at the trace tail. This raw window starts after that
+    // slice began, so old evidence logic (`dur < 0 AND s.ts >= window_start`)
+    // missed it even though resource rows included it.
+    const WINDOW_START_TS: i64 = 687_445_800_000_000;
+    const WINDOW_END_TS: i64 = 687_445_909_438_058;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = TraceProcessorManager::new_with_starting_port(1, 19_253);
+        let trace = Path::new("tests/fixtures/page_loads.pftrace");
+
+        let client = manager.get_client(trace).await.expect("spawn tp_shell");
+        let window = ChromePageLoadWindowFilters {
+            start_ts_ns: Some(WINDOW_START_TS),
+            end_ts_ns: Some(WINDOW_END_TS),
+            ..Default::default()
+        };
+        let hotspots_sql =
+            chrome_page_load_resource_hotspots_sql(ChromePageLoadResourceHotspotsFilters {
+                window,
+                min_dur_ms: Some(0.0),
+                limit: Some(10),
+            })
+            .expect("resource hotspots SQL builder must succeed");
+        let hotspots = client
+            .query(&hotspots_sql)
+            .await
+            .expect("resource hotspots raw-window query must succeed");
+        let incomplete_row = (0..hotspots.len())
+            .find(|&i| {
+                hotspots
+                    .cell(i, "slice_duration_status")
+                    .and_then(|v| v.as_str())
+                    == Some("incomplete_duration")
+            })
+            .expect("raw-window resource hotspots must surface the in-flight NavigationRequest");
+        assert_eq!(
+            hotspots.cell(incomplete_row, "id").and_then(|v| v.as_i64()),
+            Some(24_888),
+            "fixture should keep the pinned incomplete NavigationRequest slice",
+        );
+        assert!(
+            hotspots
+                .cell(incomplete_row, "end_ms")
+                .is_some_and(|v| v.is_null()),
+            "incomplete duration rows must keep completed end_ms null",
+        );
+        assert!(
+            hotspots
+                .cell(incomplete_row, "overlap_ms")
+                .and_then(|v| v.as_f64())
+                .is_some_and(|ms| ms > 0.0),
+            "incomplete duration rows must still expose positive observed overlap",
+        );
+
+        let evidence_sql = chrome_page_load_resource_timing_evidence_sql(window)
+            .expect("resource evidence SQL builder must succeed");
+        let evidence = client
+            .query(&evidence_sql)
+            .await
+            .expect("resource timing evidence raw-window query must succeed");
+        assert_eq!(
+            evidence
+                .cell(0, "incomplete_duration_resource_slice_count")
+                .and_then(|v| v.as_i64()),
+            Some(1),
+            "timing evidence must count the same in-flight resource candidate",
+        );
+    });
+}
+
+#[test]
 fn e2e_chrome_page_load_resource_summary_synthetic_ambiguous_window_against_fixture() {
     // Strong assertion: synthesize a raw window spanning the first two
     // page-load navigations in the fixture. This exercises the production
