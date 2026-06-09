@@ -4,6 +4,10 @@
 
 ### Unreleased
 
+### [0.16.2](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.2) (June 9, 2026)
+
+- **Chrome resource tool descriptions are back under the tools/list context budget.** The v0.16.1 evidence fields remain unchanged, but the summary and pipeline descriptions were tightened so `tool_descriptions_stay_within_context_budget` passes while still warning that detail slices are evidence, not root-cause claims.
+
 ### [0.16.1](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.1) (June 9, 2026)
 
 - **Chrome resource wait evidence is more explicit and less likely to overclaim.** `chrome_page_load_resource_summary` and `chrome_page_load_resource_pipeline` now expose primary resource slices, longest detail resource slices, and percent-of-primary timing evidence separately from lifecycle wrappers. `chrome_page_load_resource_pipeline` also surfaces URL/ancestor-correlated resource result `source` / `hit` facts with an explicit correlation basis, so LLM callers can see cache/enhancement evidence such as long `GetResource` spans without treating tool output as a root-cause verdict.
