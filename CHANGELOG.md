@@ -4,6 +4,10 @@
 
 ### Unreleased
 
+### [0.16.1](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.1) (June 9, 2026)
+
+- **Chrome resource wait evidence is more explicit and less likely to overclaim.** `chrome_page_load_resource_summary` and `chrome_page_load_resource_pipeline` now expose primary resource slices, longest detail resource slices, and percent-of-primary timing evidence separately from lifecycle wrappers. `chrome_page_load_resource_pipeline` also surfaces URL/ancestor-correlated resource result `source` / `hit` facts with an explicit correlation basis, so LLM callers can see cache/enhancement evidence such as long `GetResource` spans without treating tool output as a root-cause verdict.
+
 ### [0.16.0](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.0) (June 8, 2026)
 
 - **Accuracy-focused trace analysis hardening.** `execute_sql` now rejects multiple output statements instead of silently returning only the last result, clamps oversized output-shaping requests to the supported row cap, preserves BLOB cells as hex, reports stricter decoder errors for incomplete rows, and gives targeted hints for missing modules/functions and ambiguous columns.
