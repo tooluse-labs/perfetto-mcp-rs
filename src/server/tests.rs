@@ -3835,6 +3835,19 @@ fn chrome_page_load_resource_summary_sql_groups_by_url() {
         "compact summary should expose one representative slice name, got: {sql}",
     );
     assert!(
+        sql.contains("AS primary_slice_ms")
+            && sql.contains("AS primary_slice_id")
+            && sql.contains("AS longest_detail_resource_slice_name")
+            && sql.contains("AS longest_detail_resource_slice_ms")
+            && sql.contains("AS longest_detail_resource_slice_id")
+            && sql.contains("AS detail_slice_pct_of_primary"),
+        "summary must expose factual primary and detail resource slice evidence, got: {sql}",
+    );
+    assert!(
+        !sql.contains("r2.overlap_dur >= 50000000") && !sql.contains("r2.overlap_dur * 10 >="),
+        "summary must not hide phase evidence behind significance heuristics, got: {sql}",
+    );
+    assert!(
         sql.contains(
             "SUM(CASE WHEN rr.slice_duration_status = 'incomplete_duration' THEN 1 ELSE 0 END)"
         ) && sql.contains("AS incomplete_duration_slice_count"),
@@ -4075,6 +4088,36 @@ fn chrome_page_load_resource_pipeline_sql_builds_url_drilldown() {
         sql.contains("THEN rr.overlap_dur END) / 1e6, 3) AS request_span_ms")
             && sql.contains("THEN rr.overlap_dur END) / 1e6, 3) AS cache_or_get_resource_span_ms"),
         "pipeline request/cache spans must use clipped overlap duration, got: {sql}",
+    );
+    assert!(
+        sql.contains("resource_row_ancestors")
+            && sql.contains("resource_result_roots")
+            && sql.contains("resource_result_rows")
+            && sql.contains("result.name GLOB '*Result*'"),
+        "pipeline must correlate same-URL resource rows back to resource result evidence, got: {sql}",
+    );
+    assert!(
+        sql.contains("primary_resource_slice_name")
+            && sql.contains("primary_resource_slice_ms")
+            && sql.contains("primary_resource_slice_id")
+            && sql.contains("longest_detail_resource_slice_name")
+            && sql.contains("longest_detail_resource_slice_ms")
+            && sql.contains("longest_detail_resource_slice_process_name")
+            && sql.contains("detail_slice_pct_of_primary"),
+        "pipeline must expose factual primary and detail resource slice evidence, got: {sql}",
+    );
+    assert!(
+        !sql.contains("r2.overlap_dur >= 50000000") && !sql.contains("r2.overlap_dur * 10 >="),
+        "pipeline must not hide phase evidence behind significance heuristics, got: {sql}",
+    );
+    assert!(
+        sql.contains("resource_result_correlation_basis")
+            && sql.contains("resource_result_row_count")
+            && sql.contains("resource_result_names")
+            && sql.contains("resource_result_sources")
+            && sql.contains("resource_result_hits")
+            && sql.contains("example_resource_result_slice_id"),
+        "pipeline must expose resource result source/hit evidence, got: {sql}",
     );
     assert!(
         sql.contains("background_parse_ms"),

@@ -515,6 +515,16 @@ fn e2e_chrome_page_load_resource_summary_synthetic_ambiguous_window_against_fixt
                 table.cell(i, "example_slice_id").is_some(),
                 "row {i} missing example_slice_id",
             );
+            assert!(
+                table.cell(i, "primary_slice_ms").is_some(),
+                "row {i} missing primary_slice_ms",
+            );
+            assert!(
+                table
+                    .cell(i, "longest_detail_resource_slice_name")
+                    .is_some(),
+                "row {i} missing longest_detail_resource_slice_name",
+            );
         }
     });
 }
@@ -565,6 +575,36 @@ fn e2e_chrome_page_load_resource_pipeline_sql_runs_cleanly() {
             assert!(
                 table.cell(i, "max_request_overlap_ms").is_some(),
                 "row {i} missing max_request_overlap_ms",
+            );
+            assert!(
+                table.cell(i, "primary_resource_slice_name").is_some(),
+                "row {i} missing primary_resource_slice_name",
+            );
+            assert!(
+                table
+                    .cell(i, "longest_detail_resource_slice_name")
+                    .is_some(),
+                "row {i} missing longest_detail_resource_slice_name",
+            );
+            assert!(
+                table.cell(i, "detail_slice_pct_of_primary").is_some(),
+                "row {i} missing detail_slice_pct_of_primary",
+            );
+            assert!(
+                table.cell(i, "resource_result_correlation_basis").is_some(),
+                "row {i} missing resource_result_correlation_basis",
+            );
+            assert!(
+                table.cell(i, "resource_result_row_count").is_some(),
+                "row {i} missing resource_result_row_count",
+            );
+            assert!(
+                table.cell(i, "resource_result_names").is_some(),
+                "row {i} missing resource_result_names",
+            );
+            assert!(
+                table.cell(i, "resource_result_sources").is_some(),
+                "row {i} missing resource_result_sources",
             );
             assert!(
                 table.cell(i, "evidence_boundary").is_some(),

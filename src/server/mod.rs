@@ -914,8 +914,10 @@ impl PerfettoMcpServer {
         name = "chrome_page_load_resource_summary",
         description = "URL-level Chrome resource/request summary for a page-load/raw \
                        window. Returns URL key, process/machine/priority sets, span, \
-                       max/summed overlap, navigation/renderer relation evidence \
-                       including `target_renderer_source`, example_slice_id, \
+                       max/summed overlap, primary/detail resource slice evidence \
+                       (detail excludes common lifecycle wrappers; not a root-cause \
+                       claim), navigation/renderer relation evidence including \
+                       `target_renderer_source`, example_slice_id, \
                        incomplete_duration_slice_count. Use before \
                        `chrome_page_load_resource_hotspots`; rank by max overlap.",
         annotations(
@@ -1001,10 +1003,12 @@ impl PerfettoMcpServer {
                        after `chrome_page_load_resource_summary` with \
                        `example_slice_id` or `url_substring`. Returns timing facts, \
                        match evidence, completed/observed resource ends, \
-                       resource/script machine-id sets, incomplete count, and an \
-                       evidence_boundary for DNS/TLS/TTFB/cache. Parameters: URL seed \
-                       required; optional window filters, `url_grouping`, `limit` \
-                       default 30, `max_string_len`.",
+                       primary and detail resource slice evidence (detail excludes common \
+                       lifecycle wrappers; not a root-cause claim), URL/ancestor-correlated \
+                       resource result source/hit, resource/script machine-id sets, \
+                       incomplete count, and an evidence_boundary for DNS/TLS/TTFB/cache. \
+                       Parameters: URL seed required; optional window filters, \
+                       `url_grouping`, `limit` default 30, `max_string_len`.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

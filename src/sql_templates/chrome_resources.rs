@@ -129,7 +129,8 @@ fn append_chrome_resource_candidates_cte(
                MAX(CASE WHEN a.flat_key IN ('debug.priority', 'priority') \
                     THEN a.display_value END), \
                MAX(CASE WHEN a.key = 'priority' THEN a.display_value END) \
-             ) AS priority \
+             ) AS priority, \
+             MAX(CASE WHEN a.flat_key = 'debug.size' THEN a.int_value END) AS size_bytes \
            FROM slice s \
            LEFT JOIN track tr ON s.track_id = tr.id \
            LEFT JOIN thread_track tt ON s.track_id = tt.id \
@@ -167,7 +168,16 @@ fn append_chrome_resource_candidates_cte(
               s.name GLOB '*URLRequest*' OR \
               s.name GLOB '*Network*' OR \
               s.name GLOB '*Request*' OR \
+              s.name GLOB '*ServiceWorker*' OR \
               s.name GLOB '*Fetch*' OR \
+              s.name GLOB '*Cache*' OR \
+              s.name GLOB '*ProxyResolution*' OR \
+              s.name GLOB '*HostResolver*' OR \
+              s.name GLOB '*DNS*' OR \
+              s.name GLOB '*CertVerifier*' OR \
+              s.name GLOB '*SSL*' OR \
+              s.name GLOB '*TLS*' OR \
+              s.name GLOB '*HttpStream*' OR \
               s.name GLOB '*XHR*' \
             ) \
            AND NOT ( \
@@ -251,7 +261,8 @@ fn append_chrome_resource_candidates_cte(
              rcs.machine_id, \
              rcs.thread_name, \
              rcsu.url, \
-             rcs.priority \
+             rcs.priority, \
+             rcs.size_bytes \
            FROM resource_candidate_slices rcs \
            JOIN resource_candidate_selected_urls rcsu ON rcsu.id = rcs.id \
          ) ",
@@ -541,6 +552,52 @@ pub fn chrome_page_load_resource_summary_sql(
             (SELECT r2.name FROM resource_rows r2 \
              WHERE r2.url_key = rr.url_key \
              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS primary_slice_name, \
+            ROUND((SELECT r2.overlap_dur FROM resource_rows r2 \
+             WHERE r2.url_key = rr.url_key \
+             ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) / 1e6, 3) \
+              AS primary_slice_ms, \
+            (SELECT r2.id FROM resource_rows r2 \
+             WHERE r2.url_key = rr.url_key \
+             ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS primary_slice_id, \
+            (SELECT r2.name FROM resource_rows r2 \
+             WHERE r2.url_key = rr.url_key \
+               AND NOT (r2.name IN ( \
+                 'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                 'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+               ) OR r2.name GLOB '*OnReceiveResponse*' \
+                 OR r2.name GLOB '*SendResponseToClient*') \
+             ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+              AS longest_detail_resource_slice_name, \
+            ROUND((SELECT r2.overlap_dur FROM resource_rows r2 \
+             WHERE r2.url_key = rr.url_key \
+               AND NOT (r2.name IN ( \
+                 'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                 'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+               ) OR r2.name GLOB '*OnReceiveResponse*' \
+                 OR r2.name GLOB '*SendResponseToClient*') \
+             ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) / 1e6, 3) \
+              AS longest_detail_resource_slice_ms, \
+            (SELECT r2.id FROM resource_rows r2 \
+             WHERE r2.url_key = rr.url_key \
+               AND NOT (r2.name IN ( \
+                 'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                 'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+               ) OR r2.name GLOB '*OnReceiveResponse*' \
+                 OR r2.name GLOB '*SendResponseToClient*') \
+             ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+              AS longest_detail_resource_slice_id, \
+            ROUND((SELECT r2.overlap_dur FROM resource_rows r2 \
+             WHERE r2.url_key = rr.url_key \
+               AND NOT (r2.name IN ( \
+                 'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                 'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+               ) OR r2.name GLOB '*OnReceiveResponse*' \
+                 OR r2.name GLOB '*SendResponseToClient*') \
+             ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) * 100.0 / \
+             NULLIF((SELECT r3.overlap_dur FROM resource_rows r3 \
+              WHERE r3.url_key = rr.url_key \
+              ORDER BY r3.overlap_dur DESC, r3.dur DESC, r3.id ASC LIMIT 1), 0), 2) \
+              AS detail_slice_pct_of_primary, \
             GROUP_CONCAT(DISTINCT rr.process_name) AS process_names, \
             GROUP_CONCAT(DISTINCT rr.upid) AS upids, \
             GROUP_CONCAT(DISTINCT rr.machine_id) AS machine_ids, \
@@ -883,6 +940,61 @@ pub fn chrome_page_load_resource_pipeline_sql(
             JOIN script_slices ss ON ss.id = d.root_id \
             GROUP BY {ss_url_key_expr} \
          ), \
+         resource_row_ancestors(url_key, resource_id, ancestor_id, ancestor_name, depth) AS ( \
+           SELECT url_key, id, id, name, 0 FROM resource_rows \
+           UNION ALL \
+           SELECT rra.url_key, rra.resource_id, parent.id, parent.name, rra.depth + 1 \
+           FROM resource_row_ancestors rra \
+           JOIN slice current_slice ON current_slice.id = rra.ancestor_id \
+           JOIN slice parent ON parent.id = current_slice.parent_id \
+           WHERE rra.depth < 6 \
+         ), \
+         resource_result_roots AS ( \
+           SELECT DISTINCT url_key, ancestor_id AS root_id \
+           FROM resource_row_ancestors \
+           WHERE ancestor_name GLOB '*Resource*' \
+              OR ancestor_name GLOB '*Request*' \
+              OR ancestor_name GLOB '*Fetch*' \
+              OR ancestor_name GLOB '*URLLoader*' \
+              OR ancestor_name GLOB '*Network*' \
+              OR ancestor_name GLOB '*Cache*' \
+         ), \
+         resource_result_rows AS ( \
+           SELECT \
+             rroot.url_key, \
+             result.id, \
+             result.name, \
+             result.ts, \
+             MAX(CASE WHEN a.flat_key = 'debug.source' \
+                  THEN COALESCE(a.display_value, a.string_value) END) AS result_source, \
+             MAX(CASE WHEN a.flat_key = 'debug.hit' \
+                  THEN COALESCE( \
+                    a.display_value, a.string_value, CAST(a.int_value AS TEXT), \
+                    CAST(a.real_value AS TEXT) \
+                  ) END) AS result_hit \
+           FROM resource_result_roots rroot \
+           JOIN slice result \
+             ON result.parent_id = rroot.root_id \
+            AND result.name GLOB '*Result*' \
+           LEFT JOIN args a ON result.arg_set_id = a.arg_set_id \
+           GROUP BY rroot.url_key, result.id, result.name, result.ts \
+           HAVING result_source IS NOT NULL OR result_hit IS NOT NULL \
+         ), \
+         resource_result_rollup AS ( \
+           SELECT \
+             rrr.url_key, \
+             'ancestor_child_result_with_debug_source_or_hit' \
+               AS resource_result_correlation_basis, \
+             COUNT(*) AS resource_result_row_count, \
+             GROUP_CONCAT(DISTINCT rrr.name) AS resource_result_names, \
+             GROUP_CONCAT(DISTINCT rrr.result_source) AS resource_result_sources, \
+             GROUP_CONCAT(DISTINCT rrr.result_hit) AS resource_result_hits, \
+             (SELECT r2.id FROM resource_result_rows r2 \
+              WHERE r2.url_key = rrr.url_key \
+              ORDER BY r2.ts DESC, r2.id DESC LIMIT 1) AS example_resource_result_slice_id \
+           FROM resource_result_rows rrr \
+           GROUP BY rrr.url_key \
+         ), \
          resource_rollup AS ( \
            SELECT \
               rr.url_key, \
@@ -923,6 +1035,97 @@ pub fn chrome_page_load_resource_pipeline_sql(
              ROUND(MAX(CASE WHEN rr.name GLOB '*Cache*' \
                OR rr.name GLOB '*GetResource*' \
                THEN rr.overlap_dur END) / 1e6, 3) AS cache_or_get_resource_span_ms, \
+             (SELECT r2.name FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS primary_resource_slice_name, \
+             ROUND((SELECT r2.overlap_dur FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) / 1e6, 3) \
+                AS primary_resource_slice_ms, \
+             (SELECT r2.id FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS primary_resource_slice_id, \
+             (SELECT r2.process_name FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS primary_resource_slice_process_name, \
+             (SELECT r2.upid FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS primary_resource_slice_upid, \
+             (SELECT r2.thread_name FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS primary_resource_slice_thread_name, \
+             (SELECT r2.name FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+                AND NOT (r2.name IN ( \
+                  'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                  'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+                ) OR r2.name GLOB '*OnReceiveResponse*' \
+                  OR r2.name GLOB '*SendResponseToClient*') \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS longest_detail_resource_slice_name, \
+             ROUND((SELECT r2.overlap_dur FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+                AND NOT (r2.name IN ( \
+                  'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                  'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+                ) OR r2.name GLOB '*OnReceiveResponse*' \
+                  OR r2.name GLOB '*SendResponseToClient*') \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) / 1e6, 3) \
+                AS longest_detail_resource_slice_ms, \
+             (SELECT r2.id FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+                AND NOT (r2.name IN ( \
+                  'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                  'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+                ) OR r2.name GLOB '*OnReceiveResponse*' \
+                  OR r2.name GLOB '*SendResponseToClient*') \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS longest_detail_resource_slice_id, \
+             (SELECT r2.process_name FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+                AND NOT (r2.name IN ( \
+                  'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                  'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+                ) OR r2.name GLOB '*OnReceiveResponse*' \
+                  OR r2.name GLOB '*SendResponseToClient*') \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS longest_detail_resource_slice_process_name, \
+             (SELECT r2.upid FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+                AND NOT (r2.name IN ( \
+                  'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                  'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+                ) OR r2.name GLOB '*OnReceiveResponse*' \
+                  OR r2.name GLOB '*SendResponseToClient*') \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS longest_detail_resource_slice_upid, \
+             (SELECT r2.thread_name FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+                AND NOT (r2.name IN ( \
+                  'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                  'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+                ) OR r2.name GLOB '*OnReceiveResponse*' \
+                  OR r2.name GLOB '*SendResponseToClient*') \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) \
+                AS longest_detail_resource_slice_thread_name, \
+             ROUND((SELECT r2.overlap_dur FROM resource_rows r2 \
+              WHERE r2.url_key = rr.url_key \
+                AND NOT (r2.name IN ( \
+                  'ScheduledResourceRequest', 'URL_REQUEST_START_JOB', \
+                  'REQUEST_ALIVE', 'CORS_REQUEST', 'Resource::Create' \
+                ) OR r2.name GLOB '*OnReceiveResponse*' \
+                  OR r2.name GLOB '*SendResponseToClient*') \
+              ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) * 100.0 / \
+              NULLIF((SELECT r3.overlap_dur FROM resource_rows r3 \
+               WHERE r3.url_key = rr.url_key \
+               ORDER BY r3.overlap_dur DESC, r3.dur DESC, r3.id ASC LIMIT 1), 0), 2) \
+                AS detail_slice_pct_of_primary, \
+             MAX(rr.size_bytes) AS resource_size_bytes, \
              (SELECT r2.id FROM resource_rows r2 \
               WHERE r2.url_key = rr.url_key \
               ORDER BY r2.overlap_dur DESC, r2.dur DESC, r2.id ASC LIMIT 1) AS example_resource_slice_id \
@@ -974,6 +1177,26 @@ pub fn chrome_page_load_resource_pipeline_sql(
            rr.resource_create_ms, \
            rr.response_start_ms, \
            rr.cache_or_get_resource_span_ms, \
+           rr.primary_resource_slice_name, \
+           rr.primary_resource_slice_ms, \
+           rr.primary_resource_slice_id, \
+           rr.primary_resource_slice_process_name, \
+           rr.primary_resource_slice_upid, \
+           rr.primary_resource_slice_thread_name, \
+           rr.longest_detail_resource_slice_name, \
+           rr.longest_detail_resource_slice_ms, \
+           rr.longest_detail_resource_slice_id, \
+           rr.longest_detail_resource_slice_process_name, \
+           rr.longest_detail_resource_slice_upid, \
+           rr.longest_detail_resource_slice_thread_name, \
+           rr.detail_slice_pct_of_primary, \
+           rrr.resource_result_correlation_basis, \
+           rrr.resource_result_row_count, \
+           rrr.resource_result_names, \
+           rrr.resource_result_sources, \
+           rrr.resource_result_hits, \
+           rrr.example_resource_result_slice_id, \
+           rr.resource_size_bytes, \
            sr.background_parse_ms, \
            sr.max_evaluate_ms, \
            sr.total_evaluate_ms, \
@@ -985,10 +1208,11 @@ pub fn chrome_page_load_resource_pipeline_sql(
            sr.size_bytes, \
            rr.example_resource_slice_id, \
            sr.example_script_slice_id, \
-           'fact: lifecycle/request spans and script slices; hypothesis: DNS/TLS/TTFB/download/cache/CDN unless phase-specific rows are inspected' \
+           'fact: lifecycle/request/detail resource spans and script slices; resource_result_* is URL/ancestor-correlated evidence; hypothesis: root cause/DNS/TLS/TTFB/download/cache/CDN unless phase-specific rows are inspected' \
              AS evidence_boundary \
          FROM resource_rollup rr \
          LEFT JOIN script_rollup sr ON sr.url_key = rr.url_key \
+         LEFT JOIN resource_result_rollup rrr ON rrr.url_key = rr.url_key \
          ORDER BY rr.max_request_overlap_ms DESC, rr.first_resource_start_ms ASC \
          LIMIT {row_limit}"
     ));
