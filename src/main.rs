@@ -9,6 +9,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 
 use perfetto_mcp_rs::download::DownloadConfig;
 use perfetto_mcp_rs::install::{self, InstallArgs, UninstallArgs};
+use perfetto_mcp_rs::self_update::{self, UpdateArgs};
 use perfetto_mcp_rs::server::PerfettoMcpServer;
 use perfetto_mcp_rs::tp_manager::{TraceProcessorConfig, TraceProcessorManager};
 
@@ -72,6 +73,9 @@ enum Command {
     /// Exits 0 if up to date (or ahead of releases — local dev build),
     /// 2 if a newer release exists, 1 on network or parse error.
     CheckUpdate,
+    /// Download and run the official installer to upgrade this binary.
+    #[command(visible_alias = "upgrade")]
+    Update(UpdateArgs),
 }
 
 #[tokio::main]
@@ -86,6 +90,7 @@ async fn main() -> std::process::ExitCode {
         Some(Command::Install(a)) => result_to_exit_code(install::run_install(a)),
         Some(Command::Uninstall(a)) => result_to_exit_code(install::run_uninstall(a)),
         Some(Command::CheckUpdate) => perfetto_mcp_rs::check_update::run().await,
+        Some(Command::Update(a)) => self_update::run(a).await,
         None => result_to_exit_code(run_server(cli).await),
     }
 }
@@ -235,5 +240,33 @@ mod tests {
     #[test]
     fn span_events_cli_option_is_removed() {
         assert!(Cli::try_parse_from(["perfetto-mcp-rs", "--span-events", "close"]).is_err());
+    }
+
+    #[test]
+    fn update_cli_parses_version_and_scope() {
+        let cli = Cli::try_parse_from([
+            "perfetto-mcp-rs",
+            "update",
+            "--version",
+            "v0.16.2",
+            "--scope",
+            "local",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Update(args)) => {
+                assert_eq!(args.version.as_deref(), Some("v0.16.2"));
+                assert_eq!(args.scope, Some(install::ClaudeScope::Local));
+            }
+            other => panic!("expected update command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgrade_alias_maps_to_update() {
+        let cli = Cli::try_parse_from(["perfetto-mcp-rs", "upgrade"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Update(_))));
     }
 }

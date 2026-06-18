@@ -248,16 +248,31 @@ JSON-based clients (e.g. Claude Code, Claude Desktop, Cursor):
 <details>
 <summary>Upgrade, pin a version, check for updates, uninstall</summary>
 
-**Upgrade** — re-run the same install command. It pulls the latest release,
-safely overwrites the existing binary (with Windows file-lock retry), and
-re-registers the MCP server with Claude Code / Codex idempotently. No auto-update
-daemon — upgrades are explicit.
+**Upgrade** — run the update subcommand:
+
+```sh
+perfetto-mcp-rs update
+```
+
+It pulls the latest release, safely overwrites the existing binary (with Windows
+file-lock retry), and re-registers the MCP server with Claude Code / Codex
+idempotently. No auto-update daemon — upgrades are explicit.
 
 Pin to a specific version with the `--version` flag:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tooluse-labs/perfetto-mcp-rs/main/install.sh | sh -s -- --version v0.7.0
+perfetto-mcp-rs update --version v0.7.0
 ```
+
+For Claude local/project registrations, re-run from the original project
+directory and pass the same scope:
+
+```sh
+perfetto-mcp-rs update --scope local
+```
+
+The raw installer one-liners still work if you prefer to drive upgrades
+manually or need installer-specific environment overrides.
 
 The `VERSION` env var also works, but **must come immediately before `sh`**
 (POSIX `VAR=value cmd` only scopes to the next command — `VERSION=v0.7.0 curl
@@ -282,7 +297,7 @@ perfetto-mcp-rs check-update
 
 Exits 0 if up to date (or ahead of releases — local dev build), 2 if a newer
 release exists, 1 on network or parse error. Useful for shell-prompt integrations
-and CI pre-checks.
+and CI pre-checks. If it reports a newer release, run `perfetto-mcp-rs update`.
 
 **Uninstall** — symmetric one-liner per platform. Deregisters from Claude Code and
 Codex, removes the binary, and deletes the cached `trace_processor_shell`.

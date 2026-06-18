@@ -132,31 +132,8 @@ fn compare(current: Version, latest: Version, published_at: String) -> Outcome {
     }
 }
 
-const UPGRADE_BASH: &str =
-    "curl -fsSL https://raw.githubusercontent.com/tooluse-labs/perfetto-mcp-rs/main/install.sh | sh";
-const UPGRADE_POWERSHELL: &str =
-    "irm https://raw.githubusercontent.com/tooluse-labs/perfetto-mcp-rs/main/install.ps1 | iex";
-
-/// The Windows binary serves both PowerShell and Git Bash users — list both
-/// upgrade commands so a copy-paste on either shell just works. PowerShell
-/// aliases `curl` to `Invoke-WebRequest` and rejects `-fsSL`, so suggesting
-/// only the bash form on Windows fails the moment a PowerShell user tries it
-/// (this happened in v0.12.1's smoke). Unix binaries don't run under
-/// PowerShell, so the bash-only form stays.
 fn upgrade_hint() -> String {
-    upgrade_hint_for_platform(cfg!(windows))
-}
-
-fn upgrade_hint_for_platform(is_windows: bool) -> String {
-    if is_windows {
-        format!(
-            "To upgrade:\n  \
-             PowerShell:  {UPGRADE_POWERSHELL}\n  \
-             Git Bash:    {UPGRADE_BASH}"
-        )
-    } else {
-        format!("Run `{UPGRADE_BASH}` to upgrade.")
-    }
+    "Run `perfetto-mcp-rs update` to upgrade.".to_owned()
 }
 
 fn render(result: Result<Outcome, CheckError>) -> (Option<String>, Option<String>, u8) {
@@ -266,34 +243,15 @@ mod tests {
         assert!(s.contains("v0.11.3"), "got: {s}");
         assert!(s.contains("v0.12.0"), "got: {s}");
         assert!(s.contains("2026-04-30"), "got: {s}");
-        assert!(s.contains("install.sh | sh"), "got: {s}");
+        assert!(s.contains("perfetto-mcp-rs update"), "got: {s}");
         assert_eq!(stderr, None);
         assert_eq!(code, 2);
     }
 
-    /// Unix builds suggest only the bash form — `curl … | sh`. PowerShell-only
-    /// commands have no audience there.
     #[test]
-    fn upgrade_hint_unix_form_is_bash_only() {
-        let hint = upgrade_hint_for_platform(false);
-        assert!(hint.contains("install.sh | sh"), "got: {hint}");
-        assert!(!hint.contains("install.ps1"), "got: {hint}");
-        assert!(!hint.contains("PowerShell"), "got: {hint}");
-        assert!(!hint.contains("iex"), "got: {hint}");
-    }
-
-    /// Windows builds suggest BOTH PowerShell (`irm | iex`) and Git Bash
-    /// (`curl | sh`) forms because the same `.exe` is invoked from either
-    /// shell. PowerShell rejects `-fsSL` (curl is aliased to
-    /// Invoke-WebRequest), so suggesting only the bash form fails the moment
-    /// a PowerShell user copy-pastes it (this happened in v0.12.1's smoke).
-    #[test]
-    fn upgrade_hint_windows_form_lists_both_shells() {
-        let hint = upgrade_hint_for_platform(true);
-        assert!(hint.contains("install.ps1 | iex"), "got: {hint}");
-        assert!(hint.contains("install.sh | sh"), "got: {hint}");
-        assert!(hint.contains("PowerShell"), "got: {hint}");
-        assert!(hint.contains("Git Bash"), "got: {hint}");
+    fn upgrade_hint_names_update_subcommand() {
+        let hint = upgrade_hint();
+        assert!(hint.contains("perfetto-mcp-rs update"), "got: {hint}");
     }
 
     #[test]

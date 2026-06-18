@@ -11,6 +11,7 @@ pub mod error;
 pub mod install;
 pub mod params;
 pub(crate) mod query;
+pub mod self_update;
 pub mod server;
 pub mod sql_templates;
 pub mod stdlib_catalog;
