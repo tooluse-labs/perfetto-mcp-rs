@@ -4,6 +4,10 @@
 
 ### Unreleased
 
+### [0.16.3](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.3) (June 18, 2026)
+
+- **Self-upgrades are now a first-class CLI flow.** `perfetto-mcp-rs update` downloads and runs the official installer for the current platform, preserving the existing installer behavior for binary replacement, Windows file-lock handling, PATH setup, and Claude Code / Codex re-registration. `perfetto-mcp-rs upgrade` is available as an alias, `--version` pins a release tag, and `--scope` forwards local/project Claude registrations through the installer. `check-update` and README upgrade guidance now point users at the new subcommand instead of asking them to copy platform-specific installer one-liners.
+
 ### [0.16.2](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.2) (June 9, 2026)
 
 - **Chrome resource tool descriptions are back under the tools/list context budget.** The v0.16.1 evidence fields remain unchanged, but the summary and pipeline descriptions were tightened so `tool_descriptions_stay_within_context_budget` passes while still warning that detail slices are evidence, not root-cause claims.
