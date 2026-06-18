@@ -37,7 +37,11 @@ pub struct UpdateArgs {
 
 pub async fn run(args: UpdateArgs) -> ExitCode {
     match run_inner(args).await {
-        Ok(code) => ExitCode::from(code),
+        Ok(exit) if exit.success() => ExitCode::from(0),
+        Ok(exit) => {
+            eprintln!("update failed: {}", exit.failure_message());
+            ExitCode::from(exit.code)
+        }
         Err(e) => {
             eprintln!("update failed: {e:#}");
             ExitCode::from(1)
@@ -45,7 +49,7 @@ pub async fn run(args: UpdateArgs) -> ExitCode {
     }
 }
 
-async fn run_inner(args: UpdateArgs) -> Result<u8> {
+async fn run_inner(args: UpdateArgs) -> Result<InstallerExit> {
     let invocation = installer_invocation(current_platform(), &args);
     let script = fetch_installer(invocation.url).await?;
     run_installer(&invocation, &script)
@@ -70,7 +74,7 @@ async fn fetch_installer(url: &str) -> Result<String> {
         .context("failed to read installer response body")
 }
 
-fn run_installer(invocation: &InstallerInvocation, script: &str) -> Result<u8> {
+fn run_installer(invocation: &InstallerInvocation, script: &str) -> Result<InstallerExit> {
     let mut child = Command::new(invocation.program)
         .args(&invocation.args)
         .envs(invocation.env.iter().map(|(k, v)| (*k, v)))
@@ -91,7 +95,33 @@ fn run_installer(invocation: &InstallerInvocation, script: &str) -> Result<u8> {
     }
 
     let status = child.wait().context("failed to wait for installer")?;
-    Ok(exit_status_code(status))
+    Ok(InstallerExit::from_status(status))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstallerExit {
+    code: u8,
+    status_text: String,
+}
+
+impl InstallerExit {
+    fn from_status(status: ExitStatus) -> Self {
+        Self {
+            code: exit_status_code(status),
+            status_text: status.to_string(),
+        }
+    }
+
+    fn success(&self) -> bool {
+        self.code == 0
+    }
+
+    fn failure_message(&self) -> String {
+        format!(
+            "installer exited with {}; any installer output should appear above",
+            self.status_text
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +199,10 @@ fn exit_status_code(status: ExitStatus) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn args(version: Option<&str>, scope: Option<ClaudeScope>) -> UpdateArgs {
         UpdateArgs {
@@ -232,5 +266,71 @@ mod tests {
             installer_invocation(InstallerPlatform::Windows, &args(Some("v0.16.2"), None));
 
         assert_eq!(invocation.env, [("VERSION", "v0.16.2".to_owned())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_installer_streams_script_to_child_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("capture-stdin.sh");
+        let captured = temp.path().join("captured-installer.sh");
+        fs::write(&helper, "#!/bin/sh\ncat > \"$1\"\n").unwrap();
+        let mut perms = fs::metadata(&helper).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&helper, perms).unwrap();
+
+        let invocation = InstallerInvocation {
+            url: INSTALL_SH_URL,
+            program: "/bin/sh",
+            args: vec![
+                helper.to_string_lossy().to_string(),
+                captured.to_string_lossy().to_string(),
+            ],
+            env: Vec::new(),
+        };
+
+        let exit = run_installer(&invocation, "echo installer body\n").unwrap();
+
+        assert!(exit.success());
+        assert_eq!(
+            fs::read_to_string(captured).unwrap(),
+            "echo installer body\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_installer_returns_nonzero_status_for_silent_child_failure() {
+        let invocation = InstallerInvocation {
+            url: INSTALL_SH_URL,
+            program: "/bin/sh",
+            args: vec!["-c".to_owned(), "exit 7".to_owned()],
+            env: Vec::new(),
+        };
+
+        let exit = run_installer(&invocation, "ignored").unwrap();
+
+        assert_eq!(exit.code, 7);
+        assert!(!exit.success());
+        assert!(
+            exit.failure_message()
+                .contains("installer exited with exit status: 7"),
+            "got: {}",
+            exit.failure_message()
+        );
+    }
+
+    #[test]
+    fn installer_exit_maps_signal_or_unknown_status_to_one() {
+        let exit = InstallerExit {
+            code: 1,
+            status_text: "signal: 9 (SIGKILL)".to_owned(),
+        };
+
+        assert_eq!(exit.code, 1);
+        assert_eq!(
+            exit.failure_message(),
+            "installer exited with signal: 9 (SIGKILL); any installer output should appear above"
+        );
     }
 }

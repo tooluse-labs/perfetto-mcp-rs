@@ -4,6 +4,13 @@
 
 ### Unreleased
 
+- **`perfetto-mcp-rs update` now reports silent installer failures.** If the
+  downloaded installer exits non-zero without printing its own error, the update
+  wrapper now emits `update failed: installer exited ...` and preserves the
+  installer exit code instead of returning silently. Regression coverage now
+  verifies that the installer script is streamed to stdin and that silent
+  non-zero child exits remain diagnosable.
+
 ### [0.16.3](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.3) (June 18, 2026)
 
 - **Self-upgrades are now a first-class CLI flow.** `perfetto-mcp-rs update` downloads and runs the official installer for the current platform, preserving the existing installer behavior for binary replacement, Windows file-lock handling, PATH setup, and Claude Code / Codex re-registration. `perfetto-mcp-rs upgrade` is available as an alias, `--version` pins a release tag, and `--scope` forwards local/project Claude registrations through the installer. `check-update` and README upgrade guidance now point users at the new subcommand instead of asking them to copy platform-specific installer one-liners.
