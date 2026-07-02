@@ -103,6 +103,13 @@ authorization or execution boundaries.
 | `chrome_startup_summary` | Browser startup events and time-to-first-visible-content |
 | `chrome_web_content_interactions` | Web content interactions (clicks, taps, INP) ranked by duration |
 
+**Hummer / Flutter traces**
+
+| Tool | Purpose |
+|---|---|
+| `hummer_t2_result` | Return the selected Hummer/Flutter T2 window for a process, including measured T2 milliseconds and target-process overlap |
+| `hummer_t2_detail` | Break down a Hummer/Flutter T2 window by image percent samples, placeholders, slice categories, tail blockers, thread states, scheduler time, and bridge/thread evidence |
+
 **Resources**
 
 | Resource | Purpose |
@@ -123,6 +130,12 @@ The right path depends on the trace type:
   breakdown is absent. Use `chrome_page_load_script_hotspots` for post-resource JS
   and style/layout work, and `slice_descendants_breakdown` on a long task `id`
   for its child-slice breakdown.
+- **Hummer / Flutter T2 traces** — `load_trace` → `hummer_t2_result` with the
+  target `process_name` → `hummer_t2_detail` for image loading progress,
+  placeholder events, categorized overlap, tail-window blockers, thread-state,
+  scheduler, and bridge/thread evidence. Detail output is scoped to the selected
+  T2 window and target-process overlap; overlap totals are diagnostic evidence,
+  not automatic root-cause attribution.
 - **Other traces (Android, generic)** — `load_trace` → `list_stdlib_modules`
   (or read `resource://perfetto-mcp/stdlib-quickref`) to check for a ready-made
   module first (Android, generic modules like `slices.with_context`), then run it

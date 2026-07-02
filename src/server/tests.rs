@@ -1994,6 +1994,8 @@ fn tool_router_exposes_expected_tools() {
             "chrome_startup_summary",
             "chrome_web_content_interactions",
             "execute_sql",
+            "hummer_t2_detail",
+            "hummer_t2_result",
             "list_processes",
             "list_stdlib_modules",
             "list_table_structure",
@@ -2689,6 +2691,191 @@ fn chrome_trace_params_accept_stringified_numerics() {
         .expect("stringified Chrome params must deserialize");
     assert_eq!(p.limit, Some(25));
     assert_eq!(p.max_string_len, Some(300));
+}
+
+#[test]
+fn hummer_t2_result_sql_requires_process_overlap() {
+    let sql = hummer_t2_result_sql(HummerT2ResultFilters {
+        process_name: "com.example.app",
+    })
+    .expect("Hummer T2 result SQL must build");
+    let compact = compact_sql(&sql);
+    assert!(
+        compact.contains("s.name = 'T2CollectorSession'"),
+        "result SQL must prefer the session window: {compact}",
+    );
+    assert!(
+        compact.contains("t.name = 'T2 result milliseconds'"),
+        "result SQL must read the T2 result counter: {compact}",
+    );
+    assert!(
+        compact.contains("w.end_counter_ts"),
+        "result SQL must expose the selected result counter timestamp: {compact}",
+    );
+    assert!(
+        compact.contains("t.name = 'T2 start'"),
+        "result SQL must keep legacy fallback support: {compact}",
+    );
+    assert!(
+        compact.contains("s.process_name = 'com.example.app'"),
+        "result SQL must scope process overlap to the requested process: {compact}",
+    );
+    assert!(
+        compact.contains("COALESCE(process_overlap.process_overlap_ms, 0) > 0"),
+        "result SQL must reject T2 windows without target-process overlap: {compact}",
+    );
+}
+
+#[test]
+fn hummer_t2_sql_escapes_process_name() {
+    let sql = hummer_t2_result_sql(HummerT2ResultFilters {
+        process_name: "com.example.app'bad",
+    })
+    .expect("SQL builder must escape process names");
+    assert!(
+        sql.contains("'com.example.app''bad'"),
+        "process_name must be SQL-string escaped: {sql}",
+    );
+}
+
+#[test]
+fn hummer_t2_detail_sql_has_stable_category_priority() {
+    let sql = hummer_t2_detail_sql(HummerT2DetailFilters {
+        process_name: "com.example.app",
+        limit: Some(5),
+        tail_window_ms: Some(200),
+        thread_state_available: true,
+        sched_available: true,
+    })
+    .expect("Hummer T2 detail SQL must build");
+    let compact = compact_sql(&sql);
+
+    let image_decode = compact.find("THEN 'image_decode'").unwrap();
+    let image_upload = compact.find("THEN 'image_upload'").unwrap();
+    let resource_reclaim = compact.find("THEN 'resource_reclaim'").unwrap();
+    let art_gc = compact.find("THEN 'art_gc'").unwrap();
+    let dart_runtime = compact.find("THEN 'dart_runtime'").unwrap();
+    let worker_activity = compact.find("THEN 'worker_activity'").unwrap();
+    let ui_thread = compact.find("THEN 'ui_thread'").unwrap();
+    let raster_thread = compact.find("THEN 'raster_thread'").unwrap();
+    let other = compact.find("ELSE 'other'").unwrap();
+
+    assert!(
+        image_decode < image_upload
+            && image_upload < resource_reclaim
+            && resource_reclaim < art_gc
+            && art_gc < dart_runtime
+            && dart_runtime < worker_activity
+            && worker_activity < ui_thread
+            && ui_thread < raster_thread
+            && raster_thread < other,
+        "category priority must stay decode/upload/reclaim/GC/Dart/worker/UI/raster/other: {compact}",
+    );
+    assert!(
+        compact.contains("FROM other_top_slice_rows"),
+        "detail SQL must expose top rows for the other category: {compact}",
+    );
+    assert!(
+        compact.contains("pct_of_t2"),
+        "detail SQL must expose category overlap percentage: {compact}",
+    );
+    assert!(
+        compact.contains("FROM image_work_rows"),
+        "detail SQL must expose grouped image work rows: {compact}",
+    );
+    assert!(
+        compact.contains("FROM image_percent_rows"),
+        "detail SQL must expose image percent row samples: {compact}",
+    );
+    assert!(
+        compact.contains("FROM bridge_summary"),
+        "detail SQL must expose bridge summary flags: {compact}",
+    );
+    assert!(
+        compact.contains("FROM thread_summary_rows"),
+        "detail SQL must expose target-process thread summary rows: {compact}",
+    );
+    assert!(
+        compact.contains("LIMIT 5"),
+        "caller limit must apply to placeholder/top-slice sections: {compact}",
+    );
+    assert!(
+        compact.contains("FROM thread_state ts"),
+        "detail SQL must include thread-state rows when available: {compact}",
+    );
+    assert!(
+        compact.contains("AND EXISTS (SELECT 1 FROM valid_t2_window) GROUP BY thread_name, state"),
+        "thread-state rows must not bypass the valid target-process T2 window guard: {compact}",
+    );
+    assert!(
+        compact.contains("FROM sched sc"),
+        "detail SQL must include sched rows when available: {compact}",
+    );
+    assert!(
+        compact.contains("AND EXISTS (SELECT 1 FROM valid_t2_window) GROUP BY thread_name"),
+        "sched rows must not bypass the valid target-process T2 window guard: {compact}",
+    );
+    assert!(
+        compact.contains("tail_window AS"),
+        "detail SQL must expose a tail attribution window: {compact}",
+    );
+    assert!(
+        compact.contains("FROM tail_slice_rows"),
+        "detail SQL must expose tail slice rows: {compact}",
+    );
+    assert!(
+        compact.contains("FROM end_blocker_rows"),
+        "detail SQL must expose end blocker rows: {compact}",
+    );
+    assert!(
+        compact.contains("FROM parent_child_rows"),
+        "detail SQL must expose parent/child rows: {compact}",
+    );
+    assert!(
+        compact.contains("FROM contention_rows"),
+        "detail SQL must expose contention rows: {compact}",
+    );
+    assert!(
+        compact.contains("w.end_ts - 200000000"),
+        "caller tail_window_ms must control the tail window: {compact}",
+    );
+}
+
+#[test]
+fn hummer_t2_effective_limit_validates_and_clamps() {
+    assert_eq!(
+        hummer_t2_effective_limit(None).unwrap(),
+        DEFAULT_HUMMER_T2_TOP_SLICE_LIMIT
+    );
+    assert_eq!(hummer_t2_effective_limit(Some(7)).unwrap(), 7);
+    assert_eq!(
+        hummer_t2_effective_limit(Some((MAX_ROWS + 1) as u32)).unwrap(),
+        MAX_HUMMER_T2_DETAIL_SECTION_LIMIT
+    );
+    assert_eq!(
+        hummer_t2_effective_limit(Some(MAX_HUMMER_T2_DETAIL_SECTION_LIMIT + 1)).unwrap(),
+        MAX_HUMMER_T2_DETAIL_SECTION_LIMIT
+    );
+    assert!(
+        MAX_HUMMER_T2_DETAIL_SECTION_LIMIT as usize * 11 + 128 <= MAX_ROWS,
+        "per-section Hummer T2 caps must leave room for fixed summary rows"
+    );
+    assert!(
+        hummer_t2_effective_limit(Some(0)).is_err(),
+        "zero limit must be rejected"
+    );
+}
+
+#[test]
+fn hummer_t2_detail_params_accept_stringified_numerics() {
+    let params: HummerT2DetailParams = serde_json::from_str(
+        r#"{"process_name": "com.example.app", "limit": "20", "tail_window_ms": "180", "max_string_len": "120"}"#,
+    )
+    .expect("stringified numeric fields must deserialize");
+    assert_eq!(params.process_name, "com.example.app");
+    assert_eq!(params.limit, Some(20));
+    assert_eq!(params.tail_window_ms, Some(180));
+    assert_eq!(params.max_string_len, Some(120));
 }
 
 #[test]

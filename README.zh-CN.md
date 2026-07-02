@@ -99,6 +99,13 @@ MCP tool annotations 只是给客户端展示/路由用的意图与安全提示�
 | `chrome_startup_summary` | 浏览器启动事件与首次可见内容时间 |
 | `chrome_web_content_interactions` | Web 内容交互（点击、触摸、INP）按耗时排序 |
 
+**Hummer / Flutter trace**
+
+| 工具 | 用途 |
+|---|---|
+| `hummer_t2_result` | 返回指定进程的 Hummer/Flutter T2 窗口，包括实测 T2 毫秒数和目标进程 overlap |
+| `hummer_t2_detail` | 拆解 Hummer/Flutter T2 窗口内的 image percent 采样、placeholder、slice 分类、尾部 blocker、thread state、调度耗时和 bridge/thread 证据 |
+
 **资源（Resources）**
 
 | Resource | 用途 |
@@ -118,6 +125,11 @@ MCP tool annotations 只是给客户端展示/路由用的意图与安全提示�
   线索；缺少 phase breakdown 时，结论应停留在 URL lifecycle span 层级。资源回来
   后的 JS / style / layout 开销看 `chrome_page_load_script_hotspots`；遇到长任务
   `id` 用 `slice_descendants_breakdown` 展开它的子 slice。
+- **Hummer / Flutter T2 trace**——`load_trace` → 带目标 `process_name` 调
+  `hummer_t2_result` → 再用 `hummer_t2_detail` 查看图片加载进度、placeholder
+  事件、分类 overlap、尾部窗口 blocker、thread state、调度耗时和 bridge/thread
+  证据。detail 输出限定在选中的 T2 窗口和目标进程 overlap 内；overlap 总量是诊断
+  证据，不是自动 root-cause 结论。
 - **其他 trace（Android、通用）**——`load_trace` → 先用 `list_stdlib_modules`
   （或读 `resource://perfetto-mcp/stdlib-quickref`）看有没有现成模块（Android、
   `slices.with_context` 这类通用模块），有就用 `execute_sql` + `INCLUDE PERFETTO

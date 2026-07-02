@@ -713,6 +713,90 @@ impl PerfettoMcpServer {
     }
 
     #[tool(
+        name = "hummer_t2_result",
+        description = "Return Hummer T2 for `process_name`.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "hummer_t2_result", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
+    async fn hummer_t2_result(
+        &self,
+        Parameters(params): Parameters<HummerT2ResultParams>,
+    ) -> Result<String, String> {
+        self.record_tool_span(format!("process_name_len={}", params.process_name.len()))
+            .await;
+        let client = self.client_for_current().await?;
+        let sql = hummer_t2_result_sql(HummerT2ResultFilters {
+            process_name: params.process_name.as_str(),
+        })
+        .map_err(|e| e.to_string())?;
+        let table = client
+            .query(&sql)
+            .await
+            .map_err(|e| format!("Hummer T2 result query failed: {e}"))?;
+        format_hummer_t2_result_response(table, None)
+    }
+
+    #[tool(
+        name = "hummer_t2_detail",
+        description = "Return Hummer/Flutter T2 detail rows with tail window, blockers, and contention.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    #[tracing::instrument(
+        level = "debug",
+        name = "mcp.tool",
+        skip_all,
+        fields(tool = "hummer_t2_detail", trace_loaded = tracing::field::Empty, param_summary = tracing::field::Empty)
+    )]
+    async fn hummer_t2_detail(
+        &self,
+        Parameters(params): Parameters<HummerT2DetailParams>,
+    ) -> Result<String, String> {
+        self.record_tool_span(format!(
+            "process_name_len={},limit_set={},tail_window_ms_set={},max_string_len_set={}",
+            params.process_name.len(),
+            params.limit.is_some(),
+            params.tail_window_ms.is_some(),
+            params.max_string_len.is_some()
+        ))
+        .await;
+        let client = self.client_for_current().await?;
+        let thread_state_available = table_has_column(&client, "thread_state", "state")
+            .await
+            .unwrap_or(false);
+        let sched_available = table_has_column(&client, "sched", "utid")
+            .await
+            .unwrap_or(false);
+        let sql = hummer_t2_detail_sql(HummerT2DetailFilters {
+            process_name: params.process_name.as_str(),
+            limit: params.limit,
+            tail_window_ms: params.tail_window_ms,
+            thread_state_available,
+            sched_available,
+        })
+        .map_err(|e| e.to_string())?;
+        let table = client
+            .query(&sql)
+            .await
+            .map_err(|e| format!("Hummer T2 detail query failed: {e}"))?;
+        format_hummer_t2_detail_response(table, params.max_string_len)
+    }
+
+    #[tool(
         name = "chrome_scroll_jank_summary",
         description = "Summarize the worst scroll jank frames in a Chrome trace: \
                        cause_of_jank, sub_cause_of_jank, delay_since_last_frame, \

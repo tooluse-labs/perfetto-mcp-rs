@@ -182,6 +182,41 @@ pub(super) struct ChromeToolRowsResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub(super) struct HummerT2SectionResponse {
+    pub(super) columns: Vec<String>,
+    pub(super) row_count: usize,
+    pub(super) rows: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct HummerT2DetailResponse {
+    pub(super) row_count: usize,
+    pub(super) string_truncated: bool,
+    pub(super) redacted: bool,
+    pub(super) note: &'static str,
+    pub(super) t2_window: HummerT2SectionResponse,
+    pub(super) image_percent_summary: HummerT2SectionResponse,
+    pub(super) image_percent_rows: HummerT2SectionResponse,
+    pub(super) placeholder_summary: HummerT2SectionResponse,
+    pub(super) placeholder_rows: HummerT2SectionResponse,
+    pub(super) category_rows: HummerT2SectionResponse,
+    pub(super) image_work_rows: HummerT2SectionResponse,
+    pub(super) top_slice_rows: HummerT2SectionResponse,
+    pub(super) other_top_slice_rows: HummerT2SectionResponse,
+    pub(super) tail_window: HummerT2SectionResponse,
+    pub(super) tail_category_rows: HummerT2SectionResponse,
+    pub(super) tail_slice_rows: HummerT2SectionResponse,
+    pub(super) end_blocker_rows: HummerT2SectionResponse,
+    pub(super) parent_child_rows: HummerT2SectionResponse,
+    pub(super) contention_rows: HummerT2SectionResponse,
+    pub(super) bridge_summary: HummerT2SectionResponse,
+    pub(super) thread_summary: HummerT2SectionResponse,
+    pub(super) thread_state_availability: HummerT2SectionResponse,
+    pub(super) thread_state_rows: HummerT2SectionResponse,
+    pub(super) sched_rows: HummerT2SectionResponse,
+}
+
+#[derive(Debug, Serialize)]
 pub(super) struct ListThreadsRowsResponse {
     pub(super) columns: Vec<String>,
     pub(super) row_count: usize,
@@ -462,6 +497,287 @@ pub(super) fn format_chrome_tool_response_with_known_row_count(
         tool_max_string_len(max_string_len)?,
         default_redact_strings(),
     )
+}
+
+pub(super) fn format_hummer_t2_result_response(
+    table: DecodedTable,
+    max_string_len: Option<u32>,
+) -> Result<String, String> {
+    let row_count = table.len();
+    format_chrome_tool_response_with_known_row_count(table, row_count, max_string_len)
+}
+
+pub(super) fn format_hummer_t2_detail_response(
+    table: DecodedTable,
+    max_string_len: Option<u32>,
+) -> Result<String, String> {
+    if table.is_empty() {
+        return Err(
+            "Hummer T2 detail found no T2 window for the requested process. \
+             Call hummer_t2_result first to confirm the trace contains a matching T2 result."
+                .to_owned(),
+        );
+    }
+
+    let max_string_len = tool_max_string_len(max_string_len)?;
+    let shape = ExecuteSqlOutputShape {
+        mode: ExecuteSqlOutputMode::FullRows,
+        active: true,
+        max_string_len,
+        redact_strings: default_redact_strings(),
+    };
+    let section_idx = table
+        .columns
+        .iter()
+        .position(|column| column == "section")
+        .ok_or_else(|| "Hummer T2 detail SQL did not return `section`".to_owned())?;
+
+    let mut any_truncated = false;
+    let mut any_redacted = false;
+    let mut build_section = |section: &str,
+                             columns: &[&str]|
+     -> Result<HummerT2SectionResponse, String> {
+        let indexes = columns
+            .iter()
+            .map(|column| {
+                table
+                    .columns
+                    .iter()
+                    .position(|candidate| candidate == column)
+                    .ok_or_else(|| format!("Hummer T2 detail SQL did not return `{column}`"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let raw_rows = table
+            .rows
+            .iter()
+            .filter(|row| row.get(section_idx).and_then(|value| value.as_str()) == Some(section))
+            .map(|row| {
+                indexes
+                    .iter()
+                    .map(|idx| row.get(*idx).cloned().unwrap_or(serde_json::Value::Null))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let (rows, string_truncated, redacted) = transform_rows(raw_rows.iter(), shape);
+        any_truncated |= string_truncated;
+        any_redacted |= redacted;
+        Ok(HummerT2SectionResponse {
+            columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+            row_count: rows.len(),
+            rows,
+        })
+    };
+
+    let t2_window = build_section(
+        "t2_window",
+        &[
+            "process_name",
+            "source",
+            "start_ts",
+            "end_ts",
+            "end_counter_ts",
+            "t2_ms",
+            "window_ms",
+            "process_overlap_ms",
+        ],
+    )?;
+    let image_percent_summary = build_section(
+        "image_percent_summary",
+        &[
+            "sample_count",
+            "max_image_percent",
+            "first_positive_rel_ms",
+            "max_rel_ms",
+        ],
+    )?;
+    let image_percent_rows = build_section("image_percent", &["rel_ms", "ts", "image_percent"])?;
+    let placeholder_summary = build_section("placeholder_summary", &["placeholder_count"])?;
+    let placeholder_rows = build_section("placeholder", &["rel_ms", "name", "ts"])?;
+    let category_rows = build_section(
+        "category",
+        &[
+            "category",
+            "slice_count",
+            "total_overlap_ms",
+            "max_overlap_ms",
+            "pct_of_t2",
+        ],
+    )?;
+    let image_work_rows = build_section(
+        "image_work",
+        &[
+            "thread_name",
+            "name",
+            "slice_count",
+            "total_overlap_ms",
+            "avg_overlap_ms",
+            "max_overlap_ms",
+        ],
+    )?;
+    let top_slice_rows = build_section(
+        "top_slice",
+        &[
+            "category",
+            "thread_name",
+            "name",
+            "full_dur_ms",
+            "overlap_ms",
+            "ts",
+        ],
+    )?;
+    let other_top_slice_rows = build_section(
+        "other_top_slice",
+        &[
+            "category",
+            "thread_name",
+            "name",
+            "full_dur_ms",
+            "overlap_ms",
+            "ts",
+        ],
+    )?;
+    let tail_window = build_section(
+        "tail_window",
+        &[
+            "tail_window_start_ts",
+            "tail_window_end_ts",
+            "tail_window_ms",
+        ],
+    )?;
+    let tail_category_rows = build_section(
+        "tail_category",
+        &[
+            "category",
+            "slice_count",
+            "total_overlap_ms",
+            "max_overlap_ms",
+            "pct_of_tail",
+        ],
+    )?;
+    let tail_slice_rows = build_section(
+        "tail_slice",
+        &[
+            "category",
+            "thread_name",
+            "name",
+            "rel_start_ms",
+            "rel_end_ms",
+            "overlap_ms",
+            "tail_overlap_ms",
+            "id",
+            "parent_id",
+        ],
+    )?;
+    let end_blocker_rows = build_section(
+        "end_blocker",
+        &[
+            "category",
+            "thread_name",
+            "name",
+            "rel_start_ms",
+            "rel_end_ms",
+            "overlap_ms",
+            "tail_overlap_ms",
+            "id",
+            "parent_id",
+        ],
+    )?;
+    let parent_child_rows = build_section(
+        "parent_child",
+        &[
+            "category",
+            "thread_name",
+            "name",
+            "overlap_ms",
+            "id",
+            "parent_id",
+            "parent_thread_name",
+            "parent_name",
+            "parent_overlap_ms",
+        ],
+    )?;
+    let contention_rows = build_section(
+        "contention",
+        &[
+            "category",
+            "thread_name",
+            "name",
+            "rel_start_ms",
+            "rel_end_ms",
+            "overlap_ms",
+            "tail_overlap_ms",
+            "id",
+            "parent_id",
+        ],
+    )?;
+    let bridge_summary = build_section(
+        "bridge_summary",
+        &[
+            "has_ui_thread",
+            "has_raster_thread",
+            "has_worker_thread",
+            "has_dart_worker",
+        ],
+    )?;
+    let thread_summary = build_section("thread_summary", &["thread_name", "slice_count"])?;
+    let thread_state_availability = build_section(
+        "thread_state_availability",
+        &["thread_state_available", "sched_available"],
+    )?;
+    let thread_state_rows = build_section(
+        "thread_state",
+        &[
+            "thread_name",
+            "state",
+            "state_span_count",
+            "state_total_ms",
+            "state_max_ms",
+        ],
+    )?;
+    let sched_rows = build_section(
+        "sched",
+        &[
+            "thread_name",
+            "cpu_count",
+            "sched_span_count",
+            "sched_total_ms",
+            "sched_max_ms",
+        ],
+    )?;
+
+    let response = HummerT2DetailResponse {
+        row_count: table.rows.len(),
+        string_truncated: any_truncated,
+        redacted: any_redacted,
+        note: "T2 detail rows are scoped to the selected T2 window and requested process; \
+               overlap totals can double-count nested slices and parallel workers, so this \
+               output is evidence for analysis rather than final root-cause attribution. \
+               Section row_count is the returned row count; row sections may be limited by \
+               the limit parameter while summary sections are computed over the full match set. \
+               Tail sections focus on the configurable window before T2 end and are better \
+               for end-of-window attribution than full-window overlap totals.",
+        t2_window,
+        image_percent_summary,
+        image_percent_rows,
+        placeholder_summary,
+        placeholder_rows,
+        category_rows,
+        image_work_rows,
+        top_slice_rows,
+        other_top_slice_rows,
+        tail_window,
+        tail_category_rows,
+        tail_slice_rows,
+        end_blocker_rows,
+        parent_child_rows,
+        contention_rows,
+        bridge_summary,
+        thread_summary,
+        thread_state_availability,
+        thread_state_rows,
+        sched_rows,
+    };
+    serde_json::to_string(&response).map_err(|e| format!("Failed to serialize results: {e}"))
 }
 
 pub(super) fn format_chrome_tool_response_with_known_row_count_and_redaction(

@@ -221,6 +221,35 @@ pub struct ListThreadsInProcessParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct HummerT2ResultParams {
+    /// Process name used to associate global Hummer/Flutter T2 counters with
+    /// the target app, e.g. "com.example.app".
+    pub process_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HummerT2DetailParams {
+    /// Process name used to filter thread slices inside the selected T2 window,
+    /// e.g. "com.example.app".
+    pub process_name: String,
+    /// Optional per-section max rows for detail row sections. Defaults to 30
+    /// and is capped below the global decoded-row limit. Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+    /// Optional window before T2 end used for tail attribution, in
+    /// milliseconds. Defaults to 180ms and is capped at the T2 window.
+    /// Accepts both numbers and numeric strings. Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub tail_window_ms: Option<u32>,
+    /// Optional per-string-cell cap applied to returned row tables. Accepts
+    /// numbers or numeric strings. Must be > 0 when set.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub max_string_len: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SliceDescendantsBreakdownParams {
     /// Root slice ids to expand. The root slices themselves are omitted from
     /// the summary; returned rows aggregate matching descendants under each
@@ -640,6 +669,22 @@ pub struct ChromeMainThreadHotspotsFilters<'a> {
     /// Optional override of the default `LIMIT 100`. Capped at `MAX_ROWS`.
     /// Must be `> 0` if set.
     pub limit: Option<u32>,
+}
+
+/// Tunable filters for `hummer_t2_result_sql`.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct HummerT2ResultFilters<'a> {
+    pub process_name: &'a str,
+}
+
+/// Tunable filters for `hummer_t2_detail_sql`.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct HummerT2DetailFilters<'a> {
+    pub process_name: &'a str,
+    pub limit: Option<u32>,
+    pub tail_window_ms: Option<u32>,
+    pub thread_state_available: bool,
+    pub sched_available: bool,
 }
 
 /// Shared page-load/window filters used by Chrome tools that can scope work

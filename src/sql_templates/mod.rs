@@ -5,6 +5,7 @@ mod chrome_common;
 mod chrome_main_thread;
 mod chrome_resources;
 mod chrome_scripts;
+mod hummer_t2;
 mod sanitize;
 mod slice_descendants;
 
@@ -14,6 +15,11 @@ pub use chrome_resources::{
     chrome_page_load_resource_summary_sql, chrome_page_load_resource_timing_evidence_sql,
 };
 pub use chrome_scripts::chrome_page_load_script_hotspots_sql;
+pub use hummer_t2::{
+    hummer_t2_detail_sql, hummer_t2_effective_limit, hummer_t2_result_sql,
+    DEFAULT_HUMMER_T2_TAIL_WINDOW_MS, DEFAULT_HUMMER_T2_TOP_SLICE_LIMIT,
+    MAX_HUMMER_T2_DETAIL_SECTION_LIMIT,
+};
 pub use sanitize::{sanitize_glob_param, sql_string_literal};
 pub use slice_descendants::{
     dedupe_preserving_order, slice_descendants_breakdown_sql, slice_descendants_effective_limit,
