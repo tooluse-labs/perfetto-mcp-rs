@@ -4,6 +4,9 @@
 
 ### Unreleased
 
+### [0.16.4](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.16.4) (July 2, 2026)
+
+- **Hummer / Flutter T2 traces now have dedicated analysis tools.** `hummer_t2_result` selects the matching T2 window for a target process, while `hummer_t2_detail` returns image progress, placeholder events, categorized slice overlap, tail-window blockers, parent/child evidence, thread summaries, thread-state rows, and scheduler rows. Detail row limits are capped per section below the global decoded-row limit, and scheduler/thread-state sections are guarded by the same target-process T2-window validation as the result tool.
 - **`perfetto-mcp-rs update` now reports silent installer failures.** If the
   downloaded installer exits non-zero without printing its own error, the update
   wrapper now emits `update failed: installer exited ...` and preserves the
