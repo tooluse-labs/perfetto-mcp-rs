@@ -1,0 +1,102 @@
+name: Hummer Release
+
+on:
+  push:
+    tags: ['hummer-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Hummer tag to release (e.g. hummer-v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: hummer-release-${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.asset_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            asset_name: perfetto-mcp-rs-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            asset_name: perfetto-mcp-rs-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-14
+            asset_name: perfetto-mcp-rs-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            asset_name: perfetto-mcp-rs-darwin-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            asset_name: perfetto-mcp-rs-windows-amd64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install protoc (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install protobuf
+          else
+            sudo apt-get update
+            sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc --yes --no-progress
+
+      - name: Install musl-tools (musl targets only)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hummer-${{ matrix.target }}
+          cache-bin: false
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/perfetto-mcp-rs"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            src="${src}.exe"
+          fi
+          cp "$src" "${{ matrix.asset_name }}"
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          prerelease: true
+          name: Hummer ${{ github.event.inputs.tag || github.ref_name }}
+          body: |
+            Hummer feature-branch build for perfetto-mcp-rs.
+
+            This prerelease is intended for Hummer T2 skill validation only.
+            It does not update Homebrew or publish to crates.io.
+          files: ${{ matrix.asset_name }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
