@@ -40,6 +40,14 @@ pub(super) struct LoadTraceSummary {
     pub(super) warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct LoadedTraceReport {
+    pub(super) path: String,
+    pub(super) display: String,
+    pub(super) trace_id: String,
+    pub(super) summary: Result<LoadTraceSummary, String>,
+}
+
 #[tracing::instrument(
     level = "debug",
     name = "load_trace.summary",
@@ -176,6 +184,7 @@ pub(super) fn build_load_trace_summary(
 
 pub(super) fn format_load_trace_response(
     display: &str,
+    trace_id: &str,
     summary: Result<LoadTraceSummary, String>,
 ) -> Result<String, String> {
     let display_len = display.len();
@@ -186,30 +195,64 @@ pub(super) fn format_load_trace_response(
         summary_available = tracing::field::Empty,
     );
     let _entered = span.enter();
-    let summary_json = match summary {
-        Ok(summary) => {
-            tracing::Span::current().record("summary_available", true);
-            serde_json::to_string(&summary)
-                .map_err(|e| format!("Failed to serialize load summary: {e}"))?
-        }
-        Err(error) => {
-            tracing::Span::current().record("summary_available", false);
-            serde_json::to_string(&serde_json::json!({
-                "available": false,
-                "error": error,
-                "redaction_policy": current_redaction_policy(),
-            }))
-            .map_err(|e| format!("Failed to serialize load summary: {e}"))?
-        }
-    };
+    tracing::Span::current().record("summary_available", summary.is_ok());
+    let summary_json = serde_json::to_string(&load_trace_summary_value(summary)?)
+        .map_err(|e| format!("Failed to serialize load summary: {e}"))?;
 
     Ok(format!(
         "Trace loaded successfully: {display}\n\
+         Trace id: {trace_id}\n\
          Trace summary: {summary_json}\n\
          Routing hint: use `recommended_next_tools` from the summary first; \
+         pass `trace_id` when comparing multiple loaded traces; \
          use `list_tables` / `list_table_structure` for schema discovery and \
          `execute_sql` for custom PerfettoSQL."
     ))
+}
+
+pub(super) fn format_load_traces_response(
+    traces: Vec<LoadedTraceReport>,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct LoadedTraceEntry {
+        path: String,
+        display: String,
+        trace_id: String,
+        summary: serde_json::Value,
+    }
+
+    let mut entries = Vec::with_capacity(traces.len());
+    for trace in traces {
+        entries.push(LoadedTraceEntry {
+            path: trace.path,
+            display: trace.display,
+            trace_id: trace.trace_id,
+            summary: load_trace_summary_value(trace.summary)?,
+        });
+    }
+    let count = entries.len();
+    let entries_json = serde_json::to_string(&entries)
+        .map_err(|e| format!("Failed to serialize loaded traces: {e}"))?;
+
+    Ok(format!(
+        "Traces loaded successfully: {count}\n\
+         Loaded traces: {entries_json}\n\
+         Routing hint: pass the returned `trace_id` to analysis tools when comparing loaded traces."
+    ))
+}
+
+fn load_trace_summary_value(
+    summary: Result<LoadTraceSummary, String>,
+) -> Result<serde_json::Value, String> {
+    match summary {
+        Ok(summary) => serde_json::to_value(summary)
+            .map_err(|e| format!("Failed to serialize load summary: {e}")),
+        Err(error) => Ok(serde_json::json!({
+            "available": false,
+            "error": error,
+            "redaction_policy": current_redaction_policy(),
+        })),
+    }
 }
 
 pub(super) fn metadata_string(table: &DecodedTable, key: &str) -> Option<String> {

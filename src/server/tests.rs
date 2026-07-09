@@ -91,7 +91,32 @@ fn execute_sql_params(sql: &str) -> ExecuteSqlParams {
         summary: false,
         include_row_count: false,
         max_string_len: None,
+        trace_id: None,
     }
+}
+
+fn trace_id_from_load_response(response: &str) -> String {
+    response
+        .lines()
+        .find_map(|line| line.strip_prefix("Trace id: "))
+        .expect("load_trace response must include trace id")
+        .to_owned()
+}
+
+fn loaded_traces_from_batch_response(response: &str) -> serde_json::Value {
+    let traces_line = response
+        .lines()
+        .find_map(|line| line.strip_prefix("Loaded traces: "))
+        .expect("batch load response must include loaded traces JSON");
+    serde_json::from_str(traces_line).expect("loaded traces line must be JSON")
+}
+
+fn first_i64_cell(response: &str) -> i64 {
+    let parsed: serde_json::Value =
+        serde_json::from_str(response).expect("execute_sql response must be JSON");
+    parsed["rows"][0][0]
+        .as_i64()
+        .unwrap_or_else(|| panic!("first cell must be an integer: {parsed}"))
 }
 
 fn assert_json_key_order(response: &str, first: &str, second: &str) {
@@ -206,8 +231,9 @@ fn load_trace_response_embeds_parseable_summary_json() {
         warnings: vec![],
     };
 
-    let response = format_load_trace_response("/tmp/basic.perfetto-trace", Ok(summary))
-        .expect("response must serialize");
+    let response =
+        format_load_trace_response("/tmp/basic.perfetto-trace", "trace_test", Ok(summary))
+            .expect("response must serialize");
     let summary_line = response
         .lines()
         .find_map(|line| line.strip_prefix("Trace summary: "))
@@ -217,6 +243,7 @@ fn load_trace_response_embeds_parseable_summary_json() {
 
     assert_eq!(parsed["available"], json!(true));
     assert_eq!(parsed["trace_profile"], json!("generic"));
+    assert_eq!(trace_id_from_load_response(&response), "trace_test");
     assert_eq!(parsed["process_count"], json!(4));
     assert!(
         response.contains("recommended_next_tools"),
@@ -240,8 +267,12 @@ fn load_trace_response_embeds_parseable_summary_json() {
 
 #[test]
 fn load_trace_response_preserves_success_when_summary_unavailable() {
-    let response = format_load_trace_response("/tmp/basic.perfetto-trace", Err("boom".into()))
-        .expect("response must serialize");
+    let response = format_load_trace_response(
+        "/tmp/basic.perfetto-trace",
+        "trace_test",
+        Err("boom".into()),
+    )
+    .expect("response must serialize");
     let summary_line = response
         .lines()
         .find_map(|line| line.strip_prefix("Trace summary: "))
@@ -291,7 +322,12 @@ fn schema_cache_is_scoped_to_trace_fingerprint() {
     );
     assert!(
         cache.table_structure(&key_b, "slice").is_none(),
-        "switching trace fingerprints must clear stale structures too"
+        "a different trace fingerprint must not reuse stale structures"
+    );
+    assert_eq!(
+        cache.table_structure(&key_a, "slice").as_deref(),
+        Some(r#"{"table":"slice","columns":[]}"#),
+        "schema cache should retain independent entries per trace"
     );
 }
 
@@ -307,10 +343,16 @@ fn load_trace_returns_summary_from_real_trace() {
         let server = PerfettoMcpServer::new(manager);
         let response = server
             .load_trace(Parameters(LoadTraceParams {
-                path: "tests/fixtures/basic.perfetto-trace".to_owned(),
+                path: Some("tests/fixtures/basic.perfetto-trace".to_owned()),
+                paths: vec![],
             }))
             .await
             .expect("load_trace on basic fixture must succeed");
+        let trace_id = trace_id_from_load_response(&response);
+        assert!(
+            trace_id.starts_with("trace_"),
+            "load_trace must return an opaque trace id, got: {trace_id}",
+        );
 
         let summary_line = response
             .lines()
@@ -335,6 +377,186 @@ fn load_trace_returns_summary_from_real_trace() {
                 .iter()
                 .any(|tool| tool.as_str() == Some("execute_sql")),
             "summary should preserve execute_sql as an escape hatch: {parsed}",
+        );
+    });
+}
+
+#[test]
+fn trace_id_routes_queries_after_current_trace_changes() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = Arc::new(TraceProcessorManager::new_with_starting_port(2, 19_331));
+        let server = PerfettoMcpServer::new(manager);
+        let basic_response = server
+            .load_trace(Parameters(LoadTraceParams {
+                path: Some("tests/fixtures/basic.perfetto-trace".to_owned()),
+                paths: vec![],
+            }))
+            .await
+            .expect("load basic trace");
+        let basic_trace_id = trace_id_from_load_response(&basic_response);
+
+        let page_load_response = server
+            .load_trace(Parameters(LoadTraceParams {
+                path: Some("tests/fixtures/page_loads.pftrace".to_owned()),
+                paths: vec![],
+            }))
+            .await
+            .expect("load page-load trace");
+        let page_load_trace_id = trace_id_from_load_response(&page_load_response);
+        assert_ne!(
+            basic_trace_id, page_load_trace_id,
+            "different trace files must receive different trace ids"
+        );
+
+        let response = server
+            .execute_sql(Parameters(ExecuteSqlParams {
+                trace_id: Some(basic_trace_id),
+                ..execute_sql_params("SELECT COUNT(*) AS c FROM process")
+            }))
+            .await
+            .expect("trace_id should route query to first loaded trace");
+
+        assert_eq!(
+            first_i64_cell(&response),
+            4,
+            "query with old trace_id must still hit basic.perfetto-trace after current trace changes"
+        );
+    });
+}
+
+#[test]
+fn load_trace_accepts_paths_array_for_batch_loading() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = Arc::new(TraceProcessorManager::new_with_starting_port(2, 19_371));
+        let server = PerfettoMcpServer::new(manager);
+
+        let response = server
+            .load_trace(Parameters(LoadTraceParams {
+                path: None,
+                paths: vec![
+                    "tests/fixtures/basic.perfetto-trace".to_owned(),
+                    "tests/fixtures/page_loads.pftrace".to_owned(),
+                ],
+            }))
+            .await
+            .expect("batch load_trace must succeed");
+
+        let loaded = loaded_traces_from_batch_response(&response);
+        let loaded = loaded.as_array().expect("loaded traces must be an array");
+        assert_eq!(loaded.len(), 2);
+        assert!(
+            loaded.iter().all(|entry| entry["trace_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("trace_"))),
+            "each loaded trace entry must include trace_id: {loaded:?}"
+        );
+
+        let first_trace_id = loaded[0]["trace_id"]
+            .as_str()
+            .expect("first loaded trace id")
+            .to_owned();
+        let response = server
+            .execute_sql(Parameters(ExecuteSqlParams {
+                trace_id: Some(first_trace_id),
+                ..execute_sql_params("SELECT COUNT(*) AS c FROM process")
+            }))
+            .await
+            .expect("batch-loaded trace_id should route query");
+        assert_eq!(first_i64_cell(&response), 4);
+    });
+}
+
+#[test]
+fn trace_id_routes_concurrent_queries_without_cross_talk() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let manager = Arc::new(TraceProcessorManager::new_with_starting_port(2, 19_411));
+        let server = PerfettoMcpServer::new(manager);
+
+        let response = server
+            .load_trace(Parameters(LoadTraceParams {
+                path: None,
+                paths: vec![
+                    "tests/fixtures/basic.perfetto-trace".to_owned(),
+                    "tests/fixtures/page_loads.pftrace".to_owned(),
+                ],
+            }))
+            .await
+            .expect("batch load_trace must succeed");
+
+        let loaded = loaded_traces_from_batch_response(&response);
+        let loaded = loaded.as_array().expect("loaded traces must be an array");
+        let basic_trace_id = loaded[0]["trace_id"]
+            .as_str()
+            .expect("basic trace id")
+            .to_owned();
+        let page_load_trace_id = loaded[1]["trace_id"]
+            .as_str()
+            .expect("page-load trace id")
+            .to_owned();
+
+        let basic_query = server.execute_sql(Parameters(ExecuteSqlParams {
+            trace_id: Some(basic_trace_id),
+            ..execute_sql_params("SELECT COUNT(*) AS c FROM process")
+        }));
+        let page_load_query = server.execute_sql(Parameters(ExecuteSqlParams {
+            trace_id: Some(page_load_trace_id),
+            ..execute_sql_params(
+                "INCLUDE PERFETTO MODULE chrome.page_loads; \
+                 SELECT COUNT(*) AS c FROM chrome_page_loads",
+            )
+        }));
+
+        let (basic_response, page_load_response) = tokio::join!(basic_query, page_load_query);
+        let basic_response = basic_response.expect("basic trace query should succeed");
+        let page_load_response = page_load_response.expect("page-load trace query should succeed");
+
+        assert_eq!(
+            first_i64_cell(&basic_response),
+            4,
+            "basic query must keep using the basic trace during concurrent analysis"
+        );
+        assert!(
+            first_i64_cell(&page_load_response) > 0,
+            "page-load query must use the Chrome page-load trace during concurrent analysis"
+        );
+    });
+}
+
+#[test]
+fn trace_id_errors_clearly_when_unknown() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let server = test_server();
+        let err = server
+            .execute_sql(Parameters(ExecuteSqlParams {
+                trace_id: Some("trace_missing".to_owned()),
+                ..execute_sql_params("SELECT 1")
+            }))
+            .await
+            .expect_err("unknown trace_id must fail before opening a trace");
+
+        assert!(
+            err.contains("Unknown trace_id") && err.contains("load_trace"),
+            "unknown trace_id error should be actionable, got: {err}",
         );
     });
 }
@@ -1239,6 +1461,7 @@ fn slice_descendants_applied_filters_use_effective_defaults() {
         include_args: true,
         limit: None,
         max_string_len: None,
+        trace_id: None,
     };
 
     let filters = slice_descendants_applied_filters(&params, DEFAULT_SLICE_DESCENDANTS_LIMIT);
@@ -2264,7 +2487,8 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
         // not about "no trace loaded").
         server
             .load_trace(Parameters(LoadTraceParams {
-                path: non_chrome_path.to_owned(),
+                path: Some(non_chrome_path.to_owned()),
+                paths: vec![],
             }))
             .await
             .expect("load_trace on non-chrome fixture must succeed");
@@ -2273,6 +2497,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
             .chrome_scroll_jank_summary(Parameters(ChromeTraceParams {
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2286,6 +2511,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
             .chrome_page_load_summary(Parameters(ChromeTraceParams {
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2305,6 +2531,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
                 min_dur_ms: None,
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2328,6 +2555,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
                 url_grouping: None,
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2352,6 +2580,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
                 url_grouping: None,
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2378,6 +2607,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
                 min_total_ms: None,
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2404,6 +2634,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
                 min_dur_ms: None,
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2417,6 +2648,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
             .chrome_startup_summary(Parameters(ChromeTraceParams {
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2430,6 +2662,7 @@ fn all_chrome_handlers_reject_non_chrome_via_preflight() {
             .chrome_web_content_interactions(Parameters(ChromeTraceParams {
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await;
         let err = r
@@ -2456,7 +2689,8 @@ fn list_tables_response_is_not_contaminated_by_previous_tool_call() {
         let server = PerfettoMcpServer::new(manager);
         server
             .load_trace(Parameters(LoadTraceParams {
-                path: "tests/fixtures/page_loads.pftrace".to_owned(),
+                path: Some("tests/fixtures/page_loads.pftrace".to_owned()),
+                paths: vec![],
             }))
             .await
             .expect("load_trace must succeed");
@@ -2465,6 +2699,7 @@ fn list_tables_response_is_not_contaminated_by_previous_tool_call() {
             .chrome_page_load_summary(Parameters(ChromeTraceParams {
                 limit: None,
                 max_string_len: None,
+                trace_id: None,
             }))
             .await
             .expect("page-load summary must succeed");
@@ -2476,6 +2711,7 @@ fn list_tables_response_is_not_contaminated_by_previous_tool_call() {
         let list_tables_response = server
             .list_tables(Parameters(ListTablesParams {
                 pattern: Some("chrome*".to_owned()),
+                trace_id: None,
             }))
             .await
             .expect("list_tables must succeed after a chrome tool call");
@@ -2933,6 +3169,32 @@ fn only_load_trace_advertises_path_field() {
     }
 }
 
+#[test]
+fn trace_bound_tools_advertise_trace_id_selector() {
+    let server = test_server();
+    for tool in server.tool_router.list_all() {
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        let props = schema.get("properties").and_then(|p| p.as_object());
+        let has_trace_id = props.map(|p| p.contains_key("trace_id")).unwrap_or(false);
+        match tool.name.as_ref() {
+            "load_trace" | "list_stdlib_modules" => {
+                assert!(
+                    !has_trace_id,
+                    "tool `{}` should not advertise `trace_id`",
+                    tool.name
+                );
+            }
+            _ => {
+                assert!(
+                    has_trace_id,
+                    "trace-bound tool `{}` must advertise optional `trace_id`",
+                    tool.name
+                );
+            }
+        }
+    }
+}
+
 /// v0.10.0 reverted `Json<T>` returns to plain `Result<String, String>`
 /// (Claude Code rendered `structured_content` as multi-line pretty-print,
 /// blowing up the conversation UI). With no tool returning `Json<T>`,
@@ -2961,8 +3223,30 @@ fn load_trace_accepts_trace_path_alias_for_backwards_compat() {
         serde_json::from_str(r#"{"path": "/x"}"#).expect("canonical `path` must deserialize");
     let from_alias: LoadTraceParams = serde_json::from_str(r#"{"trace_path": "/x"}"#)
         .expect("legacy `trace_path` alias must still deserialize");
-    assert_eq!(from_path.path, "/x");
-    assert_eq!(from_alias.path, "/x");
+    assert_eq!(from_path.path.as_deref(), Some("/x"));
+    assert_eq!(from_alias.path.as_deref(), Some("/x"));
+}
+
+#[test]
+fn load_trace_accepts_paths_array_and_rejects_ambiguous_selector() {
+    let batch: LoadTraceParams =
+        serde_json::from_str(r#"{"paths": ["/a", "/b"]}"#).expect("paths array must deserialize");
+    assert_eq!(batch.path, None);
+    assert_eq!(batch.paths, vec!["/a", "/b"]);
+    assert_eq!(
+        load_trace_paths(batch).expect("paths array must validate"),
+        vec!["/a".to_owned(), "/b".to_owned()]
+    );
+
+    let ambiguous: LoadTraceParams = serde_json::from_str(r#"{"path": "/a", "paths": ["/b"]}"#)
+        .expect("ambiguous shape should deserialize before semantic validation");
+    let err = load_trace_paths(ambiguous).expect_err("path and paths together must reject");
+    assert!(err.contains("either `path`") && err.contains("`paths`"));
+
+    let missing: LoadTraceParams =
+        serde_json::from_str(r#"{}"#).expect("missing path shape should deserialize");
+    let err = load_trace_paths(missing).expect_err("missing path(s) must reject");
+    assert!(err.contains("path") && err.contains("paths"));
 }
 
 /// v0.11.3 removed `path` from non-`load_trace` tools. v0.10.x callers
@@ -4542,6 +4826,7 @@ fn list_threads_in_process_requires_one_of_upid_or_process_name() {
                 process_name: None,
                 limit: None,
                 offset: None,
+                trace_id: None,
             }))
             .await;
         let err = r.expect_err("must reject when neither upid nor process_name is set");

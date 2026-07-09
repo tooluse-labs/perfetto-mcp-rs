@@ -140,8 +140,13 @@ pub(crate) fn redact_strings_default_from_env_value(value: Option<&str>) -> bool
 pub struct LoadTraceParams {
     /// Absolute path to a Perfetto trace file (.pftrace, .perfetto-trace, .bin,
     /// or any other trace_processor-readable format — content-sniffed, not by extension).
-    #[serde(alias = "trace_path")]
-    pub path: String,
+    #[serde(default, alias = "trace_path")]
+    pub path: Option<String>,
+    /// Absolute paths to multiple Perfetto trace files. Use this to load all
+    /// comparison targets in one call; the response returns one `trace_id` per
+    /// path. Mutually exclusive with `path`.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -173,6 +178,9 @@ pub struct ExecuteSqlParams {
     /// Accepts both numbers and numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -181,6 +189,9 @@ pub struct ListTablesParams {
     /// Optional GLOB pattern to filter table names (e.g. "chrome_*").
     #[serde(default)]
     pub pattern: Option<String>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -190,11 +201,18 @@ pub struct TableStructureParams {
     /// who model schema discovery around a generic "name" field.
     #[serde(alias = "name")]
     pub table_name: String,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ListProcessesParams {}
+pub struct ListProcessesParams {
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -217,6 +235,9 @@ pub struct ListThreadsInProcessParams {
     /// numbers and numeric strings.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub offset: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -247,6 +268,9 @@ pub struct SliceDescendantsBreakdownParams {
     /// numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -261,6 +285,9 @@ pub struct ChromeTraceParams {
     /// numbers and numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -324,6 +351,9 @@ pub struct ChromePageLoadResourceHotspotsParams {
     /// numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -378,6 +408,9 @@ pub struct ChromePageLoadResourceSummaryParams {
     /// numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -429,6 +462,9 @@ pub struct ChromePageLoadResourcePipelineParams {
     /// numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -486,6 +522,9 @@ pub struct ChromePageLoadScriptHotspotsParams {
     /// numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -555,6 +594,9 @@ pub struct ChromeMainThreadHotspotsParams {
     /// numeric strings. Must be > 0 when set.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_string_len: Option<u32>,
+    /// Optional trace id returned by `load_trace`. Omit to use the active trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]

@@ -48,22 +48,25 @@ use trace_summary::*;
 
 /// MCP server providing Perfetto trace analysis tools.
 ///
-/// `current_trace` is set by `load_trace` on success and is the **only** path
-/// source for every other handler — no other tool accepts an explicit `path`
-/// parameter. Switching between multiple cached traces is therefore done by
-/// re-calling `load_trace`, which is near-zero-cost when the manager already
-/// has a cached `trace_processor_shell` for that path. Overwritten on each
-/// successful `load_trace`, so "load A then load B then execute_sql" runs
-/// against B.
+/// `current_trace` is set by `load_trace` on success and remains the default
+/// path source for legacy callers. Multi-trace callers can pass the `trace_id`
+/// returned by `load_trace` to route a tool call to a specific loaded trace
+/// without racing the mutable current-trace pointer.
 #[derive(Debug, Clone)]
 pub struct PerfettoMcpServer {
     manager: Arc<TraceProcessorManager>,
     current_trace: Arc<Mutex<Option<String>>>,
+    loaded_traces: Arc<Mutex<HashMap<String, LoadedTrace>>>,
     schema_cache: Arc<Mutex<SchemaCache>>,
     tool_router: ToolRouter<Self>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+struct LoadedTrace {
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SchemaCacheTraceKey {
     canonical_path: PathBuf,
     size_bytes: u64,
@@ -74,8 +77,7 @@ struct SchemaCacheTraceKey {
 
 #[derive(Debug, Default)]
 struct SchemaCache {
-    trace_key: Option<SchemaCacheTraceKey>,
-    table_structures: HashMap<String, String>,
+    table_structures: HashMap<SchemaCacheTraceKey, HashMap<String, String>>,
 }
 
 impl SchemaCache {
@@ -84,8 +86,10 @@ impl SchemaCache {
         trace_key: &SchemaCacheTraceKey,
         table_name: &str,
     ) -> Option<String> {
-        self.ensure_trace(trace_key);
-        self.table_structures.get(table_name).cloned()
+        self.table_structures
+            .get(trace_key)
+            .and_then(|tables| tables.get(table_name))
+            .cloned()
     }
 
     fn store_table_structure(
@@ -94,15 +98,10 @@ impl SchemaCache {
         table_name: String,
         response: String,
     ) {
-        self.ensure_trace(&trace_key);
-        self.table_structures.insert(table_name, response);
-    }
-
-    fn ensure_trace(&mut self, trace_key: &SchemaCacheTraceKey) {
-        if self.trace_key.as_ref() != Some(trace_key) {
-            self.trace_key = Some(trace_key.clone());
-            self.table_structures.clear();
-        }
+        self.table_structures
+            .entry(trace_key)
+            .or_default()
+            .insert(table_name, response);
     }
 }
 
@@ -216,30 +215,21 @@ async fn query_exact_row_count_for_limited_tool_sql(
 impl PerfettoMcpServer {
     #[tool(
         name = "load_trace",
-        description = "Load a Perfetto trace file for analysis and return a lightweight \
-                       routing summary (trace type/profile, duration, platform, process/thread \
-                       counts, capabilities, and recommended next tools). Every other tool \
-                       operates on the trace set here.\n\
+        description = "Load one or more local Perfetto trace files and return routing summaries \
+                       plus `trace_id` handles. Other tools use the active trace by default; \
+                       pass `trace_id` to analyze a specific loaded trace after loading more.\n\
                        \n\
                        Use when: starting any analysis session — call this first.\n\
                        \n\
-                       Don't use for: live trace capture (Perfetto records traces; \
-                       perfetto-mcp-rs only reads the resulting file) or for streaming \
-                       URLs (path must be a complete file on local disk).\n\
+                       Don't use for: live capture or streaming URLs; paths must be complete \
+                       local trace files.\n\
                        \n\
-                       Parameters: `path` is an absolute path to a Perfetto trace file \
-                       (`.pftrace`, `.perfetto-trace`, `.bin`, or any other format \
-                       trace_processor accepts — content-sniffed, not by extension). \
-                       Calling again with a new path replaces the active \
-                       trace; cached `trace_processor_shell` instances make repeat loads \
-                       near-zero-cost unless the same path's metadata/content fingerprint \
-                       changed since it was loaded.\n\
+                       Parameters: pass `path` for one trace or `paths` for a batch. Calling again \
+                       makes the last loaded path the active default; cached trace processors make \
+                       repeat loads cheap unless the file fingerprint changed.\n\
                        \n\
                        Errors when: the file doesn't exist, isn't a valid Perfetto \
-                       trace, or `trace_processor_shell` fails to parse it (corrupt \
-                       trace, version mismatch). On first run only, also errors if the \
-                       `trace_processor_shell` binary fails to download from the \
-                       Perfetto LUCI bucket.",
+                       trace, trace_processor fails to parse it, or the binary cannot be downloaded.",
         annotations(
             destructive_hint = false,
             idempotent_hint = true,
@@ -256,27 +246,39 @@ impl PerfettoMcpServer {
         &self,
         Parameters(params): Parameters<LoadTraceParams>,
     ) -> Result<String, String> {
-        self.record_tool_span(format!("path_len={}", params.path.len()))
-            .await;
-        let client = self.client_for(&params.path).await?;
+        let paths = load_trace_paths(params)?;
+        self.record_tool_span(format!(
+            "path_count={},total_path_len={}",
+            paths.len(),
+            paths.iter().map(|path| path.len()).sum::<usize>()
+        ))
+        .await;
 
-        let status = client
-            .status()
-            .await
-            .map_err(|e| format!("Failed to get status: {e}"))?;
+        let mut loaded = Vec::with_capacity(paths.len());
+        for path in paths {
+            loaded.push(self.prepare_loaded_trace(path).await?);
+        }
 
-        let display =
-            format_loaded_trace_display(&params.path, status.loaded_trace_name.as_deref());
+        // Only update current_trace after every requested client is healthy.
+        // A failed batch must not redirect subsequent tools to a half-loaded
+        // trace. Summary collection above is best-effort and must not turn a
+        // successfully loaded trace into a failed load.
+        for trace in &loaded {
+            self.register_loaded_trace(trace.trace_id.clone(), trace.path.clone())
+                .await;
+        }
+        if let Some(last) = loaded.last() {
+            *self.current_trace.lock().await = Some(last.path.clone());
+        }
 
-        // Only update current_trace after the client is healthy and status
-        // succeeded — a failed load must not redirect subsequent tools to a
-        // half-loaded trace. Summary collection below is best-effort and must
-        // not turn a successfully loaded trace into a failed load.
-        *self.current_trace.lock().await = Some(params.path.clone());
-
-        let summary = collect_load_trace_summary(&client, &params.path).await;
-
-        format_load_trace_response(&display, summary)
+        if loaded.len() == 1 {
+            let trace = loaded
+                .pop()
+                .expect("single loaded trace must be present after len check");
+            format_load_trace_response(&trace.display, &trace.trace_id, trace.summary)
+        } else {
+            format_load_traces_response(loaded)
+        }
     }
 
     #[tool(
@@ -348,7 +350,7 @@ impl PerfettoMcpServer {
         ))
         .await;
         let decode_options = execute_sql_decode_options(&params)?;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         let decoded = client
             .query_with_options(&params.sql, decode_options)
             .await
@@ -403,7 +405,9 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span(format!("pattern_set={}", params.pattern.is_some()))
             .await;
-        let trace_path = self.current_trace_path().await?;
+        let trace_path = self
+            .trace_path_for_selector(params.trace_id.as_deref())
+            .await?;
         let pattern_key = match &params.pattern {
             Some(pat) => Some(sanitize_glob_param(pat).map_err(|e| e.to_string())?),
             None => None,
@@ -492,7 +496,9 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span(format!("table_name_len={}", params.table_name.len()))
             .await;
-        let trace_path = self.current_trace_path().await?;
+        let trace_path = self
+            .trace_path_for_selector(params.trace_id.as_deref())
+            .await?;
         let trace_key = trace_schema_cache_key(&trace_path)?;
         reject_table_structure_pattern(&params.table_name)?;
         let table_name = sanitize_glob_param(&params.table_name).map_err(|e| e.to_string())?;
@@ -569,10 +575,10 @@ impl PerfettoMcpServer {
     )]
     async fn list_processes(
         &self,
-        Parameters(_params): Parameters<ListProcessesParams>,
+        Parameters(params): Parameters<ListProcessesParams>,
     ) -> Result<String, String> {
         self.record_tool_span("no_params".to_owned()).await;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         let machine_id_expr = if table_has_column(&client, "process", "machine_id").await? {
             "machine_id"
         } else {
@@ -665,7 +671,7 @@ impl PerfettoMcpServer {
                 return Err("Either `upid` or `process_name` must be provided.".to_string());
             }
         };
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         let process_has_machine_id = table_has_column(&client, "process", "machine_id").await?;
         let machine_id_expr = if process_has_machine_id {
             "p.machine_id"
@@ -760,7 +766,7 @@ impl PerfettoMcpServer {
         ))
         .await;
         let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome scroll jank summary").await?;
         let table = client
             .query(&chrome_scroll_jank_summary_sql(effective_limit))
@@ -821,7 +827,7 @@ impl PerfettoMcpServer {
         ))
         .await;
         let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome page load summary").await?;
         let table = client
             .query(&chrome_page_load_summary_sql(effective_limit))
@@ -873,7 +879,7 @@ impl PerfettoMcpServer {
             params.max_string_len.is_some()
         ))
         .await;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome page-load resource hotspots").await?;
         let process_machine_id_available =
             table_has_column(&client, "process", "machine_id").await?;
@@ -956,7 +962,7 @@ impl PerfettoMcpServer {
             start_ts_ns: params.start_ts_ns,
             end_ts_ns: params.end_ts_ns,
         };
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome page-load resource summary").await?;
         let process_machine_id_available =
             table_has_column(&client, "process", "machine_id").await?;
@@ -1037,7 +1043,7 @@ impl PerfettoMcpServer {
             params.max_string_len.is_some()
         ))
         .await;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome page-load resource pipeline").await?;
         let process_machine_id_available =
             table_has_column(&client, "process", "machine_id").await?;
@@ -1122,7 +1128,7 @@ impl PerfettoMcpServer {
             params.max_string_len.is_some()
         ))
         .await;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome page-load script hotspots").await?;
         let process_machine_id_available =
             table_has_column(&client, "process", "machine_id").await?;
@@ -1244,7 +1250,7 @@ impl PerfettoMcpServer {
             params.max_string_len.is_some()
         ))
         .await;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome main-thread hotspots").await?;
         let process_machine_id_available =
             table_has_column(&client, "process", "machine_id").await?;
@@ -1334,7 +1340,7 @@ impl PerfettoMcpServer {
         let probe_limit = extra_row_probe_limit(effective_limit as usize) as u32;
         let applied_filters = slice_descendants_applied_filters(&params, effective_limit);
 
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         let deduped_root_ids = dedupe_slice_ids_preserving_order(&params.slice_ids);
         let missing_root_ids = if deduped_root_ids.is_empty() {
             Vec::new()
@@ -1445,7 +1451,7 @@ impl PerfettoMcpServer {
         ))
         .await;
         let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome startup summary").await?;
         let table = client
             .query(&chrome_startup_summary_sql(effective_limit))
@@ -1506,7 +1512,7 @@ impl PerfettoMcpServer {
         ))
         .await;
         let effective_limit = bounded_tool_limit(params.limit, DEFAULT_CHROME_TOOL_ROWS)?;
-        let client = self.client_for_current().await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
         ensure_chrome_trace(&client, "Chrome web content interactions").await?;
         let table = client
             .query(&chrome_web_content_interactions_sql(effective_limit))
@@ -1564,6 +1570,7 @@ impl PerfettoMcpServer {
         Self {
             manager,
             current_trace: Arc::new(Mutex::new(None)),
+            loaded_traces: Arc::new(Mutex::new(HashMap::new())),
             schema_cache: Arc::new(Mutex::new(SchemaCache::default())),
             tool_router: Self::tool_router(),
         }
@@ -1592,11 +1599,56 @@ impl PerfettoMcpServer {
         })
     }
 
-    /// One-shot "current trace → cached client" used by every non-`load_trace`
-    /// handler. Centralizes the two-step preamble so tool descriptions and
-    /// future telemetry/retry hooks have one site to wire into.
-    async fn client_for_current(&self) -> Result<crate::tp_client::TraceProcessorClient, String> {
-        let path = self.current_trace_path().await?;
+    async fn register_loaded_trace(&self, trace_id: String, path: String) {
+        self.loaded_traces
+            .lock()
+            .await
+            .insert(trace_id, LoadedTrace { path });
+    }
+
+    async fn prepare_loaded_trace(&self, path: String) -> Result<LoadedTraceReport, String> {
+        let client = self.client_for(&path).await?;
+
+        let status = client
+            .status()
+            .await
+            .map_err(|e| format!("Failed to get status for {path:?}: {e}"))?;
+
+        let display = format_loaded_trace_display(&path, status.loaded_trace_name.as_deref());
+        let trace_key = trace_schema_cache_key(&path)?;
+        let trace_id = trace_id_for_key(&trace_key);
+        let summary = collect_load_trace_summary(&client, &path).await;
+
+        Ok(LoadedTraceReport {
+            path,
+            display,
+            trace_id,
+            summary,
+        })
+    }
+
+    async fn trace_path_for_selector(&self, trace_id: Option<&str>) -> Result<String, String> {
+        match trace_id {
+            Some(id) => self
+                .loaded_traces
+                .lock()
+                .await
+                .get(id)
+                .map(|trace| trace.path.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "Unknown trace_id {id:?}. Call `load_trace` first and use the returned `trace_id`."
+                    )
+                }),
+            None => self.current_trace_path().await,
+        }
+    }
+
+    async fn client_for_selected(
+        &self,
+        trace_id: Option<&str>,
+    ) -> Result<crate::tp_client::TraceProcessorClient, String> {
+        let path = self.trace_path_for_selector(trace_id).await?;
         self.client_for(&path).await
     }
 
@@ -1610,6 +1662,25 @@ impl PerfettoMcpServer {
             .await
             .map_err(|e| format!("Failed to open trace {trace_path:?}: {e}"))
     }
+}
+
+fn load_trace_paths(params: LoadTraceParams) -> Result<Vec<String>, String> {
+    let LoadTraceParams { path, paths } = params;
+    match (path, paths.is_empty()) {
+        (Some(_), false) => Err(
+            "Pass either `path` for one trace or `paths` for multiple traces, not both.".to_owned(),
+        ),
+        (Some(path), true) => validate_trace_paths(vec![path]),
+        (None, false) => validate_trace_paths(paths),
+        (None, true) => Err("Missing trace path. Pass `path` or `paths`.".to_owned()),
+    }
+}
+
+fn validate_trace_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
+    if let Some(index) = paths.iter().position(|path| path.trim().is_empty()) {
+        return Err(format!("Trace path at index {index} is empty."));
+    }
+    Ok(paths)
 }
 
 async fn table_has_column(
@@ -1661,6 +1732,30 @@ fn trace_schema_cache_key(trace_path: &str) -> Result<SchemaCacheTraceKey, Strin
         platform: trace_file_platform_fingerprint(&metadata),
         sample_sha256,
     })
+}
+
+fn trace_id_for_key(trace_key: &SchemaCacheTraceKey) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(trace_key.canonical_path.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(trace_key.size_bytes.to_le_bytes());
+    hasher.update(b"\0");
+    if let Some(modified) = trace_key.modified {
+        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(duration.as_nanos().to_le_bytes());
+        }
+    }
+    hasher.update(b"\0");
+    if let Some(platform) = &trace_key.platform {
+        hasher.update(platform.as_bytes());
+    }
+    hasher.update(b"\0");
+    hasher.update(trace_key.sample_sha256.as_bytes());
+
+    let digest = hex::encode(hasher.finalize());
+    format!("trace_{}", &digest[..16])
 }
 
 #[cfg(test)]
