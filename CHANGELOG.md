@@ -4,6 +4,16 @@
 
 ### Unreleased
 
+### [0.17.1](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.17.1) (July 10, 2026)
+
+- **`perfetto-mcp-rs update` no longer fails silently or accepts a no-op install.**
+  Unix updates now download through the same `curl` path as the documented
+  installer command, print progress before network work, reject empty/HTML
+  installer responses before starting a shell, and preserve downloader or
+  installer diagnostics. The command resolves an exact target release and
+  verifies the installed binary's `--version` before reporting success, so an
+  installer exit code of zero cannot leave an older binary behind unnoticed.
+
 ### [0.17.0](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.17.0) (July 10, 2026)
 
 - **Multiple traces can now be loaded, routed, and analyzed concurrently.** Pass
