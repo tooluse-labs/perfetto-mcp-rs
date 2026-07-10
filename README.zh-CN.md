@@ -61,8 +61,9 @@ agentic 客户端虽然也能看到全部工具和错误提示，但不会自动
 
 ## 工具
 
-切换 trace 只需重新调 `load_trace`——其它工具都没有 `path` 参数，一律作用于
-最近一次加载的 trace。
+分析单个 trace 时，其它工具默认作用于最近一次加载的 trace。分析多个 trace 时，
+用 `load_trace` 的 `paths` 一次加载多个文件，保留每个文件返回的 `trace_id`，并在
+后续每个 trace 工具调用中传入目标 id。
 
 MCP tool annotations 只是给客户端展示/路由用的意图与安全提示，不是服务端授权
 或执行边界。
@@ -71,7 +72,7 @@ MCP tool annotations 只是给客户端展示/路由用的意图与安全提示�
 
 | 工具 | 用途 |
 |---|---|
-| `load_trace` | 打开 trace，返回轻量路由摘要（类型/profile、时长、平台、进程/线程数、能力标签、脱敏策略、推荐下一步工具） |
+| `load_trace` | 用 `path` 打开一个 trace，或用 `paths` 打开多个；为每个文件返回不透明的 `trace_id` 和轻量路由摘要（类型/profile、时长、平台、进程/线程数、能力标签、脱敏策略、推荐下一步工具） |
 | `execute_sql` | 执行 PerfettoSQL 查询（最多返回 5000 行）。标准分析优先用专用的 `chrome_*` / `list_*` 工具；只有它们没暴露的自定义 join/聚合才用本工具。输出塑形：`head`/`limit`、`summary`、`columns_only`、`include_row_count`、`max_string_len`。默认遮蔽 URL/header/cookie/路径中的敏感值 |
 
 **探索（Exploration）**
@@ -124,6 +125,13 @@ MCP tool annotations 只是给客户端展示/路由用的意图与安全提示�
   MODULE`。没有合适模块时，再用 `list_tables` / `list_table_structure` 探索
   schema，然后 `execute_sql`。
 
+### 分析多个 trace
+
+用 `load_trace(paths=[...])` 一次加载所有对比目标；响应会为每个文件返回一个稳定的
+`trace_id`。对每个 id 调用相同的 trace 工具（MCP 客户端支持并行工具调用时可以并发
+执行），再比较各自返回的证据。省略 `trace_id` 仍兼容旧用法，作用于最近一次加载的
+trace。如果已加载文件在磁盘上发生变化，旧 id 会被明确拒绝，并提示重新加载。
+
 **隐私**——tool 结果会进入 LLM 上下文，而真实 trace 里可能含 URL、header、
 cookie、本地路径。`execute_sql` 和专用 Chrome 工具默认遮蔽这类敏感字符串，同时
 保留诊断结构。需要原始取证数据时，在启动服务端前设
@@ -155,7 +163,8 @@ ORDER BY n DESC;
 | `PERFETTO_TP_PATH` | — | 已有的 `trace_processor_shell` 路径，设了就不自动下载 |
 | `--startup-timeout-ms` / `PERFETTO_STARTUP_TIMEOUT_MS` | `20000` | 等待新启动 `trace_processor_shell` 就绪的最长时间（ms） |
 | `--query-timeout-ms` / `PERFETTO_QUERY_TIMEOUT_MS` | `30000` | `/status` 和 `/query` 请求的 HTTP 超时（ms） |
-| `--max-instances` | `3` | 最多缓存几个 `trace_processor_shell` 进程，超过按 LRU 淘汰 |
+| `--max-instances` | `3` | idle LRU 最多保留几个 `trace_processor_shell` 进程；正在查询的实例不会被淘汰 |
+| `--max-active-instances` | `10` | 同时处于查询中的 `trace_processor_shell` 实例上限；更多不同 trace 的请求会等待 semaphore permit |
 | `--span-timings` / `PERFETTO_MCP_SPAN_TIMINGS` | 关 | 输出 tracing span close 计时，用于性能热点诊断（`1` / `true` / `yes` / `on`） |
 | `--artifacts-base-url` / `PERFETTO_ARTIFACTS_BASE_URL` | LUCI bucket | 缓存未命中时覆盖 `trace_processor_shell` 的下载源（镜像/代理；版本仍为固定 pin） |
 | `PERFETTO_MCP_REDACT_STRINGS_DEFAULT` | `true` | 遮蔽 tool 输出里 URL/header/cookie/路径的敏感字符串；设 `false` 走原始取证 |

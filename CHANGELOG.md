@@ -4,6 +4,22 @@
 
 ### Unreleased
 
+### [0.17.0](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.17.0) (July 10, 2026)
+
+- **Multiple traces can now be loaded, routed, and analyzed concurrently.** Pass
+  `paths` to `load_trace` to receive one opaque `trace_id` per file, then pass
+  those ids to any trace-bound tool so parallel calls stay isolated instead of
+  racing through one mutable current-trace selection.
+- **Trace routing now preserves identity and query lifetime.** A `trace_id` is
+  bound to the loaded file fingerprint, so overwriting a trace or retargeting a
+  symlink produces an explicit reload error instead of silently querying new
+  contents. Active instance leases also prevent idle-LRU eviction from killing
+  a trace processor while its query is running.
+- **Concurrent trace processors now have an explicit resource limit.** The new
+  `--max-active-instances` option defaults to `10`; additional distinct-trace
+  queries wait for a semaphore permit. `--max-instances` remains the idle
+  process cache limit and defaults to `3`, while concurrent calls for the same
+  trace reuse one processor and one active slot.
 - **`perfetto-mcp-rs update` now reports silent installer failures.** If the
   downloaded installer exits non-zero without printing its own error, the update
   wrapper now emits `update failed: installer exited ...` and preserves the

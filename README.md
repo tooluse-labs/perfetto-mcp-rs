@@ -65,8 +65,9 @@ guided flow automatically.
 
 ## Tools
 
-Switching traces means re-calling `load_trace` — there is no `path` argument on
-the other tools; they all act on the most recently loaded trace.
+For one trace, other tools act on the most recently loaded trace by default. For
+multiple traces, call `load_trace` with `paths`, keep the returned `trace_id` for
+each file, and pass the intended id to every trace-bound tool call.
 
 MCP tool annotations are client-facing intent and safety hints, not server-side
 authorization or execution boundaries.
@@ -75,7 +76,7 @@ authorization or execution boundaries.
 
 | Tool | Purpose |
 |---|---|
-| `load_trace` | Open a trace and return a lightweight routing summary (type/profile, duration, platform, process/thread counts, capabilities, redaction policy, recommended next tools) |
+| `load_trace` | Open one trace with `path`, or several with `paths`; returns an opaque `trace_id` and lightweight routing summary for each file (type/profile, duration, platform, process/thread counts, capabilities, redaction policy, recommended next tools) |
 | `execute_sql` | Run a PerfettoSQL query (max 5000 returned rows). Prefer the dedicated `chrome_*` / `list_*` tools for standard analyses; use this for custom joins or aggregations they don't expose. Output shaping: `head`/`limit`, `summary`, `columns_only`, `include_row_count`, `max_string_len`. Sensitive URL/header/cookie/path values redacted by default |
 
 **Exploration**
@@ -128,6 +129,15 @@ The right path depends on the trace type:
   module first (Android, generic modules like `slices.with_context`), then run it
   via `execute_sql` + `INCLUDE PERFETTO MODULE`. No module fits? Fall back to
   `list_tables` / `list_table_structure` for schema discovery, then `execute_sql`.
+
+### Analyzing multiple traces
+
+Load comparison targets together with `load_trace(paths=[...])`. The response
+returns one stable `trace_id` per file. Run the same trace-bound tool for each id
+(concurrently when the MCP client supports parallel tool calls), then compare
+the returned evidence. Calls without `trace_id` remain backward compatible and
+use the most recently loaded trace. If a loaded file changes on disk, its old id
+is rejected with an explicit instruction to reload it.
 
 **Privacy** — tool results enter the LLM context, and real traces can hold URLs,
 headers, cookies, and local paths. `execute_sql` and the dedicated Chrome tools
