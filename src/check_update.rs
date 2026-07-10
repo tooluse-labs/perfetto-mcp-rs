@@ -75,15 +75,30 @@ pub async fn run() -> ExitCode {
 }
 
 async fn check() -> Result<Outcome, CheckError> {
+    let latest = latest_version().await?;
+    let current = parse_local_version()?;
+    Ok(compare(current, latest.version, latest.published_at))
+}
+
+/// Fetch and parse the latest published version for callers that need an
+/// exact release target, such as the self-update command.
+pub(crate) async fn latest_version() -> Result<LatestVersion, CheckError> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(format!("perfetto-mcp-rs/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| CheckError::Network(e.to_string()))?;
     let release = fetch_latest(&client, RELEASES_LATEST_URL).await?;
-    let current = parse_local_version()?;
-    let latest = parse_release_tag(&release.tag_name)?;
-    Ok(compare(current, latest, release.published_at))
+    Ok(LatestVersion {
+        version: parse_release_tag(&release.tag_name)?,
+        published_at: release.published_at,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LatestVersion {
+    pub(crate) version: Version,
+    published_at: String,
 }
 
 async fn fetch_latest(client: &reqwest::Client, url: &str) -> Result<LatestRelease, CheckError> {

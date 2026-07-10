@@ -7,12 +7,16 @@
 //! Windows file-lock handling, PATH setup, and MCP re-registration. Keeping
 //! this command as a thin launcher avoids duplicating that logic in Rust.
 
+use std::ffi::OsStr;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use semver::Version;
 
+use crate::check_update;
 use crate::install::ClaudeScope;
 
 const INSTALL_SH_URL: &str =
@@ -37,8 +41,19 @@ pub struct UpdateArgs {
 
 pub async fn run(args: UpdateArgs) -> ExitCode {
     match run_inner(args).await {
-        Ok(exit) if exit.success() => ExitCode::from(0),
-        Ok(exit) => {
+        Ok(UpdateOutcome::NoUpdate { current, latest }) if current == latest => {
+            println!("perfetto-mcp-rs is already on the latest release (v{current}).");
+            ExitCode::from(0)
+        }
+        Ok(UpdateOutcome::NoUpdate { current, latest }) => {
+            println!("No update needed: running v{current}, ahead of latest release v{latest}.");
+            ExitCode::from(0)
+        }
+        Ok(UpdateOutcome::Installed { version, path }) => {
+            println!("Update complete: {} is now v{version}.", path.display());
+            ExitCode::from(0)
+        }
+        Ok(UpdateOutcome::InstallerFailed(exit)) => {
             eprintln!("update failed: {}", exit.failure_message());
             ExitCode::from(exit.code)
         }
@@ -49,13 +64,95 @@ pub async fn run(args: UpdateArgs) -> ExitCode {
     }
 }
 
-async fn run_inner(args: UpdateArgs) -> Result<InstallerExit> {
-    let invocation = installer_invocation(current_platform(), &args);
-    let script = fetch_installer(invocation.url).await?;
-    run_installer(&invocation, &script)
+async fn run_inner(mut args: UpdateArgs) -> Result<UpdateOutcome> {
+    let requested_version = args.version.as_deref();
+    let target = resolve_target_version(requested_version).await?;
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))
+        .context("the running binary has an invalid embedded version")?;
+
+    if requested_version.is_none() && target <= current {
+        return Ok(UpdateOutcome::NoUpdate {
+            current,
+            latest: target,
+        });
+    }
+
+    args.version = Some(format!("v{target}"));
+    let platform = current_platform();
+    let invocation = installer_invocation(platform, &args);
+
+    println!("Updating perfetto-mcp-rs from v{current} to v{target}...");
+    println!("Downloading the official installer from {}", invocation.url);
+    let script = fetch_installer(platform, invocation.url).await?;
+    let exit = execute_installer(platform, &invocation, &script)?;
+    if !exit.success() {
+        return Ok(UpdateOutcome::InstallerFailed(exit));
+    }
+
+    let path = installed_binary_path(platform)?;
+    let installed = verify_installed_version(&path, &target)?;
+    Ok(UpdateOutcome::Installed {
+        version: installed,
+        path,
+    })
 }
 
-async fn fetch_installer(url: &str) -> Result<String> {
+async fn resolve_target_version(requested: Option<&str>) -> Result<Version> {
+    if let Some(tag) = requested {
+        return Version::parse(tag.strip_prefix('v').unwrap_or(tag))
+            .with_context(|| format!("invalid release version {tag:?}"));
+    }
+
+    check_update::latest_version()
+        .await
+        .map(|latest| latest.version)
+        .context("failed to determine the latest release; retry or pass --version <TAG>")
+}
+
+async fn fetch_installer(platform: InstallerPlatform, url: &'static str) -> Result<String> {
+    match platform {
+        InstallerPlatform::Unix => {
+            tokio::task::spawn_blocking(move || fetch_installer_with_curl(OsStr::new("curl"), url))
+                .await
+                .context("installer download task failed")?
+        }
+        InstallerPlatform::Windows => fetch_installer_with_http(url).await,
+    }
+}
+
+fn fetch_installer_with_curl(program: &OsStr, url: &str) -> Result<String> {
+    let output = Command::new(program)
+        .args([
+            "-fsSL",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "1",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "60",
+            url,
+        ])
+        .output()
+        .with_context(|| format!("failed to start {}", program.to_string_lossy()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            bail!("curl failed with {} while downloading {url}", output.status);
+        }
+        bail!(
+            "curl failed with {} while downloading {url}: {detail}",
+            output.status
+        );
+    }
+
+    String::from_utf8(output.stdout).context("downloaded installer was not valid UTF-8")
+}
+
+async fn fetch_installer_with_http(url: &str) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(format!("perfetto-mcp-rs/{}", env!("CARGO_PKG_VERSION")))
@@ -72,6 +169,38 @@ async fn fetch_installer(url: &str) -> Result<String> {
         .text()
         .await
         .context("failed to read installer response body")
+}
+
+fn execute_installer(
+    platform: InstallerPlatform,
+    invocation: &InstallerInvocation,
+    script: &str,
+) -> Result<InstallerExit> {
+    validate_installer(platform, script)?;
+    run_installer(invocation, script)
+}
+
+fn validate_installer(platform: InstallerPlatform, script: &str) -> Result<()> {
+    let markers: &[&str] = match platform {
+        InstallerPlatform::Unix => &[
+            "#!/usr/bin/env sh",
+            "BIN_NAME=\"perfetto-mcp-rs\"",
+            "main \"$@\"",
+        ],
+        InstallerPlatform::Windows => &[
+            "function Install-PerfettoMcp",
+            "perfetto-mcp-rs-windows-amd64.exe",
+            "Invoke-WebRequest",
+        ],
+    };
+
+    if script.len() < 512 || markers.iter().any(|marker| !script.contains(marker)) {
+        bail!(
+            "downloaded installer was empty or invalid; refusing to execute it ({} bytes)",
+            script.len()
+        );
+    }
+    Ok(())
 }
 
 fn run_installer(invocation: &InstallerInvocation, script: &str) -> Result<InstallerExit> {
@@ -102,6 +231,13 @@ fn run_installer(invocation: &InstallerInvocation, script: &str) -> Result<Insta
 struct InstallerExit {
     code: u8,
     status_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateOutcome {
+    NoUpdate { current: Version, latest: Version },
+    Installed { version: Version, path: PathBuf },
+    InstallerFailed(InstallerExit),
 }
 
 impl InstallerExit {
@@ -189,6 +325,59 @@ fn installer_invocation(
     }
 }
 
+fn installed_binary_path(platform: InstallerPlatform) -> Result<PathBuf> {
+    let install_dir = std::env::var_os("INSTALL_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("bin")))
+        .context("could not determine installer destination; set INSTALL_DIR explicitly")?;
+    let name = match platform {
+        InstallerPlatform::Unix => "perfetto-mcp-rs",
+        InstallerPlatform::Windows => "perfetto-mcp-rs.exe",
+    };
+    Ok(install_dir.join(name))
+}
+
+fn verify_installed_version(path: &Path, expected: &Version) -> Result<Version> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .with_context(|| {
+            format!(
+                "installer exited successfully but {} cannot be run",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "installer exited successfully but {} --version returned {}",
+            path.display(),
+            output.status
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("{} --version returned non-UTF-8 output", path.display()))?;
+    let raw = stdout
+        .trim()
+        .strip_prefix("perfetto-mcp-rs ")
+        .with_context(|| {
+            format!(
+                "unexpected --version output from {}: {stdout:?}",
+                path.display()
+            )
+        })?;
+    let actual = Version::parse(raw)
+        .with_context(|| format!("invalid installed version from {}: {raw:?}", path.display()))?;
+    if &actual != expected {
+        bail!(
+            "installer exited successfully but {} reports v{actual}; expected v{expected}",
+            path.display()
+        );
+    }
+    Ok(actual)
+}
+
 fn exit_status_code(status: ExitStatus) -> u8 {
     match status.code() {
         Some(code) if (0..=255).contains(&code) => code as u8,
@@ -268,16 +457,110 @@ mod tests {
         assert_eq!(invocation.env, [("VERSION", "v0.16.2".to_owned())]);
     }
 
+    #[tokio::test]
+    async fn explicit_target_version_accepts_v_prefix() {
+        assert_eq!(
+            resolve_target_version(Some("v0.17.0")).await.unwrap(),
+            Version::parse("0.17.0").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_target_version_rejects_invalid_tag() {
+        let error = resolve_target_version(Some("latest"))
+            .await
+            .expect_err("non-semver tags must be rejected");
+        assert!(error.to_string().contains("invalid release version"));
+    }
+
+    #[test]
+    fn checked_in_installers_pass_payload_validation() {
+        validate_installer(InstallerPlatform::Unix, include_str!("../install.sh")).unwrap();
+        validate_installer(InstallerPlatform::Windows, include_str!("../install.ps1")).unwrap();
+    }
+
+    #[test]
+    fn empty_and_html_payloads_are_rejected() {
+        for body in ["", "<html><body>proxy error</body></html>"] {
+            let error = validate_installer(InstallerPlatform::Unix, body)
+                .expect_err("non-installer response must be rejected");
+            assert!(error.to_string().contains("refusing to execute"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_payload_never_starts_the_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("record-start.sh");
+        let marker = temp.path().join("shell-started");
+        write_executable(&helper, "#!/bin/sh\n: > \"$1\"\ncat >/dev/null\n");
+        let invocation = InstallerInvocation {
+            url: INSTALL_SH_URL,
+            program: "/bin/sh",
+            args: vec![
+                helper.to_string_lossy().to_string(),
+                marker.to_string_lossy().to_string(),
+            ],
+            env: Vec::new(),
+        };
+
+        execute_installer(InstallerPlatform::Unix, &invocation, "")
+            .expect_err("empty response must fail before process creation");
+        assert!(!marker.exists(), "shell was started for an invalid payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_failure_preserves_status_and_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("failing-curl.sh");
+        write_executable(
+            &helper,
+            "#!/bin/sh\nprintf 'proxy refused request\\n' >&2\nexit 17\n",
+        );
+
+        let error = fetch_installer_with_curl(helper.as_os_str(), INSTALL_SH_URL)
+            .expect_err("download failure must not be treated as an empty installer");
+        let message = error.to_string();
+        assert!(message.contains("exit status: 17"), "got: {message}");
+        assert!(message.contains("proxy refused request"), "got: {message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_installer_with_stale_binary_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("perfetto-mcp-rs");
+        write_executable(&binary, "#!/bin/sh\nprintf 'perfetto-mcp-rs 0.16.3\\n'\n");
+
+        let error = verify_installed_version(&binary, &Version::parse("0.17.0").unwrap())
+            .expect_err("a stale binary must fail post-install verification");
+        let message = error.to_string();
+        assert!(message.contains("reports v0.16.3"), "got: {message}");
+        assert!(message.contains("expected v0.17.0"), "got: {message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_install_verification_accepts_exact_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("perfetto-mcp-rs");
+        write_executable(&binary, "#!/bin/sh\nprintf 'perfetto-mcp-rs 0.17.0\\n'\n");
+
+        assert_eq!(
+            verify_installed_version(&binary, &Version::parse("0.17.0").unwrap()).unwrap(),
+            Version::parse("0.17.0").unwrap()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_installer_streams_script_to_child_stdin() {
         let temp = tempfile::tempdir().unwrap();
         let helper = temp.path().join("capture-stdin.sh");
         let captured = temp.path().join("captured-installer.sh");
-        fs::write(&helper, "#!/bin/sh\ncat > \"$1\"\n").unwrap();
-        let mut perms = fs::metadata(&helper).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&helper, perms).unwrap();
+        write_executable(&helper, "#!/bin/sh\ncat > \"$1\"\n");
 
         let invocation = InstallerInvocation {
             url: INSTALL_SH_URL,
@@ -332,5 +615,13 @@ mod tests {
             exit.failure_message(),
             "installer exited with signal: 9 (SIGKILL); any installer output should appear above"
         );
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
     }
 }
