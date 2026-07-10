@@ -1,9 +1,10 @@
 // Copyright 2025 The perfetto-mcp-rs Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
@@ -251,8 +252,17 @@ pub(crate) fn trace_file_sample_sha256(path: &Path, size_bytes: u64) -> Result<S
 }
 
 struct CachedTraceProcessorInstance {
-    instance: TraceProcessorInstance,
+    instance: SharedTraceProcessorInstance,
     fingerprint: TraceFileFingerprint,
+    active_leases: usize,
+}
+
+type SharedTraceProcessorInstance = Arc<StdMutex<TraceProcessorInstance>>;
+
+struct TraceProcessorInstanceLease {
+    manager: Weak<StdMutex<ManagerInner>>,
+    canonical: PathBuf,
+    instance: SharedTraceProcessorInstance,
 }
 
 impl TraceProcessorInstance {
@@ -431,12 +441,12 @@ impl Drop for TraceProcessorInstance {
     }
 }
 
-/// Manages a pool of trace_processor_shell instances, one per trace file,
-/// with LRU eviction when the pool exceeds `max_instances`. Instances are
-/// keyed by canonical path and invalidated when that file's metadata/content
-/// fingerprint changes.
+/// Manages trace_processor_shell instances keyed by canonical trace path.
+/// Active instances remain registered and reusable; only idle instances enter
+/// the LRU, which retains at most `max_instances` processes. Instances are
+/// invalidated when the trace metadata/content fingerprint changes.
 pub struct TraceProcessorManager {
-    inner: Mutex<ManagerInner>,
+    inner: Arc<StdMutex<ManagerInner>>,
     spawn_locks: Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>,
     binary_path: OnceCell<PathBuf>,
     config: TraceProcessorConfig,
@@ -453,9 +463,78 @@ impl std::fmt::Debug for TraceProcessorManager {
 }
 
 struct ManagerInner {
-    instances: LruCache<PathBuf, CachedTraceProcessorInstance>,
+    instances: HashMap<PathBuf, CachedTraceProcessorInstance>,
+    idle_instances: LruCache<PathBuf, ()>,
     next_port: u16,
     starting_port: u16,
+}
+
+impl ManagerInner {
+    fn remove_instance(&mut self, canonical: &Path) -> Option<CachedTraceProcessorInstance> {
+        self.idle_instances.pop(canonical);
+        self.instances.remove(canonical)
+    }
+
+    fn release_lease(
+        &mut self,
+        canonical: &Path,
+        instance: &SharedTraceProcessorInstance,
+    ) -> Option<CachedTraceProcessorInstance> {
+        let became_idle = {
+            let cached = self.instances.get_mut(canonical)?;
+            if !Arc::ptr_eq(&cached.instance, instance) {
+                return None;
+            }
+            if cached.active_leases == 0 {
+                tracing::error!(
+                    "trace_processor lease count underflow for {}",
+                    canonical.display()
+                );
+                return None;
+            }
+            cached.active_leases -= 1;
+            cached.active_leases == 0
+        };
+
+        if !became_idle {
+            return None;
+        }
+
+        let evicted = self
+            .idle_instances
+            .push(canonical.to_path_buf(), ())
+            .map(|(path, ())| path);
+        let evicted_path = evicted.filter(|path| path.as_path() != canonical)?;
+        if self
+            .instances
+            .get(&evicted_path)
+            .is_some_and(|cached| cached.active_leases == 0)
+        {
+            tracing::debug!(
+                "evicting idle trace_processor instance for {}",
+                evicted_path.display()
+            );
+            self.instances.remove(&evicted_path)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for TraceProcessorInstanceLease {
+    fn drop(&mut self) {
+        let Some(manager) = self.manager.upgrade() else {
+            return;
+        };
+        let evicted = {
+            let mut inner = match manager.lock() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            inner.release_lease(&self.canonical, &self.instance)
+        };
+        drop(evicted);
+    }
 }
 
 impl TraceProcessorManager {
@@ -469,11 +548,12 @@ impl TraceProcessorManager {
     ) -> Self {
         let cap = NonZeroUsize::new(max_instances).unwrap_or(NonZeroUsize::MIN);
         Self {
-            inner: Mutex::new(ManagerInner {
-                instances: LruCache::new(cap),
+            inner: Arc::new(StdMutex::new(ManagerInner {
+                instances: HashMap::new(),
+                idle_instances: LruCache::new(cap),
                 next_port: starting_port,
                 starting_port,
-            }),
+            })),
             spawn_locks: Mutex::new(std::collections::HashMap::new()),
             binary_path: OnceCell::new(),
             config,
@@ -548,10 +628,10 @@ impl TraceProcessorManager {
 
     /// Get or create a `TraceProcessorClient` for the given trace file.
     ///
-    /// If the instance already exists in the cache, it is returned (and
-    /// promoted in LRU order). If the instance's process has died, it is
-    /// respawned. If the cache is full, the least recently used instance
-    /// is evicted (its process is killed via `kill_on_drop`).
+    /// If a live instance already exists, it is reused even while other calls
+    /// hold active leases. When its last lease ends, it enters the idle LRU.
+    /// If the idle cache is full, the least recently used idle process exits
+    /// via `kill_on_drop`; active instances are never evicted.
     pub async fn get_client(&self, trace_path: &Path) -> Result<TraceProcessorClient> {
         let (canonical, fingerprint, shell_path) = resolve_trace_identity(trace_path)?;
         // Cache key stays canonical so two requests for the same trace
@@ -595,64 +675,117 @@ impl TraceProcessorManager {
         F: FnOnce(u16, PathBuf) -> Fut,
         Fut: std::future::Future<Output = Result<TraceProcessorInstance>>,
     {
-        if let Some(client) = self.cached_client(&canonical, &fingerprint).await? {
+        if let Some(client) = self.cached_client(&canonical, &fingerprint)? {
             return Ok(client);
         }
 
         let port = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("trace_processor manager lock poisoned"))?;
             allocate_next_port(&mut inner)?
         };
 
-        let instance = spawn(port, canonical.clone()).await?;
-        let client = instance.client.clone();
+        let instance = Arc::new(StdMutex::new(spawn(port, canonical.clone()).await?));
+        let client = instance
+            .lock()
+            .map_err(|_| anyhow::anyhow!("trace_processor instance lock poisoned"))?
+            .client
+            .clone();
 
-        let mut inner = self.inner.lock().await;
-        if let Some(existing) = inner.instances.get(&canonical) {
-            return Ok(existing.instance.client.clone());
-        }
-        inner.instances.put(
-            canonical,
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("trace_processor manager lock poisoned"))?;
+        let previous = inner.instances.insert(
+            canonical.clone(),
             CachedTraceProcessorInstance {
-                instance,
+                instance: Arc::clone(&instance),
                 fingerprint,
+                active_leases: 1,
             },
         );
-        Ok(client)
+        debug_assert!(
+            previous.is_none(),
+            "path spawn lock must prevent replacement"
+        );
+        drop(inner);
+        drop(previous);
+        Ok(client_with_lease(client, &self.inner, canonical, instance))
     }
 
-    async fn cached_client(
+    fn cached_client(
         &self,
         canonical: &Path,
         fingerprint: &TraceFileFingerprint,
     ) -> Result<Option<TraceProcessorClient>> {
-        let mut inner = self.inner.lock().await;
-        if let Some(cached) = inner.instances.get_mut(canonical) {
-            if cached.fingerprint != *fingerprint {
-                tracing::info!(
-                    "trace file metadata changed for {}; respawning cached trace_processor_shell on port {} (old={:?}, new={:?})",
-                    canonical.display(),
-                    cached.instance.port,
-                    cached.fingerprint,
-                    fingerprint,
-                );
-                inner.instances.pop(canonical);
-                return Ok(None);
-            }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("trace_processor manager lock poisoned"))?;
+        let Some(cached) = inner.instances.get(canonical) else {
+            return Ok(None);
+        };
+        let shared = Arc::clone(&cached.instance);
+        if cached.fingerprint != *fingerprint {
+            let instance = shared.lock().map_err(|_| {
+                anyhow::anyhow!(
+                    "trace_processor instance lock poisoned for {}",
+                    canonical.display()
+                )
+            })?;
+            tracing::info!(
+                "trace file metadata changed for {}; respawning cached trace_processor_shell on port {} (old={:?}, new={:?})",
+                canonical.display(),
+                instance.port,
+                cached.fingerprint,
+                fingerprint,
+            );
+            drop(instance);
+            let removed = inner.remove_instance(canonical);
+            drop(inner);
+            drop(removed);
+            return Ok(None);
+        }
 
-            match cached.instance.try_wait()? {
-                None => return Ok(Some(cached.instance.client.clone())),
+        let client = {
+            let mut instance = shared.lock().map_err(|_| {
+                anyhow::anyhow!(
+                    "trace_processor instance lock poisoned for {}",
+                    canonical.display()
+                )
+            })?;
+            match instance.try_wait()? {
+                None => instance.client.clone(),
                 Some(status) => {
                     tracing::warn!(
                         "trace_processor_shell on port {} exited with {status}; respawning{}",
-                        cached.instance.port,
-                        format_stderr_tail(&cached.instance.stderr_tail),
+                        instance.port,
+                        format_stderr_tail(&instance.stderr_tail),
                     );
-                    inner.instances.pop(canonical);
+                    drop(instance);
+                    let removed = inner.remove_instance(canonical);
+                    drop(inner);
+                    drop(removed);
+                    return Ok(None);
                 }
             }
-        }
-        Ok(None)
+        };
+
+        inner.idle_instances.pop(canonical);
+        inner
+            .instances
+            .get_mut(canonical)
+            .expect("registered instance must remain present while manager lock is held")
+            .active_leases += 1;
+        drop(inner);
+        Ok(Some(client_with_lease(
+            client,
+            &self.inner,
+            canonical.to_path_buf(),
+            shared,
+        )))
     }
 
     async fn spawn_lock(&self, canonical: PathBuf) -> Arc<Mutex<()>> {
@@ -671,6 +804,19 @@ impl TraceProcessorManager {
             locks.remove(canonical);
         }
     }
+}
+
+fn client_with_lease(
+    client: TraceProcessorClient,
+    manager: &Arc<StdMutex<ManagerInner>>,
+    canonical: PathBuf,
+    instance: SharedTraceProcessorInstance,
+) -> TraceProcessorClient {
+    client.with_instance_lease(Arc::new(TraceProcessorInstanceLease {
+        manager: Arc::downgrade(manager),
+        canonical,
+        instance,
+    }))
 }
 
 fn resolve_trace_identity(path: &Path) -> Result<(PathBuf, TraceFileFingerprint, PathBuf)> {
@@ -1119,7 +1265,8 @@ mod tests {
     #[test]
     fn allocate_next_port_wraps_back_to_starting_port() {
         let mut inner = ManagerInner {
-            instances: LruCache::new(NonZeroUsize::new(1).unwrap()),
+            instances: HashMap::new(),
+            idle_instances: LruCache::new(NonZeroUsize::new(1).unwrap()),
             next_port: u16::MAX,
             starting_port: 19_001,
         };
@@ -1134,7 +1281,8 @@ mod tests {
     #[test]
     fn allocate_next_port_skips_occupied_ports_via_probe() {
         let mut inner = ManagerInner {
-            instances: LruCache::new(NonZeroUsize::new(1).unwrap()),
+            instances: HashMap::new(),
+            idle_instances: LruCache::new(NonZeroUsize::new(1).unwrap()),
             next_port: 20_000,
             starting_port: 20_000,
         };
@@ -1152,7 +1300,8 @@ mod tests {
     fn allocate_next_port_bails_when_all_probes_fail() {
         // starting_port near u16::MAX keeps the full-range sweep cheap in test.
         let mut inner = ManagerInner {
-            instances: LruCache::new(NonZeroUsize::new(1).unwrap()),
+            instances: HashMap::new(),
+            idle_instances: LruCache::new(NonZeroUsize::new(1).unwrap()),
             next_port: 65_530,
             starting_port: 65_530,
         };
@@ -1181,7 +1330,8 @@ mod tests {
         let bound_port = listener.local_addr().expect("local addr").port();
 
         let mut inner = ManagerInner {
-            instances: LruCache::new(NonZeroUsize::new(1).unwrap()),
+            instances: HashMap::new(),
+            idle_instances: LruCache::new(NonZeroUsize::new(1).unwrap()),
             next_port: bound_port,
             starting_port: bound_port,
         };
@@ -1313,7 +1463,7 @@ mod tests {
             .expect("freshly built manager is uncontended");
         assert_eq!(inner.starting_port, 19_500);
         assert_eq!(inner.next_port, 19_500);
-        assert_eq!(inner.instances.cap().get(), 5);
+        assert_eq!(inner.idle_instances.cap().get(), 5);
     }
 
     #[tokio::test]
@@ -1705,7 +1855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_evicts_oldest_instance_when_capacity_exceeded() {
+    async fn manager_evicts_oldest_idle_instance_when_capacity_exceeded() {
         let manager = Arc::new(TraceProcessorManager::new(2));
         let trace_a = PathBuf::from("/tmp/lru-a.perfetto-trace");
         let trace_b = PathBuf::from("/tmp/lru-b.perfetto-trace");
@@ -1765,6 +1915,253 @@ mod tests {
             4,
             "cached instance must reuse, not respawn",
         );
+    }
+
+    #[tokio::test]
+    async fn active_instance_is_reused_under_idle_cache_pressure() {
+        let manager = TraceProcessorManager::new(1);
+        let trace_a = PathBuf::from("/tmp/leased-a.perfetto-trace");
+        let trace_b = PathBuf::from("/tmp/leased-b.perfetto-trace");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+
+        let client_a = {
+            let spawn_count = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    trace_a.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        spawn_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("spawn trace A")
+        };
+        let instance_a = {
+            let inner = manager.inner.lock().expect("lock manager after trace A");
+            Arc::downgrade(
+                &inner
+                    .instances
+                    .get(&trace_a)
+                    .expect("active trace A must remain registered")
+                    .instance,
+            )
+        };
+
+        let client_b = {
+            let spawn_count = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    trace_b.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        spawn_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("spawn trace B")
+        };
+        let client_a_again = {
+            let spawn_count = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    trace_a.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        spawn_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("reuse active trace A")
+        };
+
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            2,
+            "capacity pressure must not spawn a duplicate processor for active trace A"
+        );
+        {
+            let inner = manager.inner.lock().expect("lock active registry");
+            assert_eq!(inner.instances.len(), 2);
+            assert_eq!(
+                inner
+                    .instances
+                    .get(&trace_a)
+                    .expect("trace A registered")
+                    .active_leases,
+                2
+            );
+            assert_eq!(
+                inner
+                    .instances
+                    .get(&trace_b)
+                    .expect("trace B registered")
+                    .active_leases,
+                1
+            );
+            assert!(inner.idle_instances.is_empty());
+        }
+        let retained = instance_a
+            .upgrade()
+            .expect("registered trace A instance must remain alive");
+        assert!(
+            retained
+                .lock()
+                .expect("lock retained trace A")
+                .try_wait()
+                .expect("poll retained trace A")
+                .is_none(),
+            "active trace A process must remain alive"
+        );
+
+        drop(retained);
+        drop(client_a_again);
+        drop(client_a);
+        drop(client_b);
+    }
+
+    #[tokio::test]
+    async fn only_the_last_lease_release_enters_the_idle_lru() {
+        let manager = TraceProcessorManager::new(1);
+        let trace_a = PathBuf::from("/tmp/idle-a.perfetto-trace");
+        let trace_b = PathBuf::from("/tmp/idle-b.perfetto-trace");
+
+        let client_a_first = manager
+            .get_or_spawn_instance(trace_a.clone(), test_fingerprint(1), |port, _| async move {
+                Ok(fake_instance(port))
+            })
+            .await
+            .expect("spawn trace A");
+        let client_a_second = manager
+            .get_or_spawn_instance(trace_a.clone(), test_fingerprint(1), |port, _| async move {
+                Ok(fake_instance(port))
+            })
+            .await
+            .expect("acquire second trace A lease");
+        let instance_a = {
+            let inner = manager.inner.lock().expect("lock trace A registry");
+            Arc::downgrade(
+                &inner
+                    .instances
+                    .get(&trace_a)
+                    .expect("trace A must be registered")
+                    .instance,
+            )
+        };
+
+        drop(client_a_first);
+        {
+            let inner = manager.inner.lock().expect("lock after first release");
+            assert_eq!(inner.instances[&trace_a].active_leases, 1);
+            assert!(inner.idle_instances.peek(&trace_a).is_none());
+        }
+
+        drop(client_a_second);
+        {
+            let inner = manager.inner.lock().expect("lock after final A release");
+            assert_eq!(inner.instances[&trace_a].active_leases, 0);
+            assert!(inner.idle_instances.peek(&trace_a).is_some());
+        }
+
+        let client_b = manager
+            .get_or_spawn_instance(trace_b.clone(), test_fingerprint(1), |port, _| async move {
+                Ok(fake_instance(port))
+            })
+            .await
+            .expect("spawn active trace B");
+
+        {
+            let inner = manager.inner.lock().expect("lock while B is active");
+            assert!(inner.instances.contains_key(&trace_a));
+            assert!(inner.instances.contains_key(&trace_b));
+            assert!(inner.idle_instances.peek(&trace_a).is_some());
+            assert!(inner.idle_instances.peek(&trace_b).is_none());
+        }
+
+        drop(client_b);
+        assert!(
+            instance_a.upgrade().is_none(),
+            "releasing B into a capacity-one idle LRU must evict idle trace A"
+        );
+        let inner = manager.inner.lock().expect("lock after idle eviction");
+        assert!(!inner.instances.contains_key(&trace_a));
+        assert_eq!(inner.instances[&trace_b].active_leases, 0);
+        assert!(inner.idle_instances.peek(&trace_b).is_some());
+    }
+
+    #[tokio::test]
+    async fn cloned_client_keeps_its_shared_lease_until_the_last_clone_drops() {
+        let manager = TraceProcessorManager::new(1);
+        let trace = PathBuf::from("/tmp/cloned-client.perfetto-trace");
+
+        let client = manager
+            .get_or_spawn_instance(trace.clone(), test_fingerprint(1), |port, _| async move {
+                Ok(fake_instance(port))
+            })
+            .await
+            .expect("spawn trace for cloned client");
+        let cloned_client = client.clone();
+
+        drop(client);
+        {
+            let inner = manager
+                .inner
+                .lock()
+                .expect("lock after original client drop");
+            assert_eq!(inner.instances[&trace].active_leases, 1);
+            assert!(inner.idle_instances.peek(&trace).is_none());
+        }
+
+        drop(cloned_client);
+        let inner = manager.inner.lock().expect("lock after final client drop");
+        assert_eq!(inner.instances[&trace].active_leases, 0);
+        assert!(inner.idle_instances.peek(&trace).is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_release_does_not_change_replacement_lease_state() {
+        let manager = TraceProcessorManager::new(1);
+        let trace = PathBuf::from("/tmp/replaced-active.perfetto-trace");
+
+        let old_client = manager
+            .get_or_spawn_instance(trace.clone(), test_fingerprint(1), |port, _| async move {
+                Ok(fake_instance(port))
+            })
+            .await
+            .expect("spawn old trace generation");
+        let old_instance = {
+            let inner = manager.inner.lock().expect("lock old generation");
+            Arc::downgrade(&inner.instances[&trace].instance)
+        };
+
+        let replacement_client = manager
+            .get_or_spawn_instance(trace.clone(), test_fingerprint(2), |port, _| async move {
+                Ok(fake_instance(port))
+            })
+            .await
+            .expect("spawn replacement trace generation");
+
+        drop(old_client);
+        assert!(
+            old_instance.upgrade().is_none(),
+            "old generation must be released after its last stale lease ends"
+        );
+        {
+            let inner = manager.inner.lock().expect("lock replacement generation");
+            assert_eq!(inner.instances[&trace].active_leases, 1);
+            assert!(inner.idle_instances.peek(&trace).is_none());
+        }
+
+        drop(replacement_client);
+        let inner = manager
+            .inner
+            .lock()
+            .expect("lock idle replacement generation");
+        assert_eq!(inner.instances[&trace].active_leases, 0);
+        assert!(inner.idle_instances.peek(&trace).is_some());
     }
 
     #[tokio::test]

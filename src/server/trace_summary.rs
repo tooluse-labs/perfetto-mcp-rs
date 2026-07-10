@@ -45,6 +45,7 @@ pub(super) struct LoadedTraceReport {
     pub(super) path: String,
     pub(super) display: String,
     pub(super) trace_id: String,
+    pub(super) trace_key: super::SchemaCacheTraceKey,
     pub(super) summary: Result<LoadTraceSummary, String>,
 }
 

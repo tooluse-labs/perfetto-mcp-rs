@@ -1,6 +1,9 @@
 // Copyright 2025 The perfetto-mcp-rs Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
@@ -14,10 +17,19 @@ use crate::query::{
 use crate::telemetry::{perfetto_error_span_kind, sql_span_kind};
 
 /// HTTP client for a single trace_processor_shell RPC instance.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TraceProcessorClient {
     base_url: String,
     http: reqwest::Client,
+    _instance_lease: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for TraceProcessorClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TraceProcessorClient")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TraceProcessorClient {
@@ -30,7 +42,16 @@ impl TraceProcessorClient {
         Self {
             base_url: format!("http://127.0.0.1:{port}"),
             http,
+            _instance_lease: None,
         }
+    }
+
+    pub(crate) fn with_instance_lease<T>(mut self, lease: Arc<T>) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        self._instance_lease = Some(lease);
+        self
     }
 
     /// Execute a SQL query and return the decoded columnar table.

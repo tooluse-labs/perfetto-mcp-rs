@@ -26,7 +26,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Maximum number of cached trace_processor_shell instances.
+    /// Maximum number of idle trace_processor_shell instances retained for reuse.
     #[arg(long, default_value_t = 3)]
     max_instances: usize,
 

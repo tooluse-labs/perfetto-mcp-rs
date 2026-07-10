@@ -430,6 +430,100 @@ fn trace_id_routes_queries_after_current_trace_changes() {
 }
 
 #[test]
+fn trace_id_rejects_an_overwritten_backing_file() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let mutable_trace = temp.path().join("mutable.perfetto-trace");
+        std::fs::copy("tests/fixtures/basic.perfetto-trace", &mutable_trace)
+            .expect("copy initial trace");
+
+        let manager = Arc::new(TraceProcessorManager::new_with_starting_port(1, 19_351));
+        let server = PerfettoMcpServer::new(manager);
+        let response = server
+            .load_trace(Parameters(LoadTraceParams {
+                path: Some(mutable_trace.to_string_lossy().into_owned()),
+                paths: vec![],
+            }))
+            .await
+            .expect("load initial trace");
+        let trace_id = trace_id_from_load_response(&response);
+
+        std::fs::copy("tests/fixtures/page_loads.pftrace", &mutable_trace)
+            .expect("overwrite loaded trace");
+
+        let err = server
+            .execute_sql(Parameters(ExecuteSqlParams {
+                trace_id: Some(trace_id.clone()),
+                ..execute_sql_params("SELECT COUNT(*) AS c FROM process")
+            }))
+            .await
+            .expect_err("stale trace_id must not follow overwritten path contents");
+
+        assert!(
+            err.contains(&trace_id)
+                && err.contains("changed on disk")
+                && err.contains("load_trace"),
+            "stale trace_id error must explain how to recover, got: {err}",
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_id_rejects_a_retargeted_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    runtime.block_on(async {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let trace_a = temp.path().join("a.perfetto-trace");
+        let trace_b = temp.path().join("b.perfetto-trace");
+        let selected = temp.path().join("selected.perfetto-trace");
+        std::fs::copy("tests/fixtures/basic.perfetto-trace", &trace_a).expect("copy trace A");
+        std::fs::copy("tests/fixtures/page_loads.pftrace", &trace_b).expect("copy trace B");
+        symlink(&trace_a, &selected).expect("link selector to trace A");
+
+        let manager = Arc::new(TraceProcessorManager::new_with_starting_port(1, 19_361));
+        let server = PerfettoMcpServer::new(manager);
+        let response = server
+            .load_trace(Parameters(LoadTraceParams {
+                path: Some(selected.to_string_lossy().into_owned()),
+                paths: vec![],
+            }))
+            .await
+            .expect("load trace through symlink");
+        let trace_id = trace_id_from_load_response(&response);
+
+        std::fs::remove_file(&selected).expect("remove old symlink");
+        symlink(&trace_b, &selected).expect("retarget selector to trace B");
+
+        let err = server
+            .execute_sql(Parameters(ExecuteSqlParams {
+                trace_id: Some(trace_id.clone()),
+                ..execute_sql_params("SELECT COUNT(*) AS c FROM process")
+            }))
+            .await
+            .expect_err("stale trace_id must not follow a retargeted symlink");
+
+        assert!(
+            err.contains(&trace_id)
+                && err.contains("changed on disk")
+                && err.contains("load_trace"),
+            "retargeted trace_id error must explain how to recover, got: {err}",
+        );
+    });
+}
+
+#[test]
 fn load_trace_accepts_paths_array_for_batch_loading() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -477,14 +571,14 @@ fn load_trace_accepts_paths_array_for_batch_loading() {
 }
 
 #[test]
-fn trace_id_routes_concurrent_queries_without_cross_talk() {
+fn trace_id_routes_concurrent_queries_without_cross_talk_at_capacity_one() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
 
     runtime.block_on(async {
-        let manager = Arc::new(TraceProcessorManager::new_with_starting_port(2, 19_411));
+        let manager = Arc::new(TraceProcessorManager::new_with_starting_port(1, 19_411));
         let server = PerfettoMcpServer::new(manager);
 
         let response = server

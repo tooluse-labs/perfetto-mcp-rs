@@ -64,6 +64,7 @@ pub struct PerfettoMcpServer {
 #[derive(Debug, Clone)]
 struct LoadedTrace {
     path: String,
+    trace_key: SchemaCacheTraceKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -264,8 +265,14 @@ impl PerfettoMcpServer {
         // trace. Summary collection above is best-effort and must not turn a
         // successfully loaded trace into a failed load.
         for trace in &loaded {
-            self.register_loaded_trace(trace.trace_id.clone(), trace.path.clone())
-                .await;
+            self.register_loaded_trace(
+                trace.trace_id.clone(),
+                LoadedTrace {
+                    path: trace.path.clone(),
+                    trace_key: trace.trace_key.clone(),
+                },
+            )
+            .await;
         }
         if let Some(last) = loaded.last() {
             *self.current_trace.lock().await = Some(last.path.clone());
@@ -405,15 +412,12 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span(format!("pattern_set={}", params.pattern.is_some()))
             .await;
-        let trace_path = self
-            .trace_path_for_selector(params.trace_id.as_deref())
-            .await?;
         let pattern_key = match &params.pattern {
             Some(pat) => Some(sanitize_glob_param(pat).map_err(|e| e.to_string())?),
             None => None,
         };
 
-        let client = self.client_for(&trace_path).await?;
+        let client = self.client_for_selected(params.trace_id.as_deref()).await?;
 
         let sql = match &pattern_key {
             Some(pat) => {
@@ -496,12 +500,14 @@ impl PerfettoMcpServer {
     ) -> Result<String, String> {
         self.record_tool_span(format!("table_name_len={}", params.table_name.len()))
             .await;
-        let trace_path = self
-            .trace_path_for_selector(params.trace_id.as_deref())
-            .await?;
-        let trace_key = trace_schema_cache_key(&trace_path)?;
         reject_table_structure_pattern(&params.table_name)?;
         let table_name = sanitize_glob_param(&params.table_name).map_err(|e| e.to_string())?;
+        let trace_id = params.trace_id.as_deref();
+        let trace = self.trace_for_selector(trace_id).await?;
+        if trace_id.is_some() {
+            ensure_trace_key_matches(&trace.path, &trace.trace_key, trace_id)?;
+        }
+        let trace_key = trace.trace_key.clone();
         if let Some(cached) = self
             .schema_cache
             .lock()
@@ -510,7 +516,7 @@ impl PerfettoMcpServer {
         {
             return Ok(cached);
         }
-        let client = self.client_for(&trace_path).await?;
+        let client = self.client_for_trace(&trace, trace_id).await?;
 
         let sql = format!("PRAGMA table_info('{table_name}')");
         let pragma = client
@@ -1599,15 +1605,14 @@ impl PerfettoMcpServer {
         })
     }
 
-    async fn register_loaded_trace(&self, trace_id: String, path: String) {
-        self.loaded_traces
-            .lock()
-            .await
-            .insert(trace_id, LoadedTrace { path });
+    async fn register_loaded_trace(&self, trace_id: String, trace: LoadedTrace) {
+        self.loaded_traces.lock().await.insert(trace_id, trace);
     }
 
     async fn prepare_loaded_trace(&self, path: String) -> Result<LoadedTraceReport, String> {
+        let trace_key = trace_schema_cache_key(&path)?;
         let client = self.client_for(&path).await?;
+        ensure_trace_key_matches(&path, &trace_key, None)?;
 
         let status = client
             .status()
@@ -1615,32 +1620,37 @@ impl PerfettoMcpServer {
             .map_err(|e| format!("Failed to get status for {path:?}: {e}"))?;
 
         let display = format_loaded_trace_display(&path, status.loaded_trace_name.as_deref());
-        let trace_key = trace_schema_cache_key(&path)?;
         let trace_id = trace_id_for_key(&trace_key);
         let summary = collect_load_trace_summary(&client, &path).await;
+        ensure_trace_key_matches(&path, &trace_key, None)?;
 
         Ok(LoadedTraceReport {
             path,
             display,
             trace_id,
+            trace_key,
             summary,
         })
     }
 
-    async fn trace_path_for_selector(&self, trace_id: Option<&str>) -> Result<String, String> {
+    async fn trace_for_selector(&self, trace_id: Option<&str>) -> Result<LoadedTrace, String> {
         match trace_id {
             Some(id) => self
                 .loaded_traces
                 .lock()
                 .await
                 .get(id)
-                .map(|trace| trace.path.clone())
+                .cloned()
                 .ok_or_else(|| {
                     format!(
                         "Unknown trace_id {id:?}. Call `load_trace` first and use the returned `trace_id`."
                     )
                 }),
-            None => self.current_trace_path().await,
+            None => {
+                let path = self.current_trace_path().await?;
+                let trace_key = trace_schema_cache_key(&path)?;
+                Ok(LoadedTrace { path, trace_key })
+            }
         }
     }
 
@@ -1648,8 +1658,27 @@ impl PerfettoMcpServer {
         &self,
         trace_id: Option<&str>,
     ) -> Result<crate::tp_client::TraceProcessorClient, String> {
-        let path = self.trace_path_for_selector(trace_id).await?;
-        self.client_for(&path).await
+        match trace_id {
+            Some(id) => {
+                let trace = self.trace_for_selector(Some(id)).await?;
+                self.client_for_trace(&trace, Some(id)).await
+            }
+            None => {
+                let path = self.current_trace_path().await?;
+                self.client_for(&path).await
+            }
+        }
+    }
+
+    async fn client_for_trace(
+        &self,
+        trace: &LoadedTrace,
+        trace_id: Option<&str>,
+    ) -> Result<crate::tp_client::TraceProcessorClient, String> {
+        ensure_trace_key_matches(&trace.path, &trace.trace_key, trace_id)?;
+        let client = self.client_for(&trace.path).await?;
+        ensure_trace_key_matches(&trace.path, &trace.trace_key, trace_id)?;
+        Ok(client)
     }
 
     /// Resolve a user-provided trace path to a cached client.
@@ -1732,6 +1761,32 @@ fn trace_schema_cache_key(trace_path: &str) -> Result<SchemaCacheTraceKey, Strin
         platform: trace_file_platform_fingerprint(&metadata),
         sample_sha256,
     })
+}
+
+fn ensure_trace_key_matches(
+    trace_path: &str,
+    expected: &SchemaCacheTraceKey,
+    trace_id: Option<&str>,
+) -> Result<(), String> {
+    let current = trace_schema_cache_key(trace_path)
+        .map_err(|error| trace_identity_error(trace_path, trace_id, Some(error.as_str())))?;
+    if &current != expected {
+        return Err(trace_identity_error(trace_path, trace_id, None));
+    }
+    Ok(())
+}
+
+fn trace_identity_error(trace_path: &str, trace_id: Option<&str>, detail: Option<&str>) -> String {
+    let selector = trace_id
+        .map(|id| format!(" for trace_id {id:?}"))
+        .unwrap_or_default();
+    let detail = detail
+        .map(|error| format!(" Validation failed: {error}."))
+        .unwrap_or_default();
+    format!(
+        "Trace {trace_path:?}{selector} changed on disk after it was selected.{detail} \
+         Call `load_trace` again and use the newly returned trace_id."
+    )
 }
 
 fn trace_id_for_key(trace_key: &SchemaCacheTraceKey) -> String {
