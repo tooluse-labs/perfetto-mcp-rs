@@ -30,6 +30,10 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     max_instances: usize,
 
+    /// Maximum number of trace_processor_shell instances active at once.
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+    max_active_instances: usize,
+
     /// Max time to wait for trace_processor_shell startup, in milliseconds.
     ///
     /// `PERFETTO_STARTUP_TIMEOUT_MS` env var is read lazily inside `run_server`,
@@ -131,9 +135,10 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
 
     let download_config = DownloadConfig::from_override(cli.artifacts_base_url.clone());
     tracing::info!(
-        "perfetto-mcp-rs v{} (max_instances={}, startup_timeout_ms={}, query_timeout_ms={}, span_timings={}, artifacts_base_url={})",
+        "perfetto-mcp-rs v{} (max_instances={}, max_active_instances={}, startup_timeout_ms={}, query_timeout_ms={}, span_timings={}, artifacts_base_url={})",
         env!("CARGO_PKG_VERSION"),
         cli.max_instances,
+        cli.max_active_instances,
         startup_timeout_ms,
         query_timeout_ms,
         span_timings,
@@ -144,8 +149,9 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         startup_timeout: Duration::from_millis(startup_timeout_ms),
         request_timeout: Duration::from_millis(query_timeout_ms),
     };
-    let manager = Arc::new(TraceProcessorManager::new_with_configs(
+    let manager = Arc::new(TraceProcessorManager::new_with_instance_limits_and_configs(
         cli.max_instances,
+        cli.max_active_instances,
         config,
         download_config,
     ));
@@ -199,6 +205,16 @@ fn parse_span_timings_value(env_name: &str, value: &str) -> anyhow::Result<bool>
     }
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("expected a positive integer, got {value:?}"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_owned());
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +234,17 @@ mod tests {
             !resolve_span_timings(cli.span_timings, "PERFETTO_MCP_SPAN_TIMINGS_TEST_UNSET")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn active_instance_limit_defaults_to_ten_and_accepts_override() {
+        let defaults = Cli::try_parse_from(["perfetto-mcp-rs"]).unwrap();
+        assert_eq!(defaults.max_active_instances, 10);
+
+        let overridden =
+            Cli::try_parse_from(["perfetto-mcp-rs", "--max-active-instances", "7"]).unwrap();
+        assert_eq!(overridden.max_active_instances, 7);
+        assert!(Cli::try_parse_from(["perfetto-mcp-rs", "--max-active-instances", "0"]).is_err());
     }
 
     #[test]

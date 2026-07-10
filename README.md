@@ -164,6 +164,7 @@ Server settings are read at startup; when both a CLI flag and environment variab
 | `--startup-timeout-ms` / `PERFETTO_STARTUP_TIMEOUT_MS` | `20000` | Max time to wait for a spawned `trace_processor_shell` to become ready (ms) |
 | `--query-timeout-ms` / `PERFETTO_QUERY_TIMEOUT_MS` | `30000` | HTTP timeout for `/status` and `/query` requests (ms) |
 | `--max-instances` | `3` | Maximum idle `trace_processor_shell` processes retained in the LRU; active instances stay registered until their queries finish |
+| `--max-active-instances` | `10` | Maximum active `trace_processor_shell` instances; requests for additional distinct traces wait for a semaphore permit |
 | `--span-timings` / `PERFETTO_MCP_SPAN_TIMINGS` | off | Emit tracing span-close timings for performance hotspot diagnosis (`1` / `true` / `yes` / `on`) |
 | `--artifacts-base-url` / `PERFETTO_ARTIFACTS_BASE_URL` | LUCI bucket | Override the `trace_processor_shell` download source on a cache miss (mirror/proxy; same pinned version) |
 | `PERFETTO_MCP_REDACT_STRINGS_DEFAULT` | `true` | Mask sensitive URL/header/cookie/path strings in tool output; set `false` for raw forensic work |

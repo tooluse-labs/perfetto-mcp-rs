@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{watch, Mutex, OnceCell};
+use tokio::sync::{watch, Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 
 use crate::download::DownloadConfig;
 use crate::proto::StatusResult;
@@ -255,14 +255,26 @@ struct CachedTraceProcessorInstance {
     instance: SharedTraceProcessorInstance,
     fingerprint: TraceFileFingerprint,
     active_leases: usize,
+    active_permit: Option<Arc<ActiveInstancePermit>>,
 }
 
 type SharedTraceProcessorInstance = Arc<StdMutex<TraceProcessorInstance>>;
+
+struct ActiveInstancePermit {
+    _permit: OwnedSemaphorePermit,
+}
 
 struct TraceProcessorInstanceLease {
     manager: Weak<StdMutex<ManagerInner>>,
     canonical: PathBuf,
     instance: SharedTraceProcessorInstance,
+    _active_permit: Arc<ActiveInstancePermit>,
+}
+
+enum CachedClientLookup {
+    Hit(TraceProcessorClient),
+    NeedsActivePermit,
+    Miss,
 }
 
 impl TraceProcessorInstance {
@@ -444,9 +456,11 @@ impl Drop for TraceProcessorInstance {
 /// Manages trace_processor_shell instances keyed by canonical trace path.
 /// Active instances remain registered and reusable; only idle instances enter
 /// the LRU, which retains at most `max_instances` processes. Instances are
-/// invalidated when the trace metadata/content fingerprint changes.
+/// invalidated when the trace metadata/content fingerprint changes. A separate
+/// semaphore limits the number of active instance generations.
 pub struct TraceProcessorManager {
     inner: Arc<StdMutex<ManagerInner>>,
+    active_instance_slots: Arc<Semaphore>,
     spawn_locks: Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>,
     binary_path: OnceCell<PathBuf>,
     config: TraceProcessorConfig,
@@ -493,7 +507,15 @@ impl ManagerInner {
                 return None;
             }
             cached.active_leases -= 1;
-            cached.active_leases == 0
+            if cached.active_leases == 0 {
+                cached
+                    .active_permit
+                    .take()
+                    .expect("active instance must hold a semaphore permit");
+                true
+            } else {
+                false
+            }
         };
 
         if !became_idle {
@@ -542,6 +564,7 @@ impl TraceProcessorManager {
 
     fn new_inner(
         max_instances: usize,
+        max_active_instances: usize,
         starting_port: u16,
         config: TraceProcessorConfig,
         download_config: DownloadConfig,
@@ -554,6 +577,7 @@ impl TraceProcessorManager {
                 next_port: starting_port,
                 starting_port,
             })),
+            active_instance_slots: Arc::new(Semaphore::new(max_active_instances.max(1))),
             spawn_locks: Mutex::new(std::collections::HashMap::new()),
             binary_path: OnceCell::new(),
             config,
@@ -564,6 +588,17 @@ impl TraceProcessorManager {
     pub fn new(max_instances: usize) -> Self {
         Self::new_inner(
             max_instances,
+            max_instances,
+            Self::DEFAULT_STARTING_PORT,
+            TraceProcessorConfig::default(),
+            DownloadConfig::default(),
+        )
+    }
+
+    pub fn new_with_instance_limits(max_instances: usize, max_active_instances: usize) -> Self {
+        Self::new_inner(
+            max_instances,
+            max_active_instances,
             Self::DEFAULT_STARTING_PORT,
             TraceProcessorConfig::default(),
             DownloadConfig::default(),
@@ -577,6 +612,22 @@ impl TraceProcessorManager {
     ) -> Self {
         Self::new_inner(
             max_instances,
+            max_instances,
+            Self::DEFAULT_STARTING_PORT,
+            config,
+            download_config,
+        )
+    }
+
+    pub fn new_with_instance_limits_and_configs(
+        max_instances: usize,
+        max_active_instances: usize,
+        config: TraceProcessorConfig,
+        download_config: DownloadConfig,
+    ) -> Self {
+        Self::new_inner(
+            max_instances,
+            max_active_instances,
             Self::DEFAULT_STARTING_PORT,
             config,
             download_config,
@@ -585,6 +636,7 @@ impl TraceProcessorManager {
 
     pub fn new_with_starting_port(max_instances: usize, starting_port: u16) -> Self {
         Self::new_inner(
+            max_instances,
             max_instances,
             starting_port,
             TraceProcessorConfig::default(),
@@ -598,7 +650,13 @@ impl TraceProcessorManager {
         config: TraceProcessorConfig,
         download_config: DownloadConfig,
     ) -> Self {
-        Self::new_inner(max_instances, starting_port, config, download_config)
+        Self::new_inner(
+            max_instances,
+            max_instances,
+            starting_port,
+            config,
+            download_config,
+        )
     }
 
     /// Create a manager with a pre-resolved binary path (tests only, avoids
@@ -675,8 +733,24 @@ impl TraceProcessorManager {
         F: FnOnce(u16, PathBuf) -> Fut,
         Fut: std::future::Future<Output = Result<TraceProcessorInstance>>,
     {
-        if let Some(client) = self.cached_client(&canonical, &fingerprint)? {
-            return Ok(client);
+        match self.cached_client(&canonical, &fingerprint, None)? {
+            CachedClientLookup::Hit(client) => return Ok(client),
+            CachedClientLookup::NeedsActivePermit | CachedClientLookup::Miss => {}
+        }
+
+        let active_permit = Arc::new(ActiveInstancePermit {
+            _permit: Arc::clone(&self.active_instance_slots)
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow::anyhow!("active trace_processor semaphore closed"))?,
+        });
+
+        match self.cached_client(&canonical, &fingerprint, Some(&active_permit))? {
+            CachedClientLookup::Hit(client) => return Ok(client),
+            CachedClientLookup::NeedsActivePermit => {
+                unreachable!("provided semaphore permit must activate an idle instance")
+            }
+            CachedClientLookup::Miss => {}
         }
 
         let port = {
@@ -704,6 +778,7 @@ impl TraceProcessorManager {
                 instance: Arc::clone(&instance),
                 fingerprint,
                 active_leases: 1,
+                active_permit: Some(Arc::clone(&active_permit)),
             },
         );
         debug_assert!(
@@ -712,20 +787,27 @@ impl TraceProcessorManager {
         );
         drop(inner);
         drop(previous);
-        Ok(client_with_lease(client, &self.inner, canonical, instance))
+        Ok(client_with_lease(
+            client,
+            &self.inner,
+            canonical,
+            instance,
+            active_permit,
+        ))
     }
 
     fn cached_client(
         &self,
         canonical: &Path,
         fingerprint: &TraceFileFingerprint,
-    ) -> Result<Option<TraceProcessorClient>> {
+        active_permit: Option<&Arc<ActiveInstancePermit>>,
+    ) -> Result<CachedClientLookup> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("trace_processor manager lock poisoned"))?;
         let Some(cached) = inner.instances.get(canonical) else {
-            return Ok(None);
+            return Ok(CachedClientLookup::Miss);
         };
         let shared = Arc::clone(&cached.instance);
         if cached.fingerprint != *fingerprint {
@@ -746,7 +828,7 @@ impl TraceProcessorManager {
             let removed = inner.remove_instance(canonical);
             drop(inner);
             drop(removed);
-            return Ok(None);
+            return Ok(CachedClientLookup::Miss);
         }
 
         let client = {
@@ -768,23 +850,39 @@ impl TraceProcessorManager {
                     let removed = inner.remove_instance(canonical);
                     drop(inner);
                     drop(removed);
-                    return Ok(None);
+                    return Ok(CachedClientLookup::Miss);
                 }
             }
         };
 
-        inner.idle_instances.pop(canonical);
-        inner
+        let cached = inner
             .instances
             .get_mut(canonical)
-            .expect("registered instance must remain present while manager lock is held")
-            .active_leases += 1;
+            .expect("registered instance must remain present while manager lock is held");
+        let active_permit = if cached.active_leases == 0 {
+            let Some(active_permit) = active_permit else {
+                return Ok(CachedClientLookup::NeedsActivePermit);
+            };
+            cached.active_leases = 1;
+            cached.active_permit = Some(Arc::clone(active_permit));
+            Arc::clone(active_permit)
+        } else {
+            cached.active_leases += 1;
+            Arc::clone(
+                cached
+                    .active_permit
+                    .as_ref()
+                    .expect("active instance must hold a semaphore permit"),
+            )
+        };
+        inner.idle_instances.pop(canonical);
         drop(inner);
-        Ok(Some(client_with_lease(
+        Ok(CachedClientLookup::Hit(client_with_lease(
             client,
             &self.inner,
             canonical.to_path_buf(),
             shared,
+            active_permit,
         )))
     }
 
@@ -811,11 +909,13 @@ fn client_with_lease(
     manager: &Arc<StdMutex<ManagerInner>>,
     canonical: PathBuf,
     instance: SharedTraceProcessorInstance,
+    active_permit: Arc<ActiveInstancePermit>,
 ) -> TraceProcessorClient {
     client.with_instance_lease(Arc::new(TraceProcessorInstanceLease {
         manager: Arc::downgrade(manager),
         canonical,
         instance,
+        _active_permit: active_permit,
     }))
 }
 
@@ -1464,6 +1564,19 @@ mod tests {
         assert_eq!(inner.starting_port, 19_500);
         assert_eq!(inner.next_port, 19_500);
         assert_eq!(inner.idle_instances.cap().get(), 5);
+        assert_eq!(manager.active_instance_slots.available_permits(), 5);
+    }
+
+    #[test]
+    fn distinct_idle_and_active_instance_limits_are_wired_independently() {
+        let manager = TraceProcessorManager::new_with_instance_limits(2, 7);
+        let inner = manager
+            .inner
+            .try_lock()
+            .expect("freshly built manager is uncontended");
+
+        assert_eq!(inner.idle_instances.cap().get(), 2);
+        assert_eq!(manager.active_instance_slots.available_permits(), 7);
     }
 
     #[tokio::test]
@@ -1919,7 +2032,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_instance_is_reused_under_idle_cache_pressure() {
-        let manager = TraceProcessorManager::new(1);
+        let manager = TraceProcessorManager::new_with_instance_limits(1, 2);
         let trace_a = PathBuf::from("/tmp/leased-a.perfetto-trace");
         let trace_b = PathBuf::from("/tmp/leased-b.perfetto-trace");
         let spawn_count = Arc::new(AtomicUsize::new(0));
@@ -2021,6 +2134,178 @@ mod tests {
         drop(client_a_again);
         drop(client_a);
         drop(client_b);
+        assert_eq!(manager.active_instance_slots.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn active_instance_limit_blocks_a_distinct_trace_until_release() {
+        let manager = Arc::new(TraceProcessorManager::new_with_instance_limits(2, 1));
+        let trace_a = PathBuf::from("/tmp/active-limit-a.perfetto-trace");
+        let trace_b = PathBuf::from("/tmp/active-limit-b.perfetto-trace");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+
+        let client_a = {
+            let spawn_count = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(trace_a, test_fingerprint(1), move |port, _| async move {
+                    spawn_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(fake_instance(port))
+                })
+                .await
+                .expect("spawn trace A")
+        };
+        assert_eq!(manager.active_instance_slots.available_permits(), 0);
+
+        let mut waiting_for_b = {
+            let manager = Arc::clone(&manager);
+            let spawn_count = Arc::clone(&spawn_count);
+            tokio::spawn(async move {
+                manager
+                    .get_or_spawn_instance(
+                        trace_b,
+                        test_fingerprint(1),
+                        move |port, _| async move {
+                            spawn_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(fake_instance(port))
+                        },
+                    )
+                    .await
+            })
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting_for_b)
+                .await
+                .is_err(),
+            "distinct trace B must wait while trace A owns the only active permit"
+        );
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "waiting for a permit must happen before spawning trace B"
+        );
+
+        drop(client_a);
+        let client_b = tokio::time::timeout(Duration::from_secs(2), waiting_for_b)
+            .await
+            .expect("trace B should acquire the released permit")
+            .expect("join trace B task")
+            .expect("spawn trace B after permit release");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 2);
+        assert_eq!(manager.active_instance_slots.available_permits(), 0);
+
+        drop(client_b);
+        assert_eq!(manager.active_instance_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_permit_wait_keeps_an_idle_instance_reusable() {
+        let manager = TraceProcessorManager::new_with_instance_limits(2, 1);
+        let active_trace = PathBuf::from("/tmp/permit-wait-active.perfetto-trace");
+        let idle_trace = PathBuf::from("/tmp/permit-wait-idle.perfetto-trace");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+
+        let idle_client = {
+            let spawn_count = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    idle_trace.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        spawn_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("warm idle trace")
+        };
+        drop(idle_client);
+
+        let active_client = {
+            let spawn_count = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    active_trace,
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        spawn_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("activate another trace")
+        };
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                manager.get_or_spawn_instance(
+                    idle_trace.clone(),
+                    test_fingerprint(1),
+                    |port, _| async move { Ok(fake_instance(port)) },
+                ),
+            )
+            .await
+            .is_err(),
+            "idle trace reactivation must wait while the active limit is full"
+        );
+        {
+            let inner = manager.inner.lock().expect("lock after cancelled wait");
+            assert_eq!(inner.instances[&idle_trace].active_leases, 0);
+            assert!(inner.idle_instances.peek(&idle_trace).is_some());
+        }
+
+        drop(active_client);
+        let reused_idle = manager
+            .get_or_spawn_instance(idle_trace, test_fingerprint(1), |port, _| async move {
+                Ok(fake_instance(port))
+            })
+            .await
+            .expect("reuse idle trace after permit becomes available");
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            2,
+            "cancelled waiting must not discard the cached idle processor"
+        );
+        drop(reused_idle);
+    }
+
+    #[tokio::test]
+    async fn same_active_trace_reuses_one_semaphore_permit() {
+        let manager = TraceProcessorManager::new_with_instance_limits(1, 1);
+        let trace = PathBuf::from("/tmp/shared-active-permit.perfetto-trace");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+
+        let client_first = {
+            let spawn_count = Arc::clone(&spawn_count);
+            manager
+                .get_or_spawn_instance(
+                    trace.clone(),
+                    test_fingerprint(1),
+                    move |port, _| async move {
+                        spawn_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_instance(port))
+                    },
+                )
+                .await
+                .expect("spawn shared trace")
+        };
+        let client_second = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.get_or_spawn_instance(trace, test_fingerprint(1), |port, _| async move {
+                Ok(fake_instance(port))
+            }),
+        )
+        .await
+        .expect("same active trace must not wait for another permit")
+        .expect("reuse shared trace");
+
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.active_instance_slots.available_permits(), 0);
+        drop(client_first);
+        assert_eq!(manager.active_instance_slots.available_permits(), 0);
+        drop(client_second);
+        assert_eq!(manager.active_instance_slots.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -2123,7 +2408,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_generation_release_does_not_change_replacement_lease_state() {
-        let manager = TraceProcessorManager::new(1);
+        let manager = TraceProcessorManager::new_with_instance_limits(1, 2);
         let trace = PathBuf::from("/tmp/replaced-active.perfetto-trace");
 
         let old_client = manager
@@ -2143,6 +2428,7 @@ mod tests {
             })
             .await
             .expect("spawn replacement trace generation");
+        assert_eq!(manager.active_instance_slots.available_permits(), 0);
 
         drop(old_client);
         assert!(
@@ -2154,6 +2440,7 @@ mod tests {
             assert_eq!(inner.instances[&trace].active_leases, 1);
             assert!(inner.idle_instances.peek(&trace).is_none());
         }
+        assert_eq!(manager.active_instance_slots.available_permits(), 1);
 
         drop(replacement_client);
         let inner = manager
@@ -2162,6 +2449,8 @@ mod tests {
             .expect("lock idle replacement generation");
         assert_eq!(inner.instances[&trace].active_leases, 0);
         assert!(inner.idle_instances.peek(&trace).is_some());
+        drop(inner);
+        assert_eq!(manager.active_instance_slots.available_permits(), 2);
     }
 
     #[tokio::test]
