@@ -4,6 +4,12 @@
 
 ### Unreleased
 
+- **Copilot CLI can now connect.** Copilot CLI probes with `server/discover`
+  before `initialize`; rmcp 0.16 treated any pre-initialize request as fatal and
+  exited (`expect initialized request, but received: ... server/discover`).
+  Upgraded `rmcp` to 3.x, which answers the probe and then completes the
+  classic handshake.
+
 ### [0.17.1](https://github.com/tooluse-labs/perfetto-mcp-rs/releases/tag/v0.17.1) (July 10, 2026)
 
 - **`perfetto-mcp-rs update` no longer fails silently or accepts a no-op install.**

@@ -12,7 +12,7 @@ keywords = ["perfetto", "mcp", "trace", "tracing", "claude"]
 categories = ["development-tools::profiling", "command-line-utilities"]
 
 [dependencies]
-rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 prost = "0.13"

@@ -9,8 +9,9 @@ use std::time::SystemTime;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
-        ResourceContents, ServerCapabilities, ServerInfo,
+        Implementation, ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, ResourceContents, ServerCapabilities,
+        ServerConfig,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -108,23 +109,18 @@ impl SchemaCache {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for PerfettoMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            server_info: rmcp::model::Implementation {
-                name: "perfetto-rs".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                title: None,
-                description: Some("MCP server for Perfetto trace analysis".into()),
-                icons: None,
-                website_url: None,
-            },
-            capabilities: ServerCapabilities::builder()
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
                 .enable_resources()
                 .enable_tools()
                 .build(),
-            instructions: Some(server_instructions()),
-            ..Default::default()
-        }
+        )
+        .with_server_info(
+            Implementation::new("perfetto-rs", env!("CARGO_PKG_VERSION"))
+                .with_description("MCP server for Perfetto trace analysis"),
+        )
+        .with_instructions(server_instructions())
     }
 
     fn list_resources(
@@ -141,16 +137,19 @@ impl ServerHandler for PerfettoMcpServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
         std::future::ready(match request.uri.as_str() {
-            STDLIB_QUICKREF_URI => Ok(ReadResourceResult {
-                contents: vec![ResourceContents::TextResourceContents {
-                    uri: STDLIB_QUICKREF_URI.to_owned(),
-                    mime_type: Some(STDLIB_QUICKREF_MIME_TYPE.to_owned()),
-                    text: STDLIB_QUICKREF.to_owned(),
-                    meta: None,
-                }],
-            }),
+            STDLIB_QUICKREF_URI => {
+                Ok(
+                    ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+                        uri: STDLIB_QUICKREF_URI.to_owned(),
+                        mime_type: Some(STDLIB_QUICKREF_MIME_TYPE.to_owned()),
+                        text: STDLIB_QUICKREF.to_owned(),
+                        meta: None,
+                    }])
+                    .into(),
+                )
+            }
             uri => Err(McpError::resource_not_found(
                 format!("Unknown resource: {uri}"),
                 None,

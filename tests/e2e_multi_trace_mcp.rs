@@ -133,6 +133,26 @@ impl Drop for McpProcess {
 }
 
 #[test]
+fn e2e_mcp_survives_server_discover_probe_before_initialize() {
+    // Copilot CLI probes with an empty `server/discover` before `initialize`;
+    // rmcp < 3 exited on any pre-initialize request instead of answering it.
+    let mut mcp = McpProcess::start();
+    let discover = mcp.request("server/discover", json!({}));
+    assert!(
+        discover.get("error").is_some() || discover.get("result").is_some(),
+        "server/discover must get a JSON-RPC reply: {discover}",
+    );
+    mcp.initialize();
+    let tools = mcp.request("tools/list", json!({}));
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty()),
+        "tools/list should work after discover + initialize: {tools}",
+    );
+}
+
+#[test]
 fn e2e_mcp_load_trace_paths_routes_execute_sql_by_trace_id() {
     let mut mcp = McpProcess::start();
     mcp.initialize();

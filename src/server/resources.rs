@@ -1,23 +1,15 @@
-use rmcp::model::{AnnotateAble, RawResource};
+use rmcp::model::Resource;
 
 use crate::params::ListStdlibModulesParams;
 use crate::stdlib_catalog::{
     STDLIB_MODULE_LIST, STDLIB_QUICKREF, STDLIB_QUICKREF_MIME_TYPE, STDLIB_QUICKREF_URI,
 };
-pub(super) fn stdlib_quickref_resource() -> rmcp::model::Resource {
-    RawResource {
-        uri: STDLIB_QUICKREF_URI.to_owned(),
-        name: "stdlib-quickref".to_owned(),
-        title: Some("PerfettoSQL stdlib quick reference".to_owned()),
-        description: Some(
-            "Curated PerfettoSQL stdlib modules and minimal routing examples.".to_owned(),
-        ),
-        mime_type: Some(STDLIB_QUICKREF_MIME_TYPE.to_owned()),
-        size: Some(STDLIB_QUICKREF.len() as u32),
-        icons: None,
-        meta: None,
-    }
-    .no_annotation()
+pub(super) fn stdlib_quickref_resource() -> Resource {
+    Resource::new(STDLIB_QUICKREF_URI, "stdlib-quickref")
+        .with_title("PerfettoSQL stdlib quick reference")
+        .with_description("Curated PerfettoSQL stdlib modules and minimal routing examples.")
+        .with_mime_type(STDLIB_QUICKREF_MIME_TYPE)
+        .with_size(STDLIB_QUICKREF.len() as u64)
 }
 
 pub(super) fn filtered_stdlib_modules_json(
