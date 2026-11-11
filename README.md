@@ -16,6 +16,23 @@
 
 # perfetto-mcp-rs
 
+> [!NOTE]
+> **This is a fork, maintained separately.** [`ilicmarko/perfetto-mcp`](https://github.com/ilicmarko/perfetto-mcp)
+> is an independently maintained fork of
+> [`tooluse-labs/perfetto-mcp-rs`](https://github.com/tooluse-labs/perfetto-mcp-rs),
+> created and maintained by the perfetto-mcp-rs authors. All credit for the original
+> design and implementation goes to them. The fork may diverge from upstream (for
+> example, it upgrades `rmcp` so the server works with GitHub Copilot CLI), and
+> issues here should not be reported upstream. The original license terms
+> (MIT OR Apache-2.0, see [`LICENSE-MIT`](LICENSE-MIT) and
+> [`LICENSE-APACHE`](LICENSE-APACHE)) and copyright notices are retained.
+>
+> The install scripts, badges, and `perfetto-mcp-rs update` / `check-update` below
+> still point to the **upstream** releases. To run this fork, build from source
+> (`cargo build --release`) and register the binary with
+> `perfetto-mcp-rs install --binary-path <path>`; avoid `perfetto-mcp-rs update`,
+> which would replace it with the upstream build.
+
 An [MCP](https://modelcontextprotocol.io) server that lets LLMs analyze
 [Perfetto](https://perfetto.dev) traces. Point Claude Code (or any MCP client) at
 a trace file (`.pftrace` / `.perfetto-trace` / `.bin` / … — content-sniffed) and
